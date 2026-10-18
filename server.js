@@ -4,253 +4,249 @@ const cors = require("cors");
 const axios = require("axios");
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+const API_BACBO =
+  "https://api-cs.casino.org/svc-evolution-game-events/api/bacbo";
+
+const CASINOSCORES_URL =
+  "https://www.casino.org/casinoscores/pt-br/bac-bo/";
+
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-const BASE_URL = "https://www.casino.org";
-const CASINOSCORES_URL =
-  BASE_URL + "/casinoscores/pt-br/bac-bo/";
+const http = axios.create({
+  timeout: 20000,
+  headers: {
+    "User-Agent": "Mozilla/5.0 (compatible; DadosAOBot/1.0)",
+    "Accept": "application/json, text/html, */*",
+    "Cache-Control": "no-cache"
+  }
+});
 
-async function obterHTML() {
-  const resposta = await axios.get(CASINOSCORES_URL, {
-    timeout: 20000,
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      "Accept": "text/html"
-    }
-  });
+function horaAngola(data) {
+  if (!data) return null;
 
-  return typeof resposta.data === "string"
-    ? resposta.data
-    : JSON.stringify(resposta.data);
+  return new Intl.DateTimeFormat("pt-AO", {
+    timeZone: "Africa/Luanda",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(new Date(data));
 }
 
-function limparHTML(html) {
-  return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/\s+/g, " ")
-    .trim();
+function traduzirResultado(outcome) {
+  const resultados = {
+    BankerWon: "Banca",
+    PlayerWon: "Jogador",
+    Tie: "Empate"
+  };
+
+  return resultados[outcome] || outcome || "Desconhecido";
+}
+
+function normalizarRodada(item) {
+  const dados = item.data || {};
+  const resultado = dados.result || {};
+  const jogador = resultado.playerDice || {};
+  const banca = resultado.bankerDice || {};
+
+  return {
+    id: item.id || dados.id,
+    estado: dados.status || "Desconhecido",
+    inicioUTC: dados.startedAt || null,
+    fimUTC: dados.settledAt || null,
+    horaAngola: horaAngola(dados.settledAt),
+    resultadoOriginal: resultado.outcome || null,
+    resultado: traduzirResultado(resultado.outcome),
+    multiplicador: resultado.multiplier ?? null,
+    jogador: {
+      dado1: jogador.first ?? null,
+      dado2: jogador.second ?? null,
+      total: jogador.score ?? null
+    },
+    banca: {
+      dado1: banca.first ?? null,
+      dado2: banca.second ?? null,
+      total: banca.score ?? null
+    }
+  };
+}
+
+async function obterResultados() {
+  const resposta = await http.get(API_BACBO);
+  const dados = resposta.data;
+
+  if (!Array.isArray(dados)) {
+    throw new Error("A API não devolveu uma lista de resultados.");
+  }
+
+  return dados
+    .filter(item => item.data && item.data.result)
+    .map(normalizarRodada);
 }
 
 app.get("/", (req, res) => {
   res.json({
-    bot: "Dados AO Bot",
-    status: "online",
-    fonte: "CasinoScores"
+    nome: "Dados AO Bot",
+    estado: "online",
+    fonte: "CasinoScores",
+    rotas: [
+      "/health",
+      "/teste-casinoscores",
+      "/resultados",
+      "/diagnostico",
+      "/diagnostico-scripts",
+      "/telegram/teste",
+      "/telegram/resultados"
+    ]
   });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({
+    sucesso: true,
+    estado: "online",
+    horaAngola: horaAngola(new Date())
+  });
 });
 
-// Testar acesso ao CasinoScores
 app.get("/teste-casinoscores", async (req, res) => {
   try {
-    const html = await obterHTML();
+    const resposta = await http.get(CASINOSCORES_URL);
 
     res.json({
       sucesso: true,
-      statusHTTP: 200,
-      tamanhoHTML: html.length,
-      contemBacBo: html.toLowerCase().includes("bac bo"),
+      fonte: "CasinoScores",
+      statusHTTP: resposta.status,
+      tamanhoHTML: resposta.data.length,
+      contemBacBo: resposta.data.toLowerCase().includes("bac-bo"),
       contemHistorico:
-        html.toLowerCase().includes("spin-history-section")
+        resposta.data.toLowerCase().includes("history")
     });
-  } catch (error) {
+  } catch (erro) {
     res.status(502).json({
       sucesso: false,
-      erro: error.response
-        ? "HTTP " + error.response.status
-        : error.message
+      erro: erro.message
     });
   }
 });
 
-// Testar extração de texto
 app.get("/resultados", async (req, res) => {
   try {
-    const html = await obterHTML();
-    const texto = limparHTML(html);
-    const pos = texto.toLowerCase().indexOf(
-      "histórico de lançamentos"
+    const resultados = await obterResultados();
+    const limite = Math.min(
+      Math.max(parseInt(req.query.limite, 10) || 10, 1),
+      100
     );
 
     res.json({
-      fonte: "CasinoScores",
       sucesso: true,
-      encontrouHistorico: pos !== -1,
-      trecho: pos >= 0
-        ? texto.substring(pos, pos + 3000)
-        : texto.substring(0, 3000),
-      aviso: "Ainda não confirma a extração das rodadas reais."
+      fonte: "CasinoScores",
+      quantidade: resultados.length,
+      horaConsultaAngola: horaAngola(new Date()),
+      resultados: resultados.slice(0, limite)
     });
-  } catch (error) {
+  } catch (erro) {
     res.status(502).json({
       sucesso: false,
-      erro: error.message
+      fonte: "CasinoScores",
+      erro: erro.message
     });
   }
 });
 
-// Diagnóstico inicial da página
 app.get("/diagnostico", async (req, res) => {
   try {
-    const html = await obterHTML();
+    const resposta = await http.get(API_BACBO);
+    const dados = resposta.data;
+    const primeiro = Array.isArray(dados) ? dados[0] : null;
 
+    res.json({
+      sucesso: true,
+      statusHTTP: resposta.status,
+      formatoLista: Array.isArray(dados),
+      quantidadeRecebida: Array.isArray(dados) ? dados.length : 0,
+      primeiroResultado: primeiro
+        ? normalizarRodada(primeiro)
+        : null,
+      horaConsultaAngola: horaAngola(new Date())
+    });
+  } catch (erro) {
+    res.status(502).json({
+      sucesso: false,
+      erro: erro.message
+    });
+  }
+});
+
+app.get("/diagnostico-scripts", async (req, res) => {
+  try {
+    const resposta = await http.get(CASINOSCORES_URL);
+    const html = resposta.data;
     const scripts = [
-      ...html.matchAll(
-        /<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi
-      )
-    ].map(m => m[1]);
+      ...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)
+    ]
+      .map(match => match[1])
+      .filter(src => src.includes(".js"))
+      .slice(0, 30);
 
-    const termos = [
-      "spin-history-section",
-      "latest_rolls",
-      "api/",
-      "graphql",
-      "results",
-      "history",
-      "rolls"
-    ];
+    const encontrados = [];
 
-    const pistas = {};
-    const lower = html.toLowerCase();
+    for (const src of scripts) {
+      try {
+        const url = new URL(src, CASINOSCORES_URL).href;
+        const script = await http.get(url);
+        const texto = String(script.data);
+        const pistas = [
+          "latest_rolls",
+          "spinHistory",
+          "HistoryTableBacBo",
+          "api-cs.casino.org/svc-evolution-game-events/api/bacbo",
+          "api.casinoscores.com/ws"
+        ].filter(pista => texto.includes(pista));
 
-    for (const termo of termos) {
-      const pos = lower.indexOf(termo);
-      pistas[termo] = pos >= 0
-        ? html.substring(Math.max(0, pos - 100), pos + 300)
-        : null;
+        if (pistas.length) {
+          encontrados.push({
+            ficheiro: url.split("/").pop(),
+            pistas
+          });
+        }
+      } catch (_) {
+        // Ignora scripts que não possam ser consultados.
+      }
     }
 
     res.json({
       sucesso: true,
-      quantidadeScripts: scripts.length,
-      scripts: scripts.slice(0, 30),
-      pistas
+      scriptsAnalisados: scripts.length,
+      encontrados
     });
-  } catch (error) {
+  } catch (erro) {
     res.status(502).json({
       sucesso: false,
-      erro: error.message
+      erro: erro.message
     });
   }
 });
 
-// NOVO: analisar os ficheiros JavaScript da página
-app.get("/diagnostico-scripts", async (req, res) => {
-  try {
-    const html = await obterHTML();
-
-    const scripts = [
-      ...html.matchAll(
-        /<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi
-      )
-    ].map(m => m[1]);
-
-    const ficheiros = scripts
-      .filter(src => src.includes("/_next/static/"))
-      .slice(0, 30);
-
-    const resultados = await Promise.all(
-      ficheiros.map(async src => {
-        try {
-          const url = new URL(src, BASE_URL).href;
-
-          const resposta = await axios.get(url, {
-            timeout: 15000,
-            headers: {
-              "User-Agent": "Mozilla/5.0"
-            }
-          });
-
-          const js = typeof resposta.data === "string"
-            ? resposta.data
-            : JSON.stringify(resposta.data);
-
-          const padroes = [
-            /https?:\/\/[^"'`\s<>]+/gi,
-            /["'`](?:\/[^"'`\s]{1,180})["'`]/g,
-            /(?:fetch|axios)\s*\([^)]{1,250}\)/gi,
-            /(?:graphql|api|endpoint|latest_rolls|spin-history|results|history|rolls)[^"'`\s]{0,100}/gi
-          ];
-
-          const encontrados = [];
-
-          for (const padrao of padroes) {
-            const matches = js.match(padrao) || [];
-
-            for (const item of matches) {
-              if (
-                /api|graphql|result|history|roll|spin|game|casino/i
-                  .test(item)
-              ) {
-                encontrados.push(item.substring(0, 250));
-              }
-
-              if (encontrados.length >= 20) break;
-            }
-
-            if (encontrados.length >= 20) break;
-          }
-
-          return {
-            ficheiro: src,
-            sucesso: true,
-            tamanho: js.length,
-            pistas: [...new Set(encontrados)].slice(0, 20)
-          };
-        } catch (error) {
-          return {
-            ficheiro: src,
-            sucesso: false,
-            erro: error.response
-              ? "HTTP " + error.response.status
-              : error.message
-          };
-        }
-      })
-    );
-
-    res.json({
-      fonte: "CasinoScores",
-      sucesso: true,
-      scriptsEncontrados: ficheiros.length,
-      scriptsAnalisados: resultados.length,
-      resultados,
-      aviso:
-        "As pistas são candidatas a investigação; nenhuma API é considerada confirmada sem testar a resposta."
-    });
-  } catch (error) {
-    res.status(502).json({
-      sucesso: false,
-      erro: error.response
-        ? "HTTP " + error.response.status
-        : error.message
-    });
-  }
-});
-
-// Testar ligação ao Telegram
 app.get("/telegram/teste", async (req, res) => {
   const token = process.env.BOT_TOKEN;
   const chatId = process.env.CHAT_ID;
 
   if (!token || !chatId) {
     return res.status(500).json({
-      enviado: false,
-      erro: "BOT_TOKEN ou CHAT_ID não configurado no Render."
+      sucesso: false,
+      erro: "Configura BOT_TOKEN e CHAT_ID nas variáveis do Render."
     });
   }
 
   try {
-    await axios.post(
+    const resposta = await axios.post(
       `https://api.telegram.org/bot${token}/sendMessage`,
       {
         chat_id: chatId,
@@ -260,26 +256,82 @@ app.get("/telegram/teste", async (req, res) => {
     );
 
     res.json({
-      enviado: true,
-      mensagem: "Verifica o teu Telegram."
+      sucesso: resposta.data.ok,
+      mensagem: "Teste do Telegram enviado."
     });
-  } catch (error) {
+  } catch (erro) {
     res.status(502).json({
-      enviado: false,
-      erro: error.response?.data?.description ||
-        "Falha no envio para o Telegram."
+      sucesso: false,
+      erro: erro.response?.data?.description || erro.message
+    });
+  }
+});
+
+app.get("/telegram/resultados", async (req, res) => {
+  const token = process.env.BOT_TOKEN;
+  const chatId = process.env.CHAT_ID;
+
+  if (!token || !chatId) {
+    return res.status(500).json({
+      sucesso: false,
+      erro: "Configura BOT_TOKEN e CHAT_ID no Render."
+    });
+  }
+
+  try {
+    const resultados = await obterResultados();
+
+    if (!resultados.length) {
+      return res.status(502).json({
+        sucesso: false,
+        erro: "A API não devolveu resultados."
+      });
+    }
+
+    const lista = resultados.slice(0, 10).map((r, i) => {
+      const emoji =
+        r.resultado === "Banca" ? "🔴" :
+        r.resultado === "Jogador" ? "🔵" : "🟡";
+
+      return `${i + 1}. ${emoji} ${r.resultado} | ${r.horaAngola}`;
+    });
+
+    const mensagem =
+      "🎲 DADOS AO BOT — BAC BO\n\n" +
+      lista.join("\n") +
+      "\n\nFonte: CasinoScores\n" +
+      "Resultados históricos, não previsões.";
+
+    const resposta = await axios.post(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        chat_id: chatId,
+        text: mensagem
+      },
+      { timeout: 15000 }
+    );
+
+    res.json({
+      sucesso: resposta.data.ok,
+      resultadosEnviados: Math.min(resultados.length, 10)
+    });
+  } catch (erro) {
+    res.status(502).json({
+      sucesso: false,
+      erro: erro.response?.data?.description || erro.message
     });
   }
 });
 
 app.use((req, res) => {
   res.status(404).json({
+    sucesso: false,
     erro: "Rota não encontrada",
-    rotaSolicitada: req.path
+    caminho: req.path
   });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Dados AO Bot ativo na porta ${PORT}`);
 });
-  
+    
