@@ -8,8 +8,9 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const BASE_URL = "https://www.casino.org";
 const CASINOSCORES_URL =
-  "https://www.casino.org/casinoscores/pt-br/bac-bo/";
+  BASE_URL + "/casinoscores/pt-br/bac-bo/";
 
 async function obterHTML() {
   const resposta = await axios.get(CASINOSCORES_URL, {
@@ -32,8 +33,6 @@ function limparHTML(html) {
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -42,8 +41,7 @@ app.get("/", (req, res) => {
   res.json({
     bot: "Dados AO Bot",
     status: "online",
-    fonte: "CasinoScores",
-    mensagem: "Servidor ativo."
+    fonte: "CasinoScores"
   });
 });
 
@@ -51,24 +49,21 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Teste de acesso ao CasinoScores
+// Testar acesso ao CasinoScores
 app.get("/teste-casinoscores", async (req, res) => {
   try {
     const html = await obterHTML();
 
     res.json({
-      fonte: "CasinoScores",
       sucesso: true,
       statusHTTP: 200,
       tamanhoHTML: html.length,
       contemBacBo: html.toLowerCase().includes("bac bo"),
       contemHistorico:
-        html.toLowerCase().includes("histórico de lançamentos"),
-      aviso: "A página foi carregada; os resultados reais ainda precisam de validação."
+        html.toLowerCase().includes("spin-history-section")
     });
   } catch (error) {
     res.status(502).json({
-      fonte: "CasinoScores",
       sucesso: false,
       erro: error.response
         ? "HTTP " + error.response.status
@@ -77,34 +72,33 @@ app.get("/teste-casinoscores", async (req, res) => {
   }
 });
 
-// Teste inicial de extração de texto
+// Testar extração de texto
 app.get("/resultados", async (req, res) => {
   try {
     const html = await obterHTML();
     const texto = limparHTML(html);
-    const posicao = texto.toLowerCase().indexOf("histórico de lançamentos");
+    const pos = texto.toLowerCase().indexOf(
+      "histórico de lançamentos"
+    );
 
     res.json({
       fonte: "CasinoScores",
       sucesso: true,
-      encontrouHistorico: posicao !== -1,
-      trecho: posicao >= 0
-        ? texto.substring(posicao, posicao + 3000)
+      encontrouHistorico: pos !== -1,
+      trecho: pos >= 0
+        ? texto.substring(pos, pos + 3000)
         : texto.substring(0, 3000),
-      aviso: "Este teste não garante que as rodadas estejam presentes no HTML."
+      aviso: "Ainda não confirma a extração das rodadas reais."
     });
   } catch (error) {
     res.status(502).json({
-      fonte: "CasinoScores",
       sucesso: false,
-      erro: error.response
-        ? "HTTP " + error.response.status
-        : error.message
+      erro: error.message
     });
   }
 });
 
-// Diagnóstico dos scripts e pistas de dados
+// Diagnóstico inicial da página
 app.get("/diagnostico", async (req, res) => {
   try {
     const html = await obterHTML();
@@ -113,11 +107,11 @@ app.get("/diagnostico", async (req, res) => {
       ...html.matchAll(
         /<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi
       )
-    ].map(match => match[1]);
+    ].map(m => m[1]);
 
     const termos = [
-      "latest rolls",
-      "latestrolls",
+      "spin-history-section",
+      "latest_rolls",
       "api/",
       "graphql",
       "results",
@@ -126,30 +120,115 @@ app.get("/diagnostico", async (req, res) => {
     ];
 
     const pistas = {};
-    const htmlMinusculo = html.toLowerCase();
+    const lower = html.toLowerCase();
 
     for (const termo of termos) {
-      const posicao = htmlMinusculo.indexOf(termo);
-
-      pistas[termo] = posicao >= 0
-        ? html.substring(
-            Math.max(0, posicao - 150),
-            posicao + 350
-          )
+      const pos = lower.indexOf(termo);
+      pistas[termo] = pos >= 0
+        ? html.substring(Math.max(0, pos - 100), pos + 300)
         : null;
     }
 
     res.json({
-      fonte: "CasinoScores",
       sucesso: true,
       quantidadeScripts: scripts.length,
       scripts: scripts.slice(0, 30),
-      pistas,
-      aviso: "As pistas não confirmam, por si só, uma API de resultados."
+      pistas
     });
   } catch (error) {
     res.status(502).json({
+      sucesso: false,
+      erro: error.message
+    });
+  }
+});
+
+// NOVO: analisar os ficheiros JavaScript da página
+app.get("/diagnostico-scripts", async (req, res) => {
+  try {
+    const html = await obterHTML();
+
+    const scripts = [
+      ...html.matchAll(
+        /<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi
+      )
+    ].map(m => m[1]);
+
+    const ficheiros = scripts
+      .filter(src => src.includes("/_next/static/"))
+      .slice(0, 30);
+
+    const resultados = await Promise.all(
+      ficheiros.map(async src => {
+        try {
+          const url = new URL(src, BASE_URL).href;
+
+          const resposta = await axios.get(url, {
+            timeout: 15000,
+            headers: {
+              "User-Agent": "Mozilla/5.0"
+            }
+          });
+
+          const js = typeof resposta.data === "string"
+            ? resposta.data
+            : JSON.stringify(resposta.data);
+
+          const padroes = [
+            /https?:\/\/[^"'`\s<>]+/gi,
+            /["'`](?:\/[^"'`\s]{1,180})["'`]/g,
+            /(?:fetch|axios)\s*\([^)]{1,250}\)/gi,
+            /(?:graphql|api|endpoint|latest_rolls|spin-history|results|history|rolls)[^"'`\s]{0,100}/gi
+          ];
+
+          const encontrados = [];
+
+          for (const padrao of padroes) {
+            const matches = js.match(padrao) || [];
+
+            for (const item of matches) {
+              if (
+                /api|graphql|result|history|roll|spin|game|casino/i
+                  .test(item)
+              ) {
+                encontrados.push(item.substring(0, 250));
+              }
+
+              if (encontrados.length >= 20) break;
+            }
+
+            if (encontrados.length >= 20) break;
+          }
+
+          return {
+            ficheiro: src,
+            sucesso: true,
+            tamanho: js.length,
+            pistas: [...new Set(encontrados)].slice(0, 20)
+          };
+        } catch (error) {
+          return {
+            ficheiro: src,
+            sucesso: false,
+            erro: error.response
+              ? "HTTP " + error.response.status
+              : error.message
+          };
+        }
+      })
+    );
+
+    res.json({
       fonte: "CasinoScores",
+      sucesso: true,
+      scriptsEncontrados: ficheiros.length,
+      scriptsAnalisados: resultados.length,
+      resultados,
+      aviso:
+        "As pistas são candidatas a investigação; nenhuma API é considerada confirmada sem testar a resposta."
+    });
+  } catch (error) {
+    res.status(502).json({
       sucesso: false,
       erro: error.response
         ? "HTTP " + error.response.status
@@ -158,7 +237,7 @@ app.get("/diagnostico", async (req, res) => {
   }
 });
 
-// Teste de ligação ao Telegram
+// Testar ligação ao Telegram
 app.get("/telegram/teste", async (req, res) => {
   const token = process.env.BOT_TOKEN;
   const chatId = process.env.CHAT_ID;
@@ -196,19 +275,11 @@ app.get("/telegram/teste", async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({
     erro: "Rota não encontrada",
-    rotaSolicitada: req.path,
-    rotasDisponiveis: [
-      "/",
-      "/health",
-      "/teste-casinoscores",
-      "/resultados",
-      "/diagnostico",
-      "/telegram/teste"
-    ]
+    rotaSolicitada: req.path
   });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Dados AO Bot ativo na porta ${PORT}`);
 });
-    
+  
