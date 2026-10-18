@@ -8,7 +8,6 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
 const CASINOSCORES_URL =
   "https://www.casino.org/casinoscores/pt-br/bac-bo/";
 
@@ -52,7 +51,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Testar acesso ao CasinoScores
+// Teste de acesso ao CasinoScores
 app.get("/teste-casinoscores", async (req, res) => {
   try {
     const html = await obterHTML();
@@ -62,11 +61,10 @@ app.get("/teste-casinoscores", async (req, res) => {
       sucesso: true,
       statusHTTP: 200,
       tamanhoHTML: html.length,
+      contemBacBo: html.toLowerCase().includes("bac bo"),
       contemHistorico:
         html.toLowerCase().includes("histórico de lançamentos"),
-      contemBacBo: html.toLowerCase().includes("bac bo"),
-      aviso:
-        "O acesso funciona, mas isso não confirma a extração dos resultados reais."
+      aviso: "A página foi carregada; os resultados reais ainda precisam de validação."
     });
   } catch (error) {
     res.status(502).json({
@@ -79,25 +77,21 @@ app.get("/teste-casinoscores", async (req, res) => {
   }
 });
 
-// Tentar extrair o texto do histórico
+// Teste inicial de extração de texto
 app.get("/resultados", async (req, res) => {
   try {
     const html = await obterHTML();
     const texto = limparHTML(html);
-
-    const posicao = texto
-      .toLowerCase()
-      .indexOf("histórico de lançamentos");
+    const posicao = texto.toLowerCase().indexOf("histórico de lançamentos");
 
     res.json({
       fonte: "CasinoScores",
       sucesso: true,
       encontrouHistorico: posicao !== -1,
-      trecho: posicao !== -1
+      trecho: posicao >= 0
         ? texto.substring(posicao, posicao + 3000)
         : texto.substring(0, 3000),
-      aviso:
-        "Os resultados podem ser carregados separadamente pela página."
+      aviso: "Este teste não garante que as rodadas estejam presentes no HTML."
     });
   } catch (error) {
     res.status(502).json({
@@ -110,7 +104,7 @@ app.get("/resultados", async (req, res) => {
   }
 });
 
-// Diagnóstico dos scripts e pistas de possíveis fontes de dados
+// Diagnóstico dos scripts e pistas de dados
 app.get("/diagnostico", async (req, res) => {
   try {
     const html = await obterHTML();
@@ -119,7 +113,7 @@ app.get("/diagnostico", async (req, res) => {
       ...html.matchAll(
         /<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi
       )
-    ].map(m => m[1]);
+    ].map(match => match[1]);
 
     const termos = [
       "latest rolls",
@@ -131,16 +125,16 @@ app.get("/diagnostico", async (req, res) => {
       "rolls"
     ];
 
-    const encontrados = {};
+    const pistas = {};
     const htmlMinusculo = html.toLowerCase();
 
     for (const termo of termos) {
-      const pos = htmlMinusculo.indexOf(termo);
+      const posicao = htmlMinusculo.indexOf(termo);
 
-      encontrados[termo] = pos >= 0
+      pistas[termo] = posicao >= 0
         ? html.substring(
-            Math.max(0, pos - 150),
-            pos + 350
+            Math.max(0, posicao - 150),
+            posicao + 350
           )
         : null;
     }
@@ -150,9 +144,8 @@ app.get("/diagnostico", async (req, res) => {
       sucesso: true,
       quantidadeScripts: scripts.length,
       scripts: scripts.slice(0, 30),
-      pistas: encontrados,
-      aviso:
-        "Diagnóstico inicial. Ainda não confirma uma API nem extrai resultados reais."
+      pistas,
+      aviso: "As pistas não confirmam, por si só, uma API de resultados."
     });
   } catch (error) {
     res.status(502).json({
@@ -165,7 +158,7 @@ app.get("/diagnostico", async (req, res) => {
   }
 });
 
-// Testar ligação ao Telegram
+// Teste de ligação ao Telegram
 app.get("/telegram/teste", async (req, res) => {
   const token = process.env.BOT_TOKEN;
   const chatId = process.env.CHAT_ID;
@@ -194,11 +187,25 @@ app.get("/telegram/teste", async (req, res) => {
   } catch (error) {
     res.status(502).json({
       enviado: false,
-      erro:
-        error.response?.data?.description ||
+      erro: error.response?.data?.description ||
         "Falha no envio para o Telegram."
     });
   }
+});
+
+app.use((req, res) => {
+  res.status(404).json({
+    erro: "Rota não encontrada",
+    rotaSolicitada: req.path,
+    rotasDisponiveis: [
+      "/",
+      "/health",
+      "/teste-casinoscores",
+      "/resultados",
+      "/diagnostico",
+      "/telegram/teste"
+    ]
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
