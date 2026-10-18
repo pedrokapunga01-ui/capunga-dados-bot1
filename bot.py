@@ -1,7 +1,21 @@
 
 import json
 import os
+import re
 import urllib.request
+from html.parser import HTMLParser
+
+
+class TextoHTML(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.textos = []
+
+    def handle_data(self, data):
+        self.textos.append(data)
+
+    def texto(self):
+        return " ".join(self.textos)
 
 
 def enviar_mensagem(texto):
@@ -17,21 +31,53 @@ def enviar_mensagem(texto):
     pedido = urllib.request.Request(
         url,
         data=dados,
-        headers={"Content-Type": "application/json"},
-        method="POST"
+        headers={"Content-Type": "application/json"}
     )
 
     with urllib.request.urlopen(pedido, timeout=20) as resposta:
-        resultado = json.loads(resposta.read().decode("utf-8"))
+        resposta.read()
 
-    if not resultado.get("ok"):
-        raise RuntimeError("Falha ao enviar mensagem")
+
+def testar_betmind():
+    url = "https://betmind.org/bacbo"
+    pedido = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+
+    try:
+        with urllib.request.urlopen(pedido, timeout=30) as resposta:
+            html = resposta.read().decode("utf-8", errors="replace")
+
+        parser = TextoHTML()
+        parser.feed(html)
+        texto = parser.texto()
+
+        padrao = r"Latest:\s*(\d+)\s*(Player|Banker|Tie)\s*(\d{2}:\d{2}:\d{2})"
+        resultado = re.search(padrao, texto, re.IGNORECASE)
+
+        if resultado:
+            numero, cor, hora = resultado.groups()
+            enviar_mensagem(
+                f"🎲 BETMIND — resultado encontrado\n"
+                f"Número: {numero}\n"
+                f"Resultado: {cor}\n"
+                f"Hora: {hora}\n"
+                f"⚠️ Isto é um resultado observado, não uma previsão."
+            )
+        else:
+            enviar_mensagem(
+                "⚠️ A página abriu, mas não consegui identificar "
+                "o último resultado. É necessário verificar o formato dos dados."
+            )
+
+    except Exception as erro:
+        enviar_mensagem(
+            f"⚠️ Não foi possível ler o BETMIND: "
+            f"{type(erro).__name__}"
+        )
 
 
 if __name__ == "__main__":
-    enviar_mensagem(
-        "🤖 Capunga Dados Bot\n"
-        "✅ Telegram ligado com sucesso!\n"
-        "⏳ Leitura automática do Bac bo ainda em configuração."
-    )
-    
+    testar_betmind()
+        
