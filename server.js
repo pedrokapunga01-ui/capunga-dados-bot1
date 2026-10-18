@@ -8,14 +8,16 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const BETMIND_URL = "https://betmind.org";
+
+const CASINOSCORES_URL =
+  "https://www.casino.org/casinoscores/pt-br/bac-bo/";
 
 app.get("/", (req, res) => {
   res.json({
     bot: "Dados AO Bot",
     status: "online",
-    fonte: "BetMind",
-    aviso: "Resultados dependem do acesso à API."
+    fonte: "CasinoScores",
+    mensagem: "Servidor ativo. Captura de resultados por testar."
   });
 });
 
@@ -23,84 +25,51 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-async function consultarBetMind(caminho) {
-  const chave = process.env.BETMIND_API_KEY;
-
-  if (!chave) {
-    throw new Error(
-      "Falta configurar BETMIND_API_KEY nas variáveis do Render."
-    );
-  }
-
-  const resposta = await axios.get(
-    `${BETMIND_URL}${caminho}`,
-    {
+// Testa se o servidor consegue aceder ao CasinoScores.
+app.get("/teste-casinoscores", async (req, res) => {
+  try {
+    const resposta = await axios.get(CASINOSCORES_URL, {
+      timeout: 20000,
       headers: {
-        "Content-Type": "application/json",
-        "X-API-Key": chave
-      },
-      timeout: 15000
-    }
-  );
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html"
+      }
+    });
 
-  return resposta.data;
-}
-
-app.get("/resultados", async (req, res) => {
-  try {
-    const dados = await consultarBetMind(
-      "/api/results?game=bacbo&limit=10&offset=0"
-    );
+    const html =
+      typeof resposta.data === "string"
+        ? resposta.data
+        : JSON.stringify(resposta.data);
 
     res.json({
-      fonte: "BetMind",
+      fonte: "CasinoScores",
       sucesso: true,
-      dados
+      statusHTTP: resposta.status,
+      tamanhoHTML: html.length,
+      contemHistorico: html.includes("Histórico de Lançamentos"),
+      contemBacBo: html.toLowerCase().includes("bac bo"),
+      aviso: "O acesso à página foi testado. Os resultados reais ainda precisam de ser extraídos."
     });
   } catch (error) {
-    const status = error.response?.status || 502;
-
-    res.status(status).json({
-      fonte: "BetMind",
+    res.status(502).json({
+      fonte: "CasinoScores",
       sucesso: false,
-      erro:
-        error.response?.data?.message ||
-        error.response?.data?.error ||
-        error.message
+      erro: error.response
+        ? "O CasinoScores respondeu com HTTP " + error.response.status
+        : error.message
     });
   }
 });
 
-app.get("/ultimo", async (req, res) => {
-  try {
-    const dados = await consultarBetMind(
-      "/api/latest?game=bacbo"
-    );
-
-    res.json({
-      fonte: "BetMind",
-      sucesso: true,
-      dados
-    });
-  } catch (error) {
-    res.status(error.response?.status || 502).json({
-      fonte: "BetMind",
-      sucesso: false,
-      erro:
-        error.response?.data?.message ||
-        error.response?.data?.error ||
-        error.message
-    });
-  }
-});
-
+// Teste de ligação ao Telegram.
 app.get("/telegram/teste", async (req, res) => {
   const token = process.env.BOT_TOKEN;
   const chatId = process.env.CHAT_ID;
 
   if (!token || !chatId) {
     return res.status(500).json({
-      erro: "BOT_TOKEN ou CHAT_ID não configurado."
+      enviado: false,
+      erro: "BOT_TOKEN ou CHAT_ID não configurado no Render."
     });
   }
 
@@ -109,8 +78,9 @@ app.get("/telegram/teste", async (req, res) => {
       `https://api.telegram.org/bot${token}/sendMessage`,
       {
         chat_id: chatId,
-        text: "✅ Dados AO Bot: ligação ao Telegram testada com sucesso!"
-      }
+        text: "✅ Dados AO Bot: ligação ao Telegram testada!"
+      },
+      { timeout: 15000 }
     );
 
     res.json({
@@ -118,7 +88,7 @@ app.get("/telegram/teste", async (req, res) => {
       mensagem: "Verifica o teu Telegram."
     });
   } catch (error) {
-    res.status(500).json({
+    res.status(502).json({
       enviado: false,
       erro: error.response?.data?.description ||
         "Falha no envio para o Telegram."
@@ -129,4 +99,3 @@ app.get("/telegram/teste", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Dados AO Bot ativo na porta ${PORT}`);
 });
-      
