@@ -8,12 +8,14 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const BETMIND_URL = "https://betmind.org";
 
 app.get("/", (req, res) => {
   res.json({
     bot: "Dados AO Bot",
     status: "online",
-    fonte_de_resultados: "por configurar"
+    fonte: "BetMind",
+    aviso: "Resultados dependem do acesso à API."
   });
 });
 
@@ -21,11 +23,75 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-app.get("/resultados", (req, res) => {
-  res.json({
-    resultados: [],
-    mensagem: "Aguardando uma fonte real de resultados Bac Bo."
-  });
+async function consultarBetMind(caminho) {
+  const chave = process.env.BETMIND_API_KEY;
+
+  if (!chave) {
+    throw new Error(
+      "Falta configurar BETMIND_API_KEY nas variáveis do Render."
+    );
+  }
+
+  const resposta = await axios.get(
+    `${BETMIND_URL}${caminho}`,
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": chave
+      },
+      timeout: 15000
+    }
+  );
+
+  return resposta.data;
+}
+
+app.get("/resultados", async (req, res) => {
+  try {
+    const dados = await consultarBetMind(
+      "/api/results?game=bacbo&limit=10&offset=0"
+    );
+
+    res.json({
+      fonte: "BetMind",
+      sucesso: true,
+      dados
+    });
+  } catch (error) {
+    const status = error.response?.status || 502;
+
+    res.status(status).json({
+      fonte: "BetMind",
+      sucesso: false,
+      erro:
+        error.response?.data?.message ||
+        error.response?.data?.error ||
+        error.message
+    });
+  }
+});
+
+app.get("/ultimo", async (req, res) => {
+  try {
+    const dados = await consultarBetMind(
+      "/api/latest?game=bacbo"
+    );
+
+    res.json({
+      fonte: "BetMind",
+      sucesso: true,
+      dados
+    });
+  } catch (error) {
+    res.status(error.response?.status || 502).json({
+      fonte: "BetMind",
+      sucesso: false,
+      erro:
+        error.response?.data?.message ||
+        error.response?.data?.error ||
+        error.message
+    });
+  }
 });
 
 app.get("/telegram/teste", async (req, res) => {
@@ -34,12 +100,12 @@ app.get("/telegram/teste", async (req, res) => {
 
   if (!token || !chatId) {
     return res.status(500).json({
-      erro: "BOT_TOKEN ou CHAT_ID não configurado no Render."
+      erro: "BOT_TOKEN ou CHAT_ID não configurado."
     });
   }
 
   try {
-    const resposta = await axios.post(
+    await axios.post(
       `https://api.telegram.org/bot${token}/sendMessage`,
       {
         chat_id: chatId,
@@ -48,19 +114,14 @@ app.get("/telegram/teste", async (req, res) => {
     );
 
     res.json({
-      enviado: resposta.data.ok,
+      enviado: true,
       mensagem: "Verifica o teu Telegram."
     });
   } catch (error) {
-    console.error(
-      "Erro Telegram:",
-      error.response?.data || error.message
-    );
-
     res.status(500).json({
       enviado: false,
       erro: error.response?.data?.description ||
-        "Não foi possível enviar a mensagem."
+        "Falha no envio para o Telegram."
     });
   }
 });
@@ -68,4 +129,4 @@ app.get("/telegram/teste", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Dados AO Bot ativo na porta ${PORT}`);
 });
-  
+      
