@@ -28,29 +28,39 @@ app.get("/resultados", (req, res) => {
   });
 });
 
-app.post("/telegram/teste", async (req, res) => {
+app.get("/telegram/teste", async (req, res) => {
   const token = process.env.BOT_TOKEN;
   const chatId = process.env.CHAT_ID;
 
   if (!token || !chatId) {
     return res.status(500).json({
-      erro: "Configura BOT_TOKEN e CHAT_ID nas variáveis de ambiente."
+      erro: "BOT_TOKEN ou CHAT_ID não configurado no Render."
     });
   }
 
   try {
-    await axios.post(
+    const resposta = await axios.post(
       `https://api.telegram.org/bot${token}/sendMessage`,
       {
         chat_id: chatId,
-        text: "✅ Dados AO Bot: ligação ao Telegram testada."
+        text: "✅ Dados AO Bot: ligação ao Telegram testada com sucesso!"
       }
     );
 
-    res.json({ enviado: true });
+    res.json({
+      enviado: resposta.data.ok,
+      mensagem: "Verifica o teu Telegram."
+    });
   } catch (error) {
+    console.error(
+      "Erro Telegram:",
+      error.response?.data || error.message
+    );
+
     res.status(500).json({
-      erro: "Não foi possível enviar a mensagem ao Telegram."
+      enviado: false,
+      erro: error.response?.data?.description ||
+        "Não foi possível enviar a mensagem."
     });
   }
 });
@@ -58,3 +68,4 @@ app.post("/telegram/teste", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Dados AO Bot ativo na porta ${PORT}`);
 });
+  
