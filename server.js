@@ -1,3 +1,4 @@
+JavaScript
 
 const express = require("express");
 const cors = require("cors");
@@ -7,8 +8,8 @@ const { Pool } = require("pg");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const API_BACBO =
-  "https://api-cs.casino.org/svc-evolution-game-events/api/bacbo";
+app.use(cors());
+app.use(express.json());
 
 const pool = process.env.DATABASE_URL
   ? new Pool({
@@ -20,108 +21,96 @@ const pool = process.env.DATABASE_URL
     })
   : null;
 
-app.use(cors());
-app.use(express.json());
-
-const http = axios.create({
-  timeout: 20000,
-  headers: {
-    "User-Agent": "Mozilla/5.0 (compatible; CapungaDadosBot/1.0)",
-    Accept: "application/json"
-  }
-});
+const API_BACBO =
+  "https://api-cs.casino.org/svc-evolution-game-events/api/bacbo";
 
 function horaAngola(data = new Date()) {
-  return new Intl.DateTimeFormat("pt-AO", {
+  return new Intl.DateTimeFormat("pt-PT", {
     timeZone: "Africa/Luanda",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
+    dateStyle: "short",
+    timeStyle: "medium",
     hour12: false
-  }).format(new Date(data));
+  }).format(data);
 }
 
-function traduzirResultado(outcome) {
-  const mapa = {
-    BankerWon: "Banca",
-    PlayerWon: "Jogador",
-    Tie: "Empate"
-  };
+function traduzirResultado(resultado) {
+  const valor = String(resultado || "").toLowerCase();
 
-  return mapa[outcome] || outcome || "Desconhecido";
+  if (valor.includes("banker")) return "Banca";
+  if (valor.includes("player")) return "Jogador";
+  if (valor.includes("tie")) return "Empate";
+
+  return resultado || "Desconhecido";
 }
 
 function normalizarRodada(item) {
-  const dados = item.data || {};
-  const resultado = dados.result || {};
-  const jogador = resultado.playerDice || {};
-  const banca = resultado.bankerDice || {};
+  const d = item?.data || item || {};
+  const r = d.result || {};
 
   return {
-    id: String(item.id || dados.id || ""),
-    estado: dados.status || "Desconhecido",
-    inicioUTC: dados.startedAt || null,
-    fimUTC: dados.settledAt || null,
-    horaAngola: horaAngola(dados.settledAt || new Date()),
-    resultadoOriginal: resultado.outcome || null,
-    resultado: traduzirResultado(resultado.outcome),
-    multiplicador: resultado.multiplier ?? null,
-    jogador: {
-      dado1: jogador.first ?? null,
-      dado2: jogador.second ?? null,
-      total: jogador.score ?? null
-    },
-    banca: {
-      dado1: banca.first ?? null,
-      dado2: banca.second ?? null,
-      total: banca.score ?? null
-    }
+    id: String(item?.id || d.id || ""),
+    estado: d.status || "Desconhecido",
+    inicio: d.startedAt || null,
+    fim: d.settledAt || null,
+    resultado: traduzirResultado(r.outcome),
+    pontosJogador: r.playerDice?.score ?? null,
+    pontosBanca: r.bankerDice?.score ?? null,
+    multiplicador: r.multiplier ?? null
   };
 }
 
 async function obterResultados() {
-  const resposta = await http.get(API_BACBO);
-  if (!Array.isArray(resposta.data)) {
-    throw new Error("A API não devolveu uma lista.");
-  }
+  const resposta = await axios.get(API_BACBO, {
+    timeout: 15000,
+    headers: {
+      "User-Agent": "Dados-AO-Bot/1.0",
+      Accept: "application/json"
+    }
+  });
 
-  return resposta.data
-    .filter(item => item.data && item.data.result)
-    .map(normalizarRodada);
+  const dados = resposta.data;
+  const lista = Array.isArray(dados)
+    ? dados
+    : Array.isArray(dados?.data)
+      ? dados.data
+      : Array.isArray(dados?.results)
+        ? dados.results
+        : [];
+
+  return lista
+    .map(normalizarRodada)
+    .filter(r => r.id && r.resultado !== "Desconhecido");
 }
 
 async function prepararBaseDados() {
   if (!pool) {
-    throw new Error("A variável DATABASE_URL não está configurada.");
+    throw new Error("DATABASE_URL não está configurada no Render.");
   }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bacbo_resultados (
       id TEXT PRIMARY KEY,
       resultado TEXT NOT NULL,
-      resultado_original TEXT,
-      inicio_utc TIMESTAMPTZ,
-      fim_utc TIMESTAMPTZ,
-      jogador_total INTEGER,
-      banca_total INTEGER,
+      estado TEXT,
+      inicio TIMESTAMPTZ,
+      fim TIMESTAMPTZ,
+      pontos_jogador INTEGER,
+      pontos_banca INTEGER,
       multiplicador NUMERIC,
-      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      guardado_em TIMESTAMPTZ DEFAULT NOW()
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sinais (
       id BIGSERIAL PRIMARY KEY,
-      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      criado_em TIMESTAMPTZ DEFAULT NOW(),
       dia_angola DATE NOT NULL DEFAULT
-        (timezone('Africa/Luanda', NOW()))::date,
+        (NOW() AT TIME ZONE 'Africa/Luanda')::date,
       cor TEXT NOT NULL,
       estado TEXT NOT NULL DEFAULT 'PENDENTE',
       gale INTEGER NOT NULL DEFAULT 0,
-      resultado_rodada_id TEXT,
+      resultado_id TEXT,
       resolvido_em TIMESTAMPTZ,
       observacoes TEXT
     )
@@ -129,73 +118,57 @@ async function prepararBaseDados() {
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS estatisticas_diarias (
-      dia_angola DATE PRIMARY KEY,
+      dia_angola DATE PRIMARY KEY DEFAULT
+        (NOW() AT TIME ZONE 'Africa/Luanda')::date,
       total_sinais INTEGER NOT NULL DEFAULT 0,
       green INTEGER NOT NULL DEFAULT 0,
       loss INTEGER NOT NULL DEFAULT 0,
-      gs INTEGER NOT NULL DEFAULT 0,
       g1 INTEGER NOT NULL DEFAULT 0,
       g2 INTEGER NOT NULL DEFAULT 0,
-      ge INTEGER NOT NULL DEFAULT 0,
-      ge1 INTEGER NOT NULL DEFAULT 0,
-      ge2 INTEGER NOT NULL DEFAULT 0,
       empates INTEGER NOT NULL DEFAULT 0,
-      atualizada_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      atualizada_em TIMESTAMPTZ DEFAULT NOW()
     )
   `);
 
   return true;
 }
 
-async function guardarResultados(resultados) {
-  if (!pool) {
-    throw new Error("DATABASE_URL não está configurada.");
+async function enviarTelegram(mensagem) {
+  const token = process.env.BOT_TOKEN;
+  const chatId = process.env.CHAT_ID;
+
+  if (!token || !chatId) {
+    throw new Error("BOT_TOKEN ou CHAT_ID não configurado no Render.");
   }
 
-  let guardados = 0;
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
 
-  for (const r of resultados) {
-    if (!r.id || !r.resultadoOriginal) continue;
+  const resposta = await axios.post(
+    url,
+    {
+      chat_id: chatId,
+      text: mensagem
+    },
+    { timeout: 15000 }
+  );
 
-    const resultado = await pool.query(
-      `INSERT INTO bacbo_resultados
-       (id, resultado, resultado_original, inicio_utc, fim_utc,
-        jogador_total, banca_total, multiplicador)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT (id) DO NOTHING`,
-      [
-        r.id,
-        r.resultado,
-        r.resultadoOriginal,
-        r.inicioUTC,
-        r.fimUTC,
-        r.jogador.total,
-        r.banca.total,
-        r.multiplicador
-      ]
-    );
-
-    guardados += resultado.rowCount;
-  }
-
-  return guardados;
+  return resposta.data;
 }
 
 app.get("/", (req, res) => {
   res.json({
-    nome: "Capunga Dados Bot",
-    estado: "online",
-    fonte: "CasinoScores",
-    baseDadosConfigurada: Boolean(pool),
+    nome: "Dados AO Bot",
+    online: true,
+    horaAngola: horaAngola(),
     rotas: [
       "/health",
       "/diagnostico",
-      "/resultados",
       "/db/teste",
       "/db/preparar",
       "/db/sincronizar",
-      "/telegram/teste",
-      "/estatisticas"
+      "/resultados",
+      "/estatisticas",
+      "/telegram/teste"
     ]
   });
 });
@@ -203,74 +176,45 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     sucesso: true,
-    estado: "online",
+    online: true,
     horaAngola: horaAngola()
   });
 });
 
-app.get("/diagnostico", async (req, res) => {
-  try {
-    const resultados = await obterResultados();
-
-    res.json({
-      sucesso: true,
-      fonte: "CasinoScores",
-      quantidadeRecebida: resultados.length,
-      primeiroResultado: resultados[0] || null,
-      horaConsultaAngola: horaAngola()
-    });
-  } catch (erro) {
-    res.status(502).json({
-      sucesso: false,
-      erro: erro.message
-    });
-  }
-});
-
-app.get("/resultados", async (req, res) => {
-  try {
-    const resultados = await obterResultados();
-    const limite = Math.min(
-      Math.max(parseInt(req.query.limite, 10) || 10, 1),
-      100
-    );
-
-    res.json({
-      sucesso: true,
-      fonte: "CasinoScores",
-      quantidade: resultados.length,
-      horaConsultaAngola: horaAngola(),
-      resultados: resultados.slice(0, limite)
-    });
-  } catch (erro) {
-    res.status(502).json({
-      sucesso: false,
-      erro: erro.message
-    });
-  }
+app.get("/diagnostico", (req, res) => {
+  res.json({
+    servidor: "online",
+    baseConfigurada: Boolean(process.env.DATABASE_URL),
+    telegramConfigurado: Boolean(
+      process.env.BOT_TOKEN && process.env.CHAT_ID
+    ),
+    horaAngola: horaAngola()
+  });
 });
 
 app.get("/db/teste", async (req, res) => {
   if (!pool) {
-    return res.status(500).json({
+    return res.status(503).json({
       sucesso: false,
       erro: "DATABASE_URL não está configurada no Render."
     });
   }
 
   try {
-    const resultado = await pool.query(
-      "SELECT NOW() AS hora_servidor, current_database() AS base"
-    );
+    const resultado = await pool.query(`
+      SELECT NOW() AS hora_servidor,
+             CURRENT_DATE AS dia_servidor
+    `);
 
     res.json({
       sucesso: true,
       mensagem: "Ligação PostgreSQL estabelecida.",
-      base: resultado.rows[0].base,
-      horaServidorUTC: resultado.rows[0].hora_servidor
+      horaAngola: horaAngola(),
+      baseDados: "conectada",
+      teste: resultado.rows[0]
     });
   } catch (erro) {
-    res.status(502).json({
+    res.status(500).json({
       sucesso: false,
       erro: erro.message
     });
@@ -283,10 +227,10 @@ app.get("/db/preparar", async (req, res) => {
 
     res.json({
       sucesso: true,
-      mensagem: "Tabelas preparadas para resultados, sinais e estatísticas."
+      mensagem: "Tabelas da base de dados preparadas."
     });
   } catch (erro) {
-    res.status(502).json({
+    res.status(500).json({
       sucesso: false,
       erro: erro.message
     });
@@ -295,17 +239,78 @@ app.get("/db/preparar", async (req, res) => {
 
 app.get("/db/sincronizar", async (req, res) => {
   try {
+    await prepararBaseDados();
+
     const resultados = await obterResultados();
-    const guardados = await guardarResultados(resultados);
+    let guardados = 0;
+
+    for (const r of resultados) {
+      const insercao = await pool.query(
+        `INSERT INTO bacbo_resultados
+          (id, resultado, estado, inicio, fim,
+           pontos_jogador, pontos_banca, multiplicador)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (id) DO NOTHING
+         RETURNING id`,
+        [
+          r.id,
+          r.resultado,
+          r.estado,
+          r.inicio,
+          r.fim,
+          r.pontosJogador,
+          r.pontosBanca,
+          r.multiplicador
+        ]
+      );
+
+      guardados += insercao.rowCount;
+    }
 
     res.json({
       sucesso: true,
-      resultadosRecebidos: resultados.length,
-      novosResultadosGuardados: guardados,
-      horaAngola: horaAngola()
+      recebidos: resultados.length,
+      novosGuardados: guardados,
+      mensagem: "Sincronização concluída. Esta rota guarda resultados, não gera sinais."
     });
   } catch (erro) {
-    res.status(502).json({
+    res.status(500).json({
+      sucesso: false,
+      erro: erro.message
+    });
+  }
+});
+
+app.get("/resultados", async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({
+      sucesso: false,
+      erro: "Base de dados não configurada."
+    });
+  }
+
+  try {
+    const limite = Math.min(
+      Math.max(parseInt(req.query.limite, 10) || 10, 1),
+      100
+    );
+
+    const resultado = await pool.query(
+      `SELECT id, resultado, estado, inicio, fim,
+              pontos_jogador, pontos_banca, multiplicador
+       FROM bacbo_resultados
+       ORDER BY fim DESC NULLS LAST
+       LIMIT $1`,
+      [limite]
+    );
+
+    res.json({
+      sucesso: true,
+      total: resultado.rowCount,
+      resultados: resultado.rows
+    });
+  } catch (erro) {
+    res.status(500).json({
       sucesso: false,
       erro: erro.message
     });
@@ -314,22 +319,24 @@ app.get("/db/sincronizar", async (req, res) => {
 
 app.get("/estatisticas", async (req, res) => {
   if (!pool) {
-    return res.status(500).json({
+    return res.status(503).json({
       sucesso: false,
-      erro: "DATABASE_URL não está configurada."
+      erro: "Base de dados não configurada."
     });
   }
 
   try {
     const hoje = await pool.query(`
-      SELECT *
+      SELECT dia_angola, total_sinais, green, loss,
+             g1, g2, empates, atualizada_em
       FROM estatisticas_diarias
-      WHERE dia_angola = (timezone('Africa/Luanda', NOW()))::date
+      WHERE dia_angola =
+        (NOW() AT TIME ZONE 'Africa/Luanda')::date
     `);
 
-    const historico = await pool.query(`
-      SELECT dia_angola, total_sinais, green, loss, gs, g1, g2,
-             ge, ge1, ge2, empates
+    const ultimosDias = await pool.query(`
+      SELECT dia_angola, total_sinais, green, loss,
+             g1, g2, empates
       FROM estatisticas_diarias
       ORDER BY dia_angola DESC
       LIMIT 30
@@ -337,11 +344,14 @@ app.get("/estatisticas", async (req, res) => {
 
     res.json({
       sucesso: true,
-      hoje: hoje.rows[0] || null,
-      historico: historico.rows
+      horaAngola: horaAngola(),
+      hoje: hoje.rows[0] || {
+        mensagem: "Ainda não existem estatísticas registadas para hoje."
+      },
+      ultimos30Dias: ultimosDias.rows
     });
   } catch (erro) {
-    res.status(502).json({
+    res.status(500).json({
       sucesso: false,
       erro: erro.message
     });
@@ -349,29 +359,18 @@ app.get("/estatisticas", async (req, res) => {
 });
 
 app.get("/telegram/teste", async (req, res) => {
-  const token = process.env.BOT_TOKEN;
-  const chatId = process.env.CHAT_ID;
-
-  if (!token || !chatId) {
-    return res.status(500).json({
-      sucesso: false,
-      erro: "Configura BOT_TOKEN e CHAT_ID no Render."
-    });
-  }
-
   try {
-    const resposta = await axios.post(
-      `https://api.telegram.org/bot${token}/sendMessage`,
-      {
-        chat_id: chatId,
-        text: "✅ Capunga Dados Bot: teste do Telegram concluído."
-      },
-      { timeout: 15000 }
+    await enviarTelegram(
+      "✅ Dados AO Bot: teste de ligação ao Telegram.\nHora de Angola: " +
+      horaAngola()
     );
 
-    res.json({ sucesso: resposta.data.ok });
+    res.json({
+      sucesso: true,
+      mensagem: "Mensagem de teste enviada ao Telegram."
+    });
   } catch (erro) {
-    res.status(502).json({
+    res.status(500).json({
       sucesso: false,
       erro: erro.response?.data?.description || erro.message
     });
@@ -386,12 +385,13 @@ app.use((req, res) => {
   });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Capunga Dados Bot ativo na porta ${PORT}`);
+app.listen(PORT, () => {
+  console.log(`Dados AO Bot ativo na porta ${PORT}`);
+  console.log(`Hora de Angola: ${horaAngola()}`);
 });
 
 process.on("SIGTERM", async () => {
-  if (pool) await pool.end().catch(() => {});
+  if (pool) await pool.end();
   process.exit(0);
 });
-    
+  
