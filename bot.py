@@ -30,3 +30,24 @@ def enviar_mensagem():
 
 if __name__ == "__main__":
     enviar_mensagem()
+import os
+import requests
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
+
+def enviar_mensagem(texto):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    resposta = requests.post(
+        url,
+        data={"chat_id": CHAT_ID, "text": texto},
+        timeout=20
+    )
+    resposta.raise_for_status()
+
+if __name__ == "__main__":
+    enviar_mensagem(
+        "🤖 Capunga Dados Bot está online!\n"
+        "⚠️ A ligação ao Telegram foi iniciada.\n"
+        "Os sinais Bac bo ainda não estão ligados aos resultados em tempo real."
+    )
