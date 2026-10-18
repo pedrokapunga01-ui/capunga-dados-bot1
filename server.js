@@ -12,12 +12,39 @@ const PORT = process.env.PORT || 3000;
 const CASINOSCORES_URL =
   "https://www.casino.org/casinoscores/pt-br/bac-bo/";
 
+async function obterHTML() {
+  const resposta = await axios.get(CASINOSCORES_URL, {
+    timeout: 20000,
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "text/html"
+    }
+  });
+
+  return typeof resposta.data === "string"
+    ? resposta.data
+    : JSON.stringify(resposta.data);
+}
+
+function limparHTML(html) {
+  return html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 app.get("/", (req, res) => {
   res.json({
     bot: "Dados AO Bot",
     status: "online",
     fonte: "CasinoScores",
-    mensagem: "Servidor ativo. Captura de resultados por testar."
+    mensagem: "Servidor ativo."
   });
 });
 
@@ -25,43 +52,65 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Testa se o servidor consegue aceder ao CasinoScores.
+// Testar acesso ao CasinoScores
 app.get("/teste-casinoscores", async (req, res) => {
   try {
-    const resposta = await axios.get(CASINOSCORES_URL, {
-      timeout: 20000,
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/html"
-      }
-    });
-
-    const html =
-      typeof resposta.data === "string"
-        ? resposta.data
-        : JSON.stringify(resposta.data);
+    const html = await obterHTML();
 
     res.json({
       fonte: "CasinoScores",
       sucesso: true,
-      statusHTTP: resposta.status,
+      statusHTTP: 200,
       tamanhoHTML: html.length,
-      contemHistorico: html.includes("Histórico de Lançamentos"),
+      contemHistorico:
+        html.toLowerCase().includes("histórico de lançamentos"),
       contemBacBo: html.toLowerCase().includes("bac bo"),
-      aviso: "O acesso à página foi testado. Os resultados reais ainda precisam de ser extraídos."
+      aviso:
+        "O acesso funciona, mas isso não confirma que os resultados reais foram extraídos."
     });
   } catch (error) {
     res.status(502).json({
       fonte: "CasinoScores",
       sucesso: false,
       erro: error.response
-        ? "O CasinoScores respondeu com HTTP " + error.response.status
+        ? "HTTP " + error.response.status
         : error.message
     });
   }
 });
 
-// Teste de ligação ao Telegram.
+// Tentar extrair o texto do histórico
+app.get("/resultados", async (req, res) => {
+  try {
+    const html = await obterHTML();
+    const texto = limparHTML(html);
+
+    const posicao = texto
+      .toLowerCase()
+      .indexOf("histórico de lançamentos");
+
+    res.json({
+      fonte: "CasinoScores",
+      sucesso: true,
+      encontrouHistorico: posicao !== -1,
+      trecho: posicao !== -1
+        ? texto.substring(posicao, posicao + 3000)
+        : texto.substring(0, 3000),
+      aviso:
+        "Este é um teste de extração de texto. Os resultados podem ser carregados separadamente pela página."
+    });
+  } catch (error) {
+    res.status(502).json({
+      fonte: "CasinoScores",
+      sucesso: false,
+      erro: error.response
+        ? "HTTP " + error.response.status
+        : error.message
+    });
+  }
+});
+
+// Testar ligação ao Telegram
 app.get("/telegram/teste", async (req, res) => {
   const token = process.env.BOT_TOKEN;
   const chatId = process.env.CHAT_ID;
@@ -90,7 +139,8 @@ app.get("/telegram/teste", async (req, res) => {
   } catch (error) {
     res.status(502).json({
       enviado: false,
-      erro: error.response?.data?.description ||
+      erro:
+        error.response?.data?.description ||
         "Falha no envio para o Telegram."
     });
   }
@@ -99,3 +149,4 @@ app.get("/telegram/teste", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Dados AO Bot ativo na porta ${PORT}`);
 });
+    
