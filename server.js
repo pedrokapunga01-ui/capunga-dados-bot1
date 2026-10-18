@@ -66,7 +66,7 @@ app.get("/teste-casinoscores", async (req, res) => {
         html.toLowerCase().includes("histórico de lançamentos"),
       contemBacBo: html.toLowerCase().includes("bac bo"),
       aviso:
-        "O acesso funciona, mas isso não confirma que os resultados reais foram extraídos."
+        "O acesso funciona, mas isso não confirma a extração dos resultados reais."
     });
   } catch (error) {
     res.status(502).json({
@@ -97,7 +97,62 @@ app.get("/resultados", async (req, res) => {
         ? texto.substring(posicao, posicao + 3000)
         : texto.substring(0, 3000),
       aviso:
-        "Este é um teste de extração de texto. Os resultados podem ser carregados separadamente pela página."
+        "Os resultados podem ser carregados separadamente pela página."
+    });
+  } catch (error) {
+    res.status(502).json({
+      fonte: "CasinoScores",
+      sucesso: false,
+      erro: error.response
+        ? "HTTP " + error.response.status
+        : error.message
+    });
+  }
+});
+
+// Diagnóstico dos scripts e pistas de possíveis fontes de dados
+app.get("/diagnostico", async (req, res) => {
+  try {
+    const html = await obterHTML();
+
+    const scripts = [
+      ...html.matchAll(
+        /<script\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi
+      )
+    ].map(m => m[1]);
+
+    const termos = [
+      "latest rolls",
+      "latestrolls",
+      "api/",
+      "graphql",
+      "results",
+      "history",
+      "rolls"
+    ];
+
+    const encontrados = {};
+    const htmlMinusculo = html.toLowerCase();
+
+    for (const termo of termos) {
+      const pos = htmlMinusculo.indexOf(termo);
+
+      encontrados[termo] = pos >= 0
+        ? html.substring(
+            Math.max(0, pos - 150),
+            pos + 350
+          )
+        : null;
+    }
+
+    res.json({
+      fonte: "CasinoScores",
+      sucesso: true,
+      quantidadeScripts: scripts.length,
+      scripts: scripts.slice(0, 30),
+      pistas: encontrados,
+      aviso:
+        "Diagnóstico inicial. Ainda não confirma uma API nem extrai resultados reais."
     });
   } catch (error) {
     res.status(502).json({
