@@ -7,6 +7,8 @@ const { Pool } = require("pg");
 const app = express();
 const PORT = process.env.PORT || 3000;
 const INTERVALO_SINCRONIZACAO = 10000;
+const MAX_GALE = 2;
+const SINAIS_ATIVOS = process.env.SINAIS_ATIVOS === "true";
 
 app.use(cors());
 app.use(express.json());
@@ -91,9 +93,7 @@ async function obterResultados() {
 
 async function prepararBaseDados() {
   if (!pool) {
-    throw new Error(
-      "DATABASE_URL não está configurada no Render."
-    );
+    throw new Error("DATABASE_URL não está configurada no Render.");
   }
 
   await pool.query(`
@@ -147,16 +147,11 @@ async function enviarTelegram(mensagem) {
   const chatId = process.env.CHAT_ID;
 
   if (!token || !chatId) {
-    throw new Error(
-      "BOT_TOKEN ou CHAT_ID não configurado no Render."
-    );
+    throw new Error("BOT_TOKEN ou CHAT_ID não configurado no Render.");
   }
 
-  const url =
-    `https://api.telegram.org/bot${token}/sendMessage`;
-
   const resposta = await axios.post(
-    url,
+    `https://api.telegram.org/bot${token}/sendMessage`,
     {
       chat_id: chatId,
       text: mensagem
@@ -167,6 +162,225 @@ async function enviarTelegram(mensagem) {
   return resposta.data;
 }
 
+async function atualizarEstatistica(campo, incremento = 1, dia = null) {
+  const camposPermitidos = [
+    "total_sinais", "green", "loss", "g1", "g2", "empates"
+  ];
+
+  if (!camposPermitidos.includes(campo)) return;
+
+  const data = dia || null;
+
+  await pool.query(
+    `INSERT INTO estatisticas_diarias
+       (dia_angola, ${campo}, atualizada_em)
+     VALUES (
+       COALESCE($1::date, (NOW() AT TIME ZONE 'Africa/Luanda')::date),
+       $2, NOW()
+     )
+     ON CONFLICT (dia_angola)
+     DO UPDATE SET
+       ${campo} = estatisticas_diarias.${campo} + EXCLUDED.${campo},
+       atualizada_em = NOW()`,
+    [data, incremento]
+  );
+}
+
+async function resolverSinalComRodada(rodada) {
+  const resultadoSinal = await pool.query(
+    `SELECT *
+     FROM sinais
+     WHERE estado = 'PENDENTE'
+       AND resultado_id IS DISTINCT FROM $1
+     ORDER BY id ASC
+     LIMIT 1`,
+    [rodada.id]
+  );
+
+  if (!resultadoSinal.rowCount) return;
+
+  const sinal = resultadoSinal.rows[0];
+
+  if (rodada.resultado === "Empate") {
+    await atualizarEstatistica("empates", 1, sinal.dia_angola);
+
+    await enviarTelegram(
+      `🟡 DADOS AO BOT\n` +
+      `Resultado: EMPATE\n` +
+      `Sinal #${sinal.id} protegido.\n` +
+      `A gale não avança.\n` +
+      `A aguardar nova rodada.`
+    ).catch(err => console.error("Telegram:", err.message));
+
+    return;
+  }
+
+  if (rodada.resultado === sinal.cor) {
+    const estadoFinal =
+      sinal.gale === 0 ? "GREEN" :
+      sinal.gale === 1 ? "G1" : "G2";
+
+    await pool.query(
+      `UPDATE sinais
+       SET estado = $1, resolvido_em = NOW(),
+           observacoes = COALESCE(observacoes, '')
+             || $2
+       WHERE id = $3`,
+      [
+        estadoFinal,
+        ` | Resultado confirmado: ${rodada.resultado}`,
+        sinal.id
+      ]
+    );
+
+    const campo =
+      estadoFinal === "GREEN" ? "green" : estadoFinal.toLowerCase();
+
+    await atualizarEstatistica(campo, 1, sinal.dia_angola);
+
+    await enviarTelegram(
+      `✅ DADOS AO BOT\n` +
+      `Sinal #${sinal.id}: ${estadoFinal}\n` +
+      `Resultado: ${rodada.resultado}\n` +
+      `Hora Angola: ${horaAngola()}`
+    ).catch(err => console.error("Telegram:", err.message));
+
+    return;
+  }
+
+  if (sinal.gale < MAX_GALE) {
+    const proximaGale = sinal.gale + 1;
+
+    await pool.query(
+      `UPDATE sinais
+       SET gale = $1,
+           observacoes = COALESCE(observacoes, '') || $2
+       WHERE id = $3`,
+      [
+        proximaGale,
+        ` | Divergência na gale ${sinal.gale}: ${rodada.resultado}`,
+        sinal.id
+      ]
+    );
+
+    await enviarTelegram(
+      `⚠️ DADOS AO BOT\n` +
+      `Sinal #${sinal.id}\n` +
+      `Resultado: ${rodada.resultado}\n` +
+      `A avançar para G${proximaGale}.\n` +
+      `Cor original: ${sinal.cor}`
+    ).catch(err => console.error("Telegram:", err.message));
+
+    return;
+  }
+
+  await pool.query(
+    `UPDATE sinais
+     SET estado = 'LOSS',
+         resolvido_em = NOW(),
+         observacoes = COALESCE(observacoes, '') || $1
+     WHERE id = $2`,
+    [
+      ` | LOSS após G2; último resultado: ${rodada.resultado}`,
+      sinal.id
+    ]
+  );
+
+  await atualizarEstatistica("loss", 1, sinal.dia_angola);
+
+  await enviarTelegram(
+    `❌ DADOS AO BOT\n` +
+    `Sinal #${sinal.id}: LOSS\n` +
+    `Gale máximo atingido.\n` +
+    `Hora Angola: ${horaAngola()}`
+  ).catch(err => console.error("Telegram:", err.message));
+}
+
+/*
+ Estratégia experimental:
+ identifica três resultados iguais consecutivos,
+ precedidos por um resultado diferente.
+ Não existe garantia de previsão ou de lucro.
+*/
+async function tentarGerarSinal(rodadaAtual) {
+  if (!SINAIS_ATIVOS) return;
+  if (!["Banca", "Jogador"].includes(rodadaAtual.resultado)) return;
+
+  const pendente = await pool.query(
+    `SELECT id FROM sinais
+     WHERE estado = 'PENDENTE'
+     LIMIT 1`
+  );
+
+  if (pendente.rowCount) return;
+
+  const ultimos = await pool.query(`
+    SELECT id, resultado
+    FROM bacbo_resultados
+    WHERE resultado IN ('Banca', 'Jogador', 'Empate')
+    ORDER BY COALESCE(fim, inicio) DESC NULLS LAST,
+             guardado_em DESC
+    LIMIT 4
+  `);
+
+  if (ultimos.rowCount < 4) return;
+
+  const [a, b, c, d] = ultimos.rows;
+
+  if (
+    a.resultado === "Empate" ||
+    b.resultado === "Empate" ||
+    c.resultado === "Empate" ||
+    d.resultado === "Empate"
+  ) return;
+
+  // a é o mais recente; b e c devem igualar a;
+  // d deve ser diferente.
+  if (
+    a.resultado !== b.resultado ||
+    b.resultado !== c.resultado ||
+    c.resultado === d.resultado
+  ) return;
+
+  const cor = a.resultado === "Banca" ? "Jogador" : "Banca";
+
+  const criado = await pool.query(
+    `INSERT INTO sinais
+       (cor, estado, gale, resultado_id, observacoes)
+     VALUES ($1, 'PENDENTE', 0, $2, $3)
+     RETURNING id, cor, criado_em`,
+    [
+      cor,
+      rodadaAtual.id,
+      "Estratégia experimental: sequência de três resultados iguais."
+    ]
+  );
+
+  const sinal = criado.rows[0];
+
+  await atualizarEstatistica("total_sinais", 1);
+
+  try {
+    await enviarTelegram(
+      `🎯 DADOS AO BOT — NOVO SINAL\n\n` +
+      `Sinal: #${sinal.id}\n` +
+      `Mesa: Bac bo\n` +
+      `Entrada experimental: ${sinal.cor}\n` +
+      `Proteção: Empate não avança a gale\n` +
+      `Gale máximo: G2\n` +
+      `Hora Angola: ${horaAngola()}\n\n` +
+      `⚠️ Sinal experimental, sem garantia de acerto.`
+    );
+  } catch (erro) {
+    console.error("Falha ao enviar sinal:", erro.message);
+  }
+}
+
+async function processarNovaRodada(rodada) {
+  await resolverSinalComRodada(rodada);
+  await tentarGerarSinal(rodada);
+}
+
 async function sincronizarResultados() {
   if (!pool) {
     throw new Error("Base de dados não configurada.");
@@ -175,6 +389,14 @@ async function sincronizarResultados() {
   await prepararBaseDados();
 
   const resultados = await obterResultados();
+
+  // Processar do mais antigo para o mais recente.
+  resultados.sort((a, b) => {
+    const dataA = new Date(a.fim || a.inicio || 0).getTime();
+    const dataB = new Date(b.fim || b.inicio || 0).getTime();
+    return dataA - dataB;
+  });
+
   let novosGuardados = 0;
 
   for (const r of resultados) {
@@ -199,17 +421,14 @@ async function sincronizarResultados() {
       ]
     );
 
-    novosGuardados += insercao.rowCount;
+    if (insercao.rowCount > 0) {
+      novosGuardados++;
+      await processarNovaRodada(r);
+    }
   }
 
   ultimaSincronizacao = horaAngola();
   ultimoErroSincronizacao = null;
-
-  if (novosGuardados > 0) {
-    console.log(
-      `Sincronização: ${novosGuardados} novos resultados guardados.`
-    );
-  }
 
   return {
     recebidos: resultados.length,
@@ -226,9 +445,7 @@ async function sincronizarAutomaticamente() {
     const resultado = await sincronizarResultados();
 
     if (resultado.novosGuardados > 0) {
-      console.log(
-        `Total novo: ${resultado.novosGuardados}`
-      );
+      console.log(`Novos resultados: ${resultado.novosGuardados}`);
     }
   } catch (erro) {
     ultimoErroSincronizacao =
@@ -236,11 +453,7 @@ async function sincronizarAutomaticamente() {
       erro.response?.statusText ||
       erro.message;
 
-    console.error(
-      "Erro na sincronização automática:",
-      erro.response?.status || "",
-      ultimoErroSincronizacao
-    );
+    console.error("Erro de sincronização:", ultimoErroSincronizacao);
   } finally {
     sincronizacaoEmCurso = false;
   }
@@ -250,6 +463,7 @@ app.get("/", (req, res) => {
   res.json({
     nome: "Dados AO Bot",
     online: true,
+    sinaisAtivos: SINAIS_ATIVOS,
     horaAngola: horaAngola(),
     rotas: [
       "/health",
@@ -258,6 +472,7 @@ app.get("/", (req, res) => {
       "/db/preparar",
       "/db/sincronizar",
       "/resultados",
+      "/sinais",
       "/estatisticas",
       "/telegram/teste"
     ]
@@ -279,6 +494,7 @@ app.get("/diagnostico", (req, res) => {
     telegramConfigurado: Boolean(
       process.env.BOT_TOKEN && process.env.CHAT_ID
     ),
+    sinaisAtivos: SINAIS_ATIVOS,
     sincronizacaoEmCurso,
     ultimaSincronizacao,
     erroSincronizacao: ultimoErroSincronizacao,
@@ -296,37 +512,26 @@ app.get("/db/teste", async (req, res) => {
 
   try {
     const resultado = await pool.query(
-      "SELECT NOW() AS hora_servidor, CURRENT_DATE AS dia_servidor"
+      "SELECT NOW() AS hora_servidor"
     );
 
     res.json({
       sucesso: true,
       mensagem: "Ligação PostgreSQL estabelecida.",
       horaAngola: horaAngola(),
-      baseDados: "conectada",
       teste: resultado.rows[0]
     });
   } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.message
-    });
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
 app.get("/db/preparar", async (req, res) => {
   try {
     await prepararBaseDados();
-
-    res.json({
-      sucesso: true,
-      mensagem: "Tabelas da base de dados preparadas."
-    });
+    res.json({ sucesso: true, mensagem: "Tabelas preparadas." });
   } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.message
-    });
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
@@ -347,8 +552,7 @@ app.get("/db/sincronizar", async (req, res) => {
       sucesso: true,
       ...resultado,
       ultimaSincronizacao,
-      mensagem:
-        "Sincronização concluída. Esta rota guarda resultados, não gera sinais."
+      sinaisAtivos: SINAIS_ATIVOS
     });
   } catch (erro) {
     res.status(500).json({
@@ -389,10 +593,41 @@ app.get("/resultados", async (req, res) => {
       resultados: resultado.rows
     });
   } catch (erro) {
-    res.status(500).json({
+    res.status(500).json({ sucesso: false, erro: erro.message });
+  }
+});
+
+app.get("/sinais", async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({
       sucesso: false,
-      erro: erro.message
+      erro: "Base de dados não configurada."
     });
+  }
+
+  try {
+    const limite = Math.min(
+      Math.max(parseInt(req.query.limite, 10) || 20, 1),
+      100
+    );
+
+    const resultado = await pool.query(
+      `SELECT id, criado_em, dia_angola, cor, estado,
+              gale, resultado_id, resolvido_em, observacoes
+       FROM sinais
+       ORDER BY id DESC
+       LIMIT $1`,
+      [limite]
+    );
+
+    res.json({
+      sucesso: true,
+      sinaisAtivos: SINAIS_ATIVOS,
+      total: resultado.rowCount,
+      sinais: resultado.rows
+    });
+  } catch (erro) {
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
@@ -425,16 +660,12 @@ app.get("/estatisticas", async (req, res) => {
       sucesso: true,
       horaAngola: horaAngola(),
       hoje: hoje.rows[0] || {
-        mensagem:
-          "Ainda não existem estatísticas registadas para hoje."
+        mensagem: "Ainda não existem estatísticas para hoje."
       },
       ultimos30Dias: ultimosDias.rows
     });
   } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.message
-    });
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
@@ -452,9 +683,7 @@ app.get("/telegram/teste", async (req, res) => {
   } catch (erro) {
     res.status(500).json({
       sucesso: false,
-      erro:
-        erro.response?.data?.description ||
-        erro.message
+      erro: erro.response?.data?.description || erro.message
     });
   }
 });
@@ -470,14 +699,11 @@ app.use((req, res) => {
 const servidor = app.listen(PORT, () => {
   console.log(`Dados AO Bot ativo na porta ${PORT}`);
   console.log(`Hora de Angola: ${horaAngola()}`);
+  console.log(`Sinais automáticos: ${SINAIS_ATIVOS ? "ATIVOS" : "DESATIVADOS"}`);
 
   setTimeout(() => {
     sincronizarAutomaticamente();
-
-    setInterval(
-      sincronizarAutomaticamente,
-      INTERVALO_SINCRONIZACAO
-    );
+    setInterval(sincronizarAutomaticamente, INTERVALO_SINCRONIZACAO);
   }, 3000);
 });
 
@@ -490,3 +716,4 @@ process.on("SIGTERM", async () => {
 
   process.exit(0);
 });
+    
