@@ -10,24 +10,24 @@
  *   CHAT_ID
  *   ADMIN_TOKEN
  *
- * Variáveis opcionais (com defaults):
+ * Variáveis opcionais (defaults):
  *   SINAIS_ATIVOS=true
- *   STREAK_MIN=4
- *   MAX_GALE=1
+ *   STREAK_MIN=3
+ *   MAX_GALE=2
  *   EMPATE_PROTEGIDO=true
- *   MAX_REDS_DIA=5
- *   INTERVALO_MINIMO_MS=120000
- *   SINAL_EXPIRA_MIN=15
- *   INTERVALO_SYNC_MS=12000
- *   API_BACBO=https://api-cs.casino.org/svc-evolution-game-events/api/bacbo
+ *   MAX_REDS_DIA=8
+ *   INTERVALO_MINIMO_MS=45000
+ *   SINAL_EXPIRA_MIN=10
+ *   INTERVALO_SYNC_MS=8000
  *
- * Lógica de entrada (mais seletiva):
- *   - Espera streak exato de STREAK_MIN da mesma cor (Jogador ou Banca)
- *   - A rodada que completa o streak gera o sinal de CONTINUAÇÃO
- *   - Gale até MAX_GALE
- *   - Empate protegido (não conta como red)
- *   - Limite diário de LOSS
- *   - Intervalo mínimo entre sinais
+ * Cores Telegram:
+ *   Banca  = Vermelho 🔴
+ *   Jogador = Azul 🔵
+ *
+ * Lógica de entrada (CORRIGIDA):
+ *   - Dispara quando os últimos STREAK_MIN resultados são da MESMA cor
+ *   - (antes exigia streak EXACTO e bloqueava sequências longas)
+ *   - Gale até 2 | Empate protegido | Placar após cada resultado
  */
 
 const express = require('express');
@@ -67,19 +67,19 @@ function intEnv(name, fallback, min, max) {
 
 const CONFIG = {
   sinaisAtivos: boolEnv(process.env.SINAIS_ATIVOS, true),
-  streakMin: intEnv('STREAK_MIN', 4, 3, 12),
-  maxGale: intEnv('MAX_GALE', 1, 0, 3),
+  streakMin: intEnv('STREAK_MIN', 3, 2, 12),
+  maxGale: intEnv('MAX_GALE', 2, 0, 3),
   empateProtegido: boolEnv(process.env.EMPATE_PROTEGIDO, true),
-  maxRedsDia: intEnv('MAX_REDS_DIA', 5, 1, 30),
-  intervaloMinimoMs: intEnv('INTERVALO_MINIMO_MS', 120000, 30000, 3600000),
-  sinalExpiraMin: intEnv('SINAL_EXPIRA_MIN', 15, 5, 60),
-  intervaloSyncMs: intEnv('INTERVALO_SYNC_MS', 12000, 8000, 60000)
+  maxRedsDia: intEnv('MAX_REDS_DIA', 8, 1, 50),
+  intervaloMinimoMs: intEnv('INTERVALO_MINIMO_MS', 45000, 15000, 3600000),
+  sinalExpiraMin: intEnv('SINAL_EXPIRA_MIN', 10, 3, 60),
+  intervaloSyncMs: intEnv('INTERVALO_SYNC_MS', 8000, 5000, 60000)
 };
 
 const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
-      ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL)
+      ssl: /localhost|127\\.0\\.0\\.1/i.test(DATABASE_URL)
         ? false
         : { rejectUnauthorized: false },
       max: 5,
@@ -108,7 +108,8 @@ const runtime = {
   ultimoErroAPI: null,
   ultimaRodadaDB: null,
   ultimoIdDB: null,
-  ciclosSemNovos: 0
+  ciclosSemNovos: 0,
+  motivoSemSinal: null
 };
 
 let schemaPromise = null;
@@ -128,6 +129,13 @@ function horaAngola() {
   }).format(new Date());
 }
 
+/** Banca = Vermelho 🔴 | Jogador = Azul 🔵 */
+function corDisplay(cor) {
+  if (cor === 'Banca') return '🔴 Vermelho 🔴';
+  if (cor === 'Jogador') return '🔵 Azul 🔵';
+  return String(cor || '');
+}
+
 function normalizeOutcome(value) {
   if (value && typeof value === 'object') {
     value =
@@ -142,7 +150,7 @@ function normalizeOutcome(value) {
     .replace(/[\u0300-\u036f]/g, '')
     .trim()
     .toLowerCase()
-    .replace(/[\s_-]+/g, '');
+    .replace(/[\\s_-]+/g, '');
 
   if (
     [
@@ -207,21 +215,6 @@ function extractItems(body) {
   return candidates.find(Array.isArray) || [];
 }
 
-/**
- * A API devolve:
- * [
- *   {
- *     id: "6ad5f...",          // id externo do evento
- *     data: {
- *       id: "18dfe7...",       // id real da rodada (usar este)
- *       startedAt, settledAt, status,
- *       result: { outcome: "PlayerWon"|"BankerWon"|"Tie", playerDice, bankerDice, multiplier }
- *     }
- *   },
- *   ...
- * ]
- * Ordenado do mais recente para o mais antigo.
- */
 function normalizeRound(item) {
   const d = item?.data || item?.round || item || {};
 
@@ -282,7 +275,6 @@ function normalizeRound(item) {
       'finalizado'
     ].some((word) => status.includes(word)) || Boolean(fim);
 
-  // Prioridade: id interno da rodada (data.id)
   const id = String(
     d.id ??
       d.roundId ??
@@ -421,7 +413,6 @@ async function ensureSchema() {
       ON sinais (criado_em DESC)
     `);
 
-    // Índice para acelerar contagem de reds do dia
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_sinais_loss_dia
       ON sinais (criado_em)
@@ -460,7 +451,6 @@ async function fetchRounds() {
       if (round) unique.set(round.id, round);
     }
 
-    // Ordenar do mais antigo para o mais recente (processamento cronológico)
     const rounds = [...unique.values()].sort(
       (a, b) => new Date(a.fim) - new Date(b.fim)
     );
@@ -471,8 +461,7 @@ async function fetchRounds() {
 
     if (items.length && !rounds.length) {
       log('AVISO API', {
-        mensagem:
-          'A API respondeu, mas não foram reconhecidas rodadas válidas.',
+        mensagem: 'API respondeu sem rodadas válidas',
         exemplo: items[0]
       });
     }
@@ -536,25 +525,19 @@ async function getRecentOutcomes(limit = 30) {
 }
 
 /**
- * Detecta streak EXATO de CONFIG.streakMin da mesma cor.
+ * CORRIGIDO: dispara com streak de PELO MENOS streakMin da mesma cor.
+ * Antes exigia streak EXACTO → sequências longas silenciavam o bot.
  * rows[0] = mais recente.
- * Só dispara quando a rodada que acaba de chegar completa exatamente o streak.
  */
 function detectEntry(rows) {
   const min = CONFIG.streakMin;
-  if (rows.length < min) return null;
+  if (!rows || rows.length < min) return null;
 
   const color = rows[0].resultado;
   if (!['Jogador', 'Banca'].includes(color)) return null;
 
-  // Os últimos `min` devem ser todos iguais
-  if (!rows.slice(0, min).every((row) => row.resultado === color)) {
-    return null;
-  }
-
-  // Se existir o (min)-ésimo anterior e for da mesma cor → streak maior, não dispara
-  if (rows.length > min && rows[min]?.resultado === color) {
-    return null;
+  for (let i = 0; i < min; i++) {
+    if (rows[i].resultado !== color) return null;
   }
 
   return color;
@@ -568,6 +551,81 @@ async function redsToday() {
       AND criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
   `);
   return result.rows[0]?.total || 0;
+}
+
+async function getPlacarDia() {
+  const result = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE estado = 'GREEN')::int AS green,
+      COUNT(*) FILTER (WHERE estado = 'G1')::int AS g1,
+      COUNT(*) FILTER (WHERE estado = 'G2')::int AS g2,
+      COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS loss,
+      COALESCE(SUM(empates), 0)::int AS empates
+    FROM sinais
+    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+      AND estado IN ('GREEN', 'G1', 'G2', 'LOSS')
+  `);
+
+  const s = result.rows[0] || {
+    green: 0,
+    g1: 0,
+    g2: 0,
+    loss: 0,
+    empates: 0
+  };
+
+  const acertos = (s.green || 0) + (s.g1 || 0) + (s.g2 || 0);
+  const finalizados = acertos + (s.loss || 0);
+  const percent =
+    finalizados > 0
+      ? Number(((acertos / finalizados) * 100).toFixed(1))
+      : 100;
+
+  const recent = await pool.query(`
+    SELECT estado
+    FROM sinais
+    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+      AND estado IN ('GREEN', 'G1', 'G2', 'LOSS')
+    ORDER BY criado_em DESC, id DESC
+    LIMIT 50
+  `);
+
+  let greensSeguidos = 0;
+  for (const row of recent.rows) {
+    if (row.estado === 'GREEN' || row.estado === 'G1' || row.estado === 'G2') {
+      greensSeguidos++;
+    } else {
+      break;
+    }
+  }
+
+  return {
+    green: s.green || 0,
+    g1: s.g1 || 0,
+    g2: s.g2 || 0,
+    empates: s.empates || 0,
+    loss: s.loss || 0,
+    percent,
+    greensSeguidos
+  };
+}
+
+function formatPlacar(p) {
+  return [
+    '',
+    '━━━━━━━━━━━━━━━━━━━━',
+    '🎲🇺🇸 CAPUNGA BOT 🇺🇸🎲',
+    '📊 PLACAR DO DIA 📊',
+    '━━━━━━━━━━━━━━━━━━━━',
+    `🟩 GREEN (sem gale): ${p.green}`,
+    `🟨 G1: ${p.g1}`,
+    `🟧 G2: ${p.g2}`,
+    `🟡 Empates: ${p.empates}`,
+    `🟥 LOSS: ${p.loss}`,
+    `📈 Percentagem: ${p.percent}%`,
+    `🔥 Greens seguidos: ${p.greensSeguidos}`,
+    '━━━━━━━━━━━━━━━━━━━━'
+  ].join('\n');
 }
 
 async function getPendingSignal() {
@@ -596,28 +654,108 @@ async function expirePendingSignal(signal) {
   );
 
   await telegramSend(
-    `⌛ SINAL EXPIRADO\nSinal #${signal.id}\nHora Angola: ${horaAngola()}`
+    [
+      '⌛ SINAL EXPIRADO',
+      `Sinal #${signal.id}`,
+      `🕒 Hora Angola: ${horaAngola()}`
+    ].join('\n')
   );
 
   log('SINAL EXPIRADO', { id: signal.id });
   return true;
 }
 
+function msgNovoSinal(color) {
+  return [
+    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
+    '⚠️🚨 Entrada Confirmada 🚨⚠️',
+    `Cor: ${corDisplay(color)}`,
+    '🪬 Proteção: 🟡 Empate 🟡',
+    `🐓 Gale Máximo: ${CONFIG.maxGale}`,
+    '🧠 Faça Gestão de Banca 🧠',
+    `🕒 ${horaAngola()}`
+  ].join('\n');
+}
+
+function msgResultadoGreen(signal, state) {
+  let titulo;
+  if (state === 'GREEN') {
+    titulo = '🟩🏆 GREEEEN 🏆🟩\n✨ Sem Gale ✨';
+  } else if (state === 'G1') {
+    titulo = '🟨🏆 GREEN G1 🏆🟨\n🐓 Gale 1';
+  } else {
+    titulo = '🟧🏆 GREEN G2 🏆🟧\n🐓 Gale 2';
+  }
+
+  return [
+    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
+    '📋 RESULTADO DO SINAL',
+    titulo,
+    `🎯 Entrada: ${corDisplay(signal.cor)}`,
+    `📌 Sinal #${signal.id}`,
+    `🕒 ${horaAngola()}`
+  ].join('\n');
+}
+
+function msgResultadoLoss(signal) {
+  return [
+    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
+    '📋 RESULTADO DO SINAL',
+    '🟥❌ LOSS FINAL ❌🟥',
+    `🎯 Entrada: ${corDisplay(signal.cor)}`,
+    `🐓 Gale usado: ${signal.gale || 0}/${CONFIG.maxGale}`,
+    `📌 Sinal #${signal.id}`,
+    `🕒 ${horaAngola()}`
+  ].join('\n');
+}
+
+function msgGale(signal, nextGale) {
+  return [
+    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
+    `🐓 GALE ${nextGale} 🐓`,
+    `🎯 Mantém: ${corDisplay(signal.cor)}`,
+    `📌 Sinal #${signal.id}`,
+    `🕒 ${horaAngola()}`
+  ].join('\n');
+}
+
+function msgEmpate(signal) {
+  return [
+    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
+    '🟡🤝 EMPATE PROTEGIDO 🤝🟡',
+    `📌 Sinal #${signal.id} continua pendente`,
+    `🎯 Entrada: ${corDisplay(signal.cor)}`,
+    `🕒 ${horaAngola()}`
+  ].join('\n');
+}
+
 async function maybeCreateSignal(round) {
-  if (!CONFIG.sinaisAtivos) return;
-  if (!['Jogador', 'Banca'].includes(round.resultado)) return;
+  if (!CONFIG.sinaisAtivos) {
+    runtime.motivoSemSinal = 'sinais_desativados';
+    return;
+  }
+  if (!['Jogador', 'Banca'].includes(round.resultado)) {
+    runtime.motivoSemSinal = 'rodada_empate_ou_invalida';
+    return;
+  }
 
-  // Já existe sinal pendente → não criar outro
-  if (await getPendingSignal()) return;
+  const pending = await getPendingSignal();
+  if (pending) {
+    if (await expirePendingSignal(pending)) {
+      // expirou → pode criar novo
+    } else {
+      runtime.motivoSemSinal = `pendente_#${pending.id}`;
+      return;
+    }
+  }
 
-  // Limite diário de LOSS
   const reds = await redsToday();
   if (reds >= CONFIG.maxRedsDia) {
+    runtime.motivoSemSinal = `limite_reds_${reds}`;
     log('LIMITE REDS', { reds, max: CONFIG.maxRedsDia });
     return;
   }
 
-  // Intervalo mínimo desde o último sinal (qualquer estado)
   const lastResult = await pool.query(`
     SELECT criado_em FROM sinais
     ORDER BY criado_em DESC, id DESC LIMIT 1
@@ -627,21 +765,29 @@ async function maybeCreateSignal(round) {
     last?.criado_em &&
     Date.now() - new Date(last.criado_em).getTime() < CONFIG.intervaloMinimoMs
   ) {
+    runtime.motivoSemSinal = 'intervalo_minimo';
     return;
   }
 
-  const rows = await getRecentOutcomes(CONFIG.streakMin + 2);
+  const rows = await getRecentOutcomes(CONFIG.streakMin + 5);
   const color = detectEntry(rows);
-  if (!color) return;
+  if (!color) {
+    const recent = rows
+      .slice(0, CONFIG.streakMin)
+      .map((r) => r.resultado)
+      .join(',');
+    runtime.motivoSemSinal = `sem_streak_${CONFIG.streakMin}[${recent}]`;
+    return;
+  }
 
-  // Proteção extra: não criar sinal se a rodada atual já foi usada como resultado_id
   const jaUsada = await pool.query(
-    `
-    SELECT 1 FROM sinais WHERE resultado_id = $1 LIMIT 1
-  `,
+    `SELECT 1 FROM sinais WHERE resultado_id = $1 LIMIT 1`,
     [round.id]
   );
-  if (jaUsada.rows.length > 0) return;
+  if (jaUsada.rows.length > 0) {
+    runtime.motivoSemSinal = 'rodada_ja_usada';
+    return;
+  }
 
   const result = await pool.query(
     `
@@ -660,21 +806,9 @@ async function maybeCreateSignal(round) {
     estado: signal.estado,
     criado_em: signal.criado_em
   };
+  runtime.motivoSemSinal = null;
 
-  const msg = [
-    '🎲 CAPUNGA DADOS',
-    '📣 NOVO SINAL BAC BO',
-    `🎯 Entrada: ${color.toUpperCase()}`,
-    `🛡️ Gale máximo: ${CONFIG.maxGale}`,
-    CONFIG.empateProtegido
-      ? '🤝 Empate protegido'
-      : '🤝 Empate NÃO protegido',
-    `📊 Streak mínimo: ${CONFIG.streakMin}`,
-    `🕒 Hora Angola: ${horaAngola()}`,
-    '⚠️ Gestão de banca responsável. Não existe garantia de acerto.'
-  ].join('\n');
-
-  await telegramSend(msg);
+  await telegramSend(msgNovoSinal(color));
   log('SINAL CRIADO', { id: signal.id, cor: color, roundId: round.id });
 }
 
@@ -682,12 +816,10 @@ async function resolvePending(round) {
   const signal = await getPendingSignal();
   if (!signal) return;
 
-  // Ignora a própria rodada que gerou o sinal
   if (String(signal.resultado_id) === String(round.id)) return;
 
   if (await expirePendingSignal(signal)) return;
 
-  // Empate
   if (round.resultado === 'Empate') {
     if (!CONFIG.empateProtegido) return;
 
@@ -700,15 +832,15 @@ async function resolvePending(round) {
       [signal.id]
     );
 
-    await telegramSend(
-      `🤝 EMPATE PROTEGIDO\nSinal #${signal.id}\nContinua pendente.\nHora Angola: ${horaAngola()}`
-    );
+    await telegramSend(msgEmpate(signal));
     return;
   }
 
-  // GREEN (acerto sem gale) ou G1 (acerto no gale)
   if (round.resultado === signal.cor) {
-    const state = Number(signal.gale || 0) === 0 ? 'GREEN' : 'G1';
+    const galeNum = Number(signal.gale || 0);
+    let state = 'GREEN';
+    if (galeNum === 1) state = 'G1';
+    else if (galeNum >= 2) state = 'G2';
 
     await pool.query(
       `
@@ -719,21 +851,12 @@ async function resolvePending(round) {
       [state, round.resultado, signal.id]
     );
 
-    await telegramSend(
-      [
-        '✅ RESULTADO DO SINAL',
-        `Sinal: #${signal.id}`,
-        `Entrada: ${signal.cor}`,
-        `Resultado: ${state}`,
-        `Hora Angola: ${horaAngola()}`
-      ].join('\n')
-    );
-
+    const placar = await getPlacarDia();
+    await telegramSend(msgResultadoGreen(signal, state) + formatPlacar(placar));
     log('SINAL RESOLVIDO', { id: signal.id, estado: state });
     return;
   }
 
-  // Errou → sobe gale ou LOSS final
   const nextGale = Number(signal.gale || 0) + 1;
 
   if (nextGale <= CONFIG.maxGale) {
@@ -745,14 +868,11 @@ async function resolvePending(round) {
       [nextGale, signal.id]
     );
 
-    await telegramSend(
-      `🔁 GALE ${nextGale}\nSinal #${signal.id}\nEntrada original: ${signal.cor}\nHora Angola: ${horaAngola()}`
-    );
+    await telegramSend(msgGale(signal, nextGale));
     log('GALE', { id: signal.id, gale: nextGale });
     return;
   }
 
-  // LOSS final
   await pool.query(
     `
     UPDATE sinais
@@ -762,9 +882,8 @@ async function resolvePending(round) {
     [round.resultado, signal.id]
   );
 
-  await telegramSend(
-    `❌ LOSS FINAL\nSinal #${signal.id}\nHora Angola: ${horaAngola()}`
-  );
+  const placar = await getPlacarDia();
+  await telegramSend(msgResultadoLoss(signal) + formatPlacar(placar));
   log('SINAL LOSS', { id: signal.id });
 }
 
@@ -807,12 +926,16 @@ async function syncOnce() {
       inserted++;
       lastNew = round;
 
-      // Só analisa sinais se já existia histórico (evita sinais retroativos no 1º boot)
       if (hadHistory) {
         await resolvePending(round);
         await maybeCreateSignal(round);
         evaluated++;
       }
+    }
+
+    if (inserted === 0 && hadHistory) {
+      const pending = await getPendingSignal();
+      if (pending) await expirePendingSignal(pending);
     }
 
     runtime.sincronizacaoInicialConcluida = true;
@@ -837,14 +960,12 @@ async function syncOnce() {
       historicoPreexistente: hadHistory,
       ultimoIdDB: runtime.ultimoIdDB,
       ultimoIdAPI: rounds.at(-1)?.id || null,
-      ultimaHoraAPI: runtime.ultimaHoraDaAPI,
-      ultimaRodadaNova: lastNew?.id || null,
+      motivoSemSinal: runtime.motivoSemSinal,
       ciclosSemNovos: runtime.ciclosSemNovos,
       horaAngola: horaAngola()
     };
 
-    // Log mais verboso quando há novos ou a cada ~10 ciclos sem novos
-    if (inserted > 0 || runtime.ciclosSemNovos % 10 === 0) {
+    if (inserted > 0 || runtime.ciclosSemNovos % 8 === 0) {
       log('SINCRONIZACAO', summary);
     }
 
@@ -880,8 +1001,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-/* ========== ROTAS ========== */
-
 app.get('/', (req, res) => {
   res.json({
     nome: 'Capunga Dados',
@@ -907,6 +1026,7 @@ app.get('/health', (req, res) => {
     ultimaSincronizacao: runtime.ultimaSincronizacao,
     novosUltimoCiclo: runtime.novosUltimoCiclo,
     ciclosSemNovos: runtime.ciclosSemNovos,
+    motivoSemSinal: runtime.motivoSemSinal,
     erroSincronizacao: runtime.erroSincronizacao
   });
 });
@@ -916,6 +1036,7 @@ app.get('/diagnostico', async (req, res) => {
   let totalResultados = 0;
   let totalSinais = 0;
   let pendentes = 0;
+  let recentes = [];
 
   try {
     if (pool) {
@@ -940,10 +1061,16 @@ app.get('/diagnostico', async (req, res) => {
         `SELECT COUNT(*)::int AS total FROM sinais WHERE estado = 'PENDENTE'`
       );
       pendentes = r4.rows[0].total;
+
+      const r5 = await pool.query(`
+        SELECT resultado FROM bacbo_resultados
+        WHERE resultado IN ('Jogador', 'Banca')
+        ORDER BY fim DESC NULLS LAST, seq DESC
+        LIMIT 8
+      `);
+      recentes = r5.rows.map((x) => x.resultado);
     }
-  } catch (e) {
-    // ignora erros de diagnóstico
-  }
+  } catch (e) {}
 
   res.json({
     sucesso: true,
@@ -964,11 +1091,13 @@ app.get('/diagnostico', async (req, res) => {
     novosUltimoCiclo: runtime.novosUltimoCiclo,
     duplicadosUltimoCiclo: runtime.duplicadosUltimoCiclo,
     ciclosSemNovos: runtime.ciclosSemNovos,
+    motivoSemSinal: runtime.motivoSemSinal,
     sincronizacaoEmCurso: runtime.sincronizacaoEmCurso,
     erroSincronizacao: runtime.erroSincronizacao,
     ultimoErroTelegram: runtime.ultimoErroTelegram,
     ultimaMensagemTelegram: runtime.ultimaMensagemTelegram,
     ultimoSinal: runtime.ultimoSinal,
+    ultimosResultados: recentes,
     baseDados: {
       totalResultados,
       totalSinais,
@@ -1053,6 +1182,7 @@ app.get('/estatisticas', async (req, res) => {
         COUNT(*)::int AS total,
         COUNT(*) FILTER (WHERE estado = 'GREEN')::int AS green,
         COUNT(*) FILTER (WHERE estado = 'G1')::int AS g1,
+        COUNT(*) FILTER (WHERE estado = 'G2')::int AS g2,
         COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS loss,
         COUNT(*) FILTER (WHERE estado = 'PENDENTE')::int AS pendentes,
         COUNT(*) FILTER (WHERE estado = 'CANCELADO')::int AS cancelados
@@ -1060,13 +1190,18 @@ app.get('/estatisticas', async (req, res) => {
     `);
 
     const stats = result.rows[0];
-    const finalizados =
-      (stats.green || 0) + (stats.g1 || 0) + (stats.loss || 0);
-    const acertos = (stats.green || 0) + (stats.g1 || 0);
+    const acertos =
+      (stats.green || 0) + (stats.g1 || 0) + (stats.g2 || 0);
+    const finalizados = acertos + (stats.loss || 0);
     const taxa =
       finalizados > 0
         ? Number(((acertos / finalizados) * 100).toFixed(1))
         : null;
+
+    let placarDia = null;
+    try {
+      placarDia = await getPlacarDia();
+    } catch (_) {}
 
     res.json({
       sucesso: true,
@@ -1076,6 +1211,7 @@ app.get('/estatisticas', async (req, res) => {
         acertos,
         taxaAcertoPercent: taxa
       },
+      placarDia,
       horaAngola: horaAngola()
     });
   } catch (error) {
@@ -1106,7 +1242,11 @@ app.post('/db/sincronizar', requireAdmin, async (req, res) => {
 
 app.post('/telegram/teste', requireAdmin, async (req, res) => {
   const enviado = await telegramSend(
-    `✅ Teste do Capunga Dados concluído.\nHora Angola: ${horaAngola()}`
+    [
+      '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
+      '✅ Teste do bot concluído com sucesso!',
+      `🕒 Hora Angola: ${horaAngola()}`
+    ].join('\n')
   );
 
   res.status(enviado ? 200 : 502).json({
@@ -1123,8 +1263,6 @@ app.use((req, res) => {
   });
 });
 
-/* ========== START / SHUTDOWN ========== */
-
 async function start() {
   if (!DATABASE_URL) {
     throw new Error('DATABASE_URL não configurada no Render');
@@ -1140,11 +1278,11 @@ async function start() {
     console.log(`Sinais automáticos: ${CONFIG.sinaisAtivos}`);
     console.log(`Streak mínimo: ${CONFIG.streakMin}`);
     console.log(`Gale máximo: ${CONFIG.maxGale}`);
+    console.log(`Intervalo mínimo sinais: ${CONFIG.intervaloMinimoMs}ms`);
     console.log(`Intervalo sync: ${CONFIG.intervaloSyncMs}ms`);
     console.log('======================================');
   });
 
-  // Primeira sincronização
   const initial = await syncOnce();
   if (!initial.sucesso) {
     console.error('[PRIMEIRA SINCRONIZAÇÃO]', initial.erro);
@@ -1156,7 +1294,6 @@ async function start() {
     });
   }
 
-  // Ciclo contínuo
   syncTimer = setInterval(async () => {
     if (runtime.sincronizacaoEmCurso) return;
     try {
