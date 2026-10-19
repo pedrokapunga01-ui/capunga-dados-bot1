@@ -1,4 +1,5 @@
-  const express = require("express");
+
+const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const { Pool } = require("pg");
@@ -397,22 +398,33 @@ async function resolverSinalComRodada(rodada) {
   ).catch(err => console.error("Erro Telegram:", err.message));
 }
 
-/*
- * Filtro experimental seletivo para procurar GS.
- * Exige quatro resultados iguais consecutivos e um resultado
- * diferente antes dessa sequência. Não é garantia de previsão.
- */
 async function tentarGerarSinal(rodada) {
-  if (!SINAIS_ATIVOS) return;
-  if (!["Banca", "Jogador"].includes(rodada.resultado)) return;
-
-  const pendente = await pool.query(
-    `SELECT id FROM sinais
-     WHERE estado = 'PENDENTE'
-     LIMIT 1`
+  console.log(
+    "[FILTRO] A analisar ronda:",
+    rodada.id,
+    rodada.resultado
   );
 
-  if (pendente.rowCount) return;
+  if (!SINAIS_ATIVOS) {
+    console.log("[FILTRO] Parado: sinais desativados.");
+    return;
+  }
+
+  if (!["Banca", "Jogador"].includes(rodada.resultado)) {
+    console.log("[FILTRO] Ignorado: resultado não elegível.");
+    return;
+  }
+
+  const pendente = await pool.query(`
+    SELECT id FROM sinais
+    WHERE estado = 'PENDENTE'
+    LIMIT 1
+  `);
+
+  if (pendente.rowCount) {
+    console.log("[FILTRO] Já existe sinal pendente:", pendente.rows[0].id);
+    return;
+  }
 
   const consulta = await pool.query(`
     SELECT id, resultado
@@ -423,11 +435,22 @@ async function tentarGerarSinal(rodada) {
     LIMIT 5
   `);
 
-  if (consulta.rowCount < 5) return;
+  if (consulta.rowCount < 5) {
+    console.log("[FILTRO] Histórico insuficiente:", consulta.rowCount);
+    return;
+  }
 
   const [a, b, c, d, e] = consulta.rows;
 
-  if ([a, b, c, d, e].some(r => r.resultado === "Empate")) return;
+  console.log(
+    "[FILTRO] Últimas 5 rondas:",
+    consulta.rows.map(r => r.resultado).join(" → ")
+  );
+
+  if ([a, b, c, d, e].some(r => r.resultado === "Empate")) {
+    console.log("[FILTRO] Sem sinal: empate nas últimas 5.");
+    return;
+  }
 
   const quatroIguais =
     a.resultado === b.resultado &&
@@ -436,7 +459,10 @@ async function tentarGerarSinal(rodada) {
 
   const anteriorDiferente = d.resultado !== e.resultado;
 
-  if (!quatroIguais || !anteriorDiferente) return;
+  if (!quatroIguais || !anteriorDiferente) {
+    console.log("[FILTRO] Sem sinal: padrão não confirmado.");
+    return;
+  }
 
   const cor = a.resultado;
 
@@ -456,6 +482,8 @@ async function tentarGerarSinal(rodada) {
 
   const sinal = criado.rows[0];
 
+  console.log("[FILTRO] SINAL CRIADO:", sinal.id, sinal.cor);
+
   await enviarTelegram(
     `🎯 DADOS AO BOT — SINAL EXPERIMENTAL\n\n` +
     `Sinal #${sinal.id}\n` +
@@ -465,7 +493,9 @@ async function tentarGerarSinal(rodada) {
     `Máximo: G2\n` +
     `Hora Angola: ${horaAngola()}\n\n` +
     `Regra experimental; sem garantia de acerto ou lucro.`
-  ).catch(err => console.error("Erro Telegram:", err.message));
+  ).catch(err =>
+    console.error("[FILTRO] Erro Telegram:", err.message)
+  );
 }
 
 async function sincronizarResultados() {
@@ -480,10 +510,6 @@ async function sincronizarResultados() {
     new Date(b.fim || b.inicio || 0).getTime()
   );
 
-  /*
-   * Na primeira sincronização, apenas carrega o histórico.
-   * Não gera nem resolve sinais com rondas antigas.
-   */
   const primeiraSincronizacao = !sincronizacaoInicialConcluida;
   let novosGuardados = 0;
 
@@ -535,11 +561,20 @@ async function sincronizarAutomaticamente() {
   sincronizacaoEmCurso = true;
 
   try {
-    await sincronizarResultados();
+    const resultado = await sincronizarResultados();
+
+    console.log(
+      "[SINCRONIZACAO]",
+      JSON.stringify(resultado)
+    );
   } catch (erro) {
     ultimoErroSincronizacao =
       erro.response?.data?.message || erro.message;
-    console.error("Erro de sincronização:", ultimoErroSincronizacao);
+
+    console.error(
+      "Erro de sincronização:",
+      ultimoErroSincronizacao
+    );
   } finally {
     sincronizacaoEmCurso = false;
   }
@@ -797,42 +832,4 @@ app.get("/telegram/teste", async (req, res) => {
       sucesso: true,
       mensagem: "Mensagem de teste enviada ao Telegram."
     });
-  } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.response?.data?.description || erro.message
-    });
-  }
-});
-
-app.use((req, res) => {
-  res.status(404).json({
-    sucesso: false,
-    erro: "Rota não encontrada",
-    caminho: req.path
-  });
-});
-
-const servidor = app.listen(PORT, () => {
-  console.log(`Dados AO Bot ativo na porta ${PORT}`);
-  console.log(`Hora Angola: ${horaAngola()}`);
-  console.log(
-    `Sinais automáticos: ${SINAIS_ATIVOS ? "ATIVOS" : "DESATIVADOS"}`
-  );
-
-  setTimeout(() => {
-    sincronizarAutomaticamente();
-    setInterval(
-      sincronizarAutomaticamente,
-      INTERVALO_SINCRONIZACAO
-    );
-  }, 3000);
-});
-
-process.on("SIGTERM", async () => {
-  servidor.close();
-
-  if (pool) await pool.end();
-
-  process.exit(0);
-});
+  } ca
