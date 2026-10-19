@@ -1,3 +1,5 @@
+JavaScript
+
 /**
  * Capunga Dados 🎲🇺🇸 — Servidor corrigido
  * Node.js + Express + PostgreSQL + Telegram
@@ -97,7 +99,6 @@ function angolaDate(date = new Date()) {
   }).formatToParts(date);
 
   const p = Object.fromEntries(parts.map(x => [x.type, x.value]));
-
   return `${p.year}-${p.month}-${p.day}`;
 }
 
@@ -143,10 +144,8 @@ function normalizeRound(item) {
     inicio: d.startedAt ?? item?.startedAt ?? null,
     fim: d.settledAt ?? item?.settledAt ?? null,
     resultado: outcome,
-    pontosJogador:
-      r.playerDice?.score ?? d.playerDice?.score ?? null,
-    pontosBanca:
-      r.bankerDice?.score ?? d.bankerDice?.score ?? null,
+    pontosJogador: r.playerDice?.score ?? d.playerDice?.score ?? null,
+    pontosBanca: r.bankerDice?.score ?? d.bankerDice?.score ?? null,
     multiplicador: r.multiplier ?? null,
     resolvida:
       status === "resolved" ||
@@ -251,10 +250,7 @@ function telegramKeyboard() {
   return {
     reply_markup: {
       inline_keyboard: [[
-        {
-          text: CFG.botaoTexto,
-          url: CFG.botaoUrl,
-        },
+        { text: CFG.botaoTexto, url: CFG.botaoUrl },
       ]],
     },
   };
@@ -329,13 +325,10 @@ function finalMessage(s, state) {
   ].join("\n");
 }
 
-/*
- * CORREÇÃO PRINCIPAL:
- * CREATE TABLE IF NOT EXISTS não atualiza uma tabela antiga.
- * Por isso, fazemos ALTER TABLE para adicionar a coluna seq
- * quando ela ainda não existe.
- *
- * Os resultados existentes não são apagados.
+/**
+ * Prepara e migra as tabelas sem apagar os dados existentes.
+ * ALTER TABLE é necessário porque CREATE TABLE IF NOT EXISTS
+ * não adiciona colunas a tabelas antigas.
  */
 async function ensureSchema(db = pool) {
   if (!db) {
@@ -357,13 +350,11 @@ async function ensureSchema(db = pool) {
     )
   `);
 
-  // Migração para instalações que já tinham a tabela antiga.
   await db.query(`
     ALTER TABLE bacbo_resultados
     ADD COLUMN IF NOT EXISTS seq BIGSERIAL
   `);
 
-  // Garante que seq pode ser usado na ordenação e pesquisa.
   await db.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_bacbo_resultados_seq
     ON bacbo_resultados (seq)
@@ -382,6 +373,12 @@ async function ensureSchema(db = pool) {
       observacoes TEXT,
       empates INTEGER NOT NULL DEFAULT 0
     )
+  `);
+
+  // CORREÇÃO DO ERRO: migra tabelas antigas sem apagar sinais.
+  await db.query(`
+    ALTER TABLE sinais
+    ADD COLUMN IF NOT EXISTS empates INTEGER NOT NULL DEFAULT 0
   `);
 
   await db.query(`
@@ -602,7 +599,6 @@ async function syncOnce() {
   runtime.syncBusy = true;
 
   try {
-    // A migração é executada antes de qualquer consulta à coluna seq.
     await ensureSchema();
 
     const rounds = await fetchRounds();
@@ -1014,6 +1010,7 @@ app.get("/db/teste", adminOnly, async (_req, res) => {
       base: r.rows[0].base,
       horaServidor: r.rows[0].agora,
       colunaSeqPreparada: true,
+      colunaEmpatesPreparada: true,
     });
   } catch (e) {
     res.status(500).json({
@@ -1031,6 +1028,7 @@ app.post("/db/preparar", adminOnly, async (_req, res) => {
       sucesso: true,
       tabelasPreparadas: true,
       colunaSeqPreparada: true,
+      colunaEmpatesPreparada: true,
     });
   } catch (e) {
     res.status(500).json({
