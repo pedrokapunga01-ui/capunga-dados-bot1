@@ -1,3 +1,4 @@
+/**
  * Capunga Dados 🎲🇺🇸 — Server final
  *
  * Variáveis de ambiente:
