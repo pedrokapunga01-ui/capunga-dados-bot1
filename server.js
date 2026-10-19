@@ -1,4 +1,3 @@
-JavaScript
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -179,8 +178,6 @@ async function enviarTelegram(mensagem) {
     throw new Error("BOT_TOKEN ou CHAT_ID não configurado.");
   }
 
-  // Se for configurado um URL público de imagem,
-  // o Telegram envia o cartão com a mensagem.
   const imagem = process.env.BOT_CARD_IMAGE_URL;
 
   let resposta;
@@ -274,9 +271,7 @@ function avaliarPasso(sinal, resultado) {
     gale: sinal.gale,
     empateProtegido: false
   };
-}
-
-async function resolverSinalComRodada(rodada) {
+    }async function resolverSinalComRodada(rodada) {
   const consulta = await pool.query(`
     SELECT *
     FROM sinais
@@ -291,8 +286,6 @@ async function resolverSinalComRodada(rodada) {
 
   if (sinal.resultado_id === rodada.id) return;
 
-  // Não usar rondas anteriores à criação do sinal
-  // para resolver uma entrada que ainda não existia.
   const instanteRodada = rodada.fim || rodada.inicio;
 
   if (
@@ -538,8 +531,6 @@ async function sincronizarResultados() {
 
     novosGuardados++;
 
-    // Na primeira sincronização, recupera apenas o sinal pendente.
-    // Não gera entradas retroativas com o histórico inicial.
     await resolverSinalComRodada(rodada);
     sinaisAvaliados++;
 
@@ -578,7 +569,7 @@ async function sincronizarAutomaticamente() {
   } finally {
     sincronizacaoEmCurso = false;
   }
-}app.get("/", (req, res) => {
+    }app.get("/", (req, res) => {
   res.json({
     nome: NOME_BOT,
     online: true,
