@@ -1,15 +1,18 @@
+
 'use strict';
 
 /**
- * Capunga Dados 🎲🇺🇸
+ * CAPUNGA DADOS 🎲🇺🇸
  * Node.js + Express + PostgreSQL + Telegram
  *
  * Variáveis obrigatórias:
- * DATABASE_URL, BOT_TOKEN, CHAT_ID
+ * DATABASE_URL
+ * BOT_TOKEN
+ * CHAT_ID
  *
  * Variáveis opcionais:
  * SINAIS_ATIVOS=true
- * ADMIN_TOKEN=uma_senha_forte
+ * ADMIN_TOKEN=senha_forte
  * STREAK_MIN=4
  * MAX_GALE=2
  * EMPATE_PROTEGIDO=true
@@ -17,6 +20,7 @@
  * INTERVALO_MINIMO_MS=180000
  * SINAL_EXPIRA_MIN=12
  * INTERVALO_SYNC_MS=10000
+ * MAX_ATRASO_SINAL_MIN=3
  * API_BACBO=https://api-cs.casino.org/svc-evolution-game-events/api/bacbo
  */
 
@@ -37,51 +41,68 @@ const PORT = Number(process.env.PORT || 10000);
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 const API_BACBO =
   process.env.API_BACBO ||
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
-
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 function boolEnv(value, fallback = false) {
   if (value === undefined || value === null || value === '') {
     return fallback;
   }
 
-  return ['true', '1', 'yes', 'sim', 'on']
-    .includes(String(value).trim().toLowerCase());
+  return ['true', '1', 'yes', 'sim', 'on'].includes(
+    String(value).trim().toLowerCase()
+  );
 }
 
 function intEnv(name, fallback, min, max) {
-  const parsed = Number.parseInt(process.env[name], 10);
+  const value = Number.parseInt(process.env[name], 10);
 
-  if (!Number.isFinite(parsed)) return fallback;
+  if (!Number.isFinite(value)) return fallback;
 
-  return Math.max(min, Math.min(max, parsed));
+  return Math.max(min, Math.min(max, value));
 }
 
 const CONFIG = {
   sinaisAtivos: boolEnv(process.env.SINAIS_ATIVOS, false),
   streakMin: intEnv('STREAK_MIN', 4, 3, 20),
   maxGale: intEnv('MAX_GALE', 2, 0, 5),
+
   empateProtegido: boolEnv(
     process.env.EMPATE_PROTEGIDO,
     true
   ),
+
   maxRedsDia: intEnv('MAX_REDS_DIA', 3, 1, 50),
+
   intervaloMinimoMs: intEnv(
     'INTERVALO_MINIMO_MS',
     180000,
     0,
     86400000
   ),
-  sinalExpiraMin: intEnv('SINAL_EXPIRA_MIN', 12, 1, 120),
+
+  sinalExpiraMin: intEnv(
+    'SINAL_EXPIRA_MIN',
+    12,
+    1,
+    120
+  ),
+
   intervaloSyncMs: intEnv(
     'INTERVALO_SYNC_MS',
     10000,
     5000,
     300000
+  ),
+
+  maxAtrasoSinalMin: intEnv(
+    'MAX_ATRASO_SINAL_MIN',
+    3,
+    1,
+    60
   )
 };
 
@@ -106,22 +127,21 @@ const runtime = {
   ultimoIdNovo: null,
   ultimaHoraDaAPI: null,
   quantidadeAPI: 0,
+  itensRecebidosAPI: 0,
   duplicadosUltimoCiclo: 0,
   erroSincronizacao: null,
   ultimoSinal: null,
   ultimaMensagemTelegram: null,
   ultimoErroTelegram: null,
-  ultimaRespostaAPI: null
+  ultimaRespostaAPI: null,
+  ultimoHTTPAPI: null
 };
 
 let schemaPromise = null;
 let syncTimer = null;
 
 function log(tag, data) {
-  console.log(
-    `[${tag}]`,
-    JSON.stringify(data)
-  );
+  console.log(`[${tag}]`, JSON.stringify(data));
 }
 
 function agoraAngola() {
@@ -138,7 +158,6 @@ function normalizeOutcome(value) {
     value =
       value.outcome ??
       value.resultado ??
-      value.result ??
       value.winner ??
       value.name;
   }
@@ -147,26 +166,39 @@ function normalizeOutcome(value) {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .trim()
-    .toLowerCase();
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '');
 
-  if (
-    ['player', 'jogador', 'player wins', 'player_win']
-      .includes(s)
-  ) {
+  if ([
+    'player',
+    'jogador',
+    'playerwin',
+    'playerwins',
+    'playerwon',
+    'playerwinner'
+  ].includes(s)) {
     return 'Jogador';
   }
 
-  if (
-    ['banker', 'banca', 'banker wins', 'banker_win']
-      .includes(s)
-  ) {
+  if ([
+    'banker',
+    'banca',
+    'bankerwin',
+    'bankerwins',
+    'bankerwon',
+    'bankerwinner'
+  ].includes(s)) {
     return 'Banca';
   }
 
-  if (
-    ['tie', 'draw', 'empate', 'equal', 'push']
-      .includes(s)
-  ) {
+  if ([
+    'tie',
+    'draw',
+    'empate',
+    'equal',
+    'push',
+    'tied'
+  ].includes(s)) {
     return 'Empate';
   }
 
@@ -176,29 +208,30 @@ function normalizeOutcome(value) {
 function validDate(value) {
   if (!value) return null;
 
-  const d = new Date(value);
+  const date = new Date(value);
 
-  return Number.isNaN(d.getTime())
+  return Number.isNaN(date.getTime())
     ? null
-    : d.toISOString();
+    : date.toISOString();
 }
 
 function extractItems(body) {
   if (Array.isArray(body)) return body;
+  if (!body || typeof body !== 'object') return [];
 
   const candidates = [
-    body?.data,
-    body?.results,
-    body?.items,
-    body?.resultados,
-    body?.rounds,
-    body?.events,
-    body?.data?.results,
-    body?.data?.items,
-    body?.data?.resultados,
-    body?.data?.rounds,
-    body?.data?.events,
-    body?.data?.data
+    body.data,
+    body.results,
+    body.items,
+    body.resultados,
+    body.rounds,
+    body.events,
+    body.data?.results,
+    body.data?.items,
+    body.data?.resultados,
+    body.data?.rounds,
+    body.data?.events,
+    body.data?.data
   ];
 
   for (const candidate of candidates) {
@@ -208,10 +241,21 @@ function extractItems(body) {
   return [];
 }
 
+/**
+ * A API Evolution usa, entre outros:
+ * item.data.id
+ * item.data.settledAt
+ * item.data.status = "Resolved"
+ * item.data.result.outcome = "PlayerWon"/"BankerWon"/"Tie"
+ *
+ * Mantemos data.id como identificador principal para
+ * preservar compatibilidade com o histórico existente.
+ */
 function normalizeRound(item) {
   const d = item?.data || item?.round || item || {};
+
   const r =
-    (d.result && typeof d.result === 'object')
+    d.result && typeof d.result === 'object'
       ? d.result
       : (
           item?.result &&
@@ -226,10 +270,7 @@ function normalizeRound(item) {
     item?.status ??
     item?.estado ??
     ''
-  )
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase();
+  ).trim().toLowerCase();
 
   const startedAt = validDate(
     d.startedAt ??
@@ -250,19 +291,28 @@ function normalizeRound(item) {
     item?.fim
   );
 
-  const outcome = normalizeOutcome(
+  const rawOutcome =
     r.outcome ??
     r.resultado ??
-    r.result ??
+    r.winner ??
     d.outcome ??
     d.resultado ??
     d.winner ??
     item?.outcome ??
     item?.resultado ??
     item?.winner ??
-    (typeof d.result === 'string' ? d.result : null) ??
-    (typeof item?.result === 'string' ? item.result : null)
-  );
+    (
+      typeof d.result === 'string'
+        ? d.result
+        : null
+    ) ??
+    (
+      typeof item?.result === 'string'
+        ? item.result
+        : null
+    );
+
+  const outcome = normalizeOutcome(rawOutcome);
 
   const resolved =
     [
@@ -274,7 +324,7 @@ function normalizeRound(item) {
       'resolvido',
       'concluido',
       'finalizado'
-    ].some(s => status.includes(s)) ||
+    ].some(word => status.includes(word)) ||
     Boolean(endedAt);
 
   const id = String(
@@ -294,24 +344,25 @@ function normalizeRound(item) {
   }
 
   const playerScore = Number(
+    r.playerDice?.score ??
     d.playerDice?.score ??
     d.playerScore ??
     d.player_score ??
     d.pontos_jogador ??
-    item?.pontos_jogador ??
-    r.pontos_jogador
+    item?.pontos_jogador
   );
 
   const bankerScore = Number(
+    r.bankerDice?.score ??
     d.bankerDice?.score ??
     d.bankerScore ??
     d.banker_score ??
     d.pontos_banca ??
-    item?.pontos_banca ??
-    r.pontos_banca
+    item?.pontos_banca
   );
 
   const multiplier =
+    r.multiplier ??
     d.multiplier ??
     d.multiplicador ??
     item?.multiplier ??
@@ -324,12 +375,15 @@ function normalizeRound(item) {
     estado: 'Resolved',
     inicio: startedAt || endedAt,
     fim: endedAt,
+
     pontos_jogador: Number.isFinite(playerScore)
       ? playerScore
       : null,
+
     pontos_banca: Number.isFinite(bankerScore)
       ? bankerScore
       : null,
+
     multiplicador: multiplier === null
       ? null
       : String(multiplier)
@@ -340,6 +394,7 @@ async function telegramSend(texto) {
   if (!BOT_TOKEN || !CHAT_ID) {
     runtime.ultimoErroTelegram =
       'BOT_TOKEN ou CHAT_ID não configurado';
+
     return false;
   }
 
@@ -356,13 +411,15 @@ async function telegramSend(texto) {
 
     const ok = response.data?.ok === true;
 
-    runtime.ultimaMensagemTelegram = ok
-      ? new Date().toISOString()
-      : runtime.ultimaMensagemTelegram;
+    if (ok) {
+      runtime.ultimaMensagemTelegram =
+        new Date().toISOString();
 
-    runtime.ultimoErroTelegram = ok
-      ? null
-      : JSON.stringify(response.data);
+      runtime.ultimoErroTelegram = null;
+    } else {
+      runtime.ultimoErroTelegram =
+        JSON.stringify(response.data);
+    }
 
     return ok;
   } catch (error) {
@@ -454,6 +511,29 @@ async function ensureSchema() {
     `);
 
     await pool.query(`
+      ALTER TABLE sinais
+      ADD COLUMN IF NOT EXISTS gale INTEGER
+      NOT NULL DEFAULT 0
+    `);
+
+    await pool.query(`
+      ALTER TABLE sinais
+      ADD COLUMN IF NOT EXISTS criado_em TIMESTAMPTZ
+      NOT NULL DEFAULT NOW()
+    `);
+
+    await pool.query(`
+      ALTER TABLE sinais
+      ADD COLUMN IF NOT EXISTS estado TEXT
+      NOT NULL DEFAULT 'PENDENTE'
+    `);
+
+    await pool.query(`
+      ALTER TABLE sinais
+      ADD COLUMN IF NOT EXISTS cor TEXT
+    `);
+
+    await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_sinais_estado
       ON sinais (estado)
     `);
@@ -483,10 +563,16 @@ async function fetchRounds() {
     }
   });
 
+  runtime.ultimoHTTPAPI = response.status;
+
   const items = extractItems(response.data);
-  const rounds = items
-    .map(normalizeRound)
-    .filter(Boolean);
+  const rounds = [];
+
+  for (const item of items) {
+    const round = normalizeRound(item);
+
+    if (round) rounds.push(round);
+  }
 
   const unique = new Map();
 
@@ -494,16 +580,18 @@ async function fetchRounds() {
     unique.set(round.id, round);
   }
 
-  const result = [...unique.values()]
-    .sort((a, b) =>
+  const result = [...unique.values()].sort(
+    (a, b) =>
       new Date(a.fim).getTime() -
       new Date(b.fim).getTime()
-    );
+  );
 
   const latest = result[result.length - 1] || null;
 
+  runtime.itensRecebidosAPI = items.length;
   runtime.quantidadeAPI = result.length;
   runtime.ultimaHoraDaAPI = latest?.fim || null;
+
   runtime.ultimaRespostaAPI = latest
     ? {
         id: latest.id,
@@ -518,6 +606,16 @@ async function fetchRounds() {
     rodadaMaisRecente: latest?.id || null,
     horaMaisRecente: latest?.fim || null
   });
+
+  if (items.length > 0 && result.length === 0) {
+    log('AVISO API', {
+      mensagem: 'A API respondeu, mas nenhuma rodada foi validada.',
+      exemploChaves: Object.keys(items[0] || {}),
+      exemploData: Object.keys(items[0]?.data || {}),
+      exemploOutcome:
+        items[0]?.data?.result?.outcome ?? null
+    });
+  }
 
   return result;
 }
@@ -537,7 +635,7 @@ async function insertRound(round) {
       )
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       ON CONFLICT (id) DO NOTHING
-      RETURNING *
+      RETURNING id
     `,
     [
       round.id,
@@ -551,7 +649,7 @@ async function insertRound(round) {
     ]
   );
 
-  return result.rows[0] || null;
+  return result.rows.length > 0;
 }
 
 async function getRecentOutcomes(limit = 20) {
@@ -574,18 +672,17 @@ function detectEntry(rows) {
 
   if (rows.length < min + 1) return null;
 
-  const recent = rows.slice(0, min);
-  const color = recent[0].resultado;
+  const color = rows[0].resultado;
 
   if (!['Jogador', 'Banca'].includes(color)) {
     return null;
   }
 
-  const sameStreak = recent.every(
-    row => row.resultado === color
-  );
+  const recent = rows.slice(0, min);
 
-  if (!sameStreak) return null;
+  if (!recent.every(row => row.resultado === color)) {
+    return null;
+  }
 
   const previous = rows[min];
 
@@ -607,20 +704,72 @@ async function redsToday() {
   return result.rows[0]?.total || 0;
 }
 
+async function getPendingSignal() {
+  const result = await pool.query(`
+    SELECT *
+    FROM sinais
+    WHERE estado = 'PENDENTE'
+    ORDER BY criado_em ASC, id ASC
+    LIMIT 1
+  `);
+
+  return result.rows[0] || null;
+}
+
+async function expirePendingSignal(signal) {
+  if (!signal) return false;
+
+  const ageMs =
+    Date.now() - new Date(signal.criado_em).getTime();
+
+  const expiryMs = CONFIG.sinalExpiraMin * 60 * 1000;
+
+  if (ageMs < expiryMs) return false;
+
+  await pool.query(
+    `
+      UPDATE sinais
+      SET estado = 'CANCELADO'
+      WHERE id = $1
+        AND estado = 'PENDENTE'
+    `,
+    [signal.id]
+  );
+
+  await telegramSend(
+    [
+      '⌛ SINAL EXPIRADO',
+      `Sinal: #${signal.id}`,
+      'O sinal expirou sem conclusão.',
+      'Não foi contabilizado como GREEN ou LOSS.',
+      `Hora Angola: ${agoraAngola()}`
+    ].join('\n')
+  );
+
+  log('SINAL EXPIRADO', { id: signal.id });
+
+  return true;
+}
+
 async function maybeCreateSignal(round) {
   if (!CONFIG.sinaisAtivos) return;
-  if (!['Jogador', 'Banca'].includes(round.resultado)) return;
 
-  const latestSignal = await pool.query(`
+  if (!['Jogador', 'Banca'].includes(round.resultado)) {
+    return;
+  }
+
+  const pending = await getPendingSignal();
+
+  if (pending) return;
+
+  const latestSignalResult = await pool.query(`
     SELECT id, criado_em, estado
     FROM sinais
     ORDER BY criado_em DESC, id DESC
     LIMIT 1
   `);
 
-  const last = latestSignal.rows[0];
-
-  if (last?.estado === 'PENDENTE') return;
+  const last = latestSignalResult.rows[0];
 
   if (last?.criado_em) {
     const elapsed =
@@ -629,7 +778,14 @@ async function maybeCreateSignal(round) {
     if (elapsed < CONFIG.intervaloMinimoMs) return;
   }
 
-  if ((await redsToday()) >= CONFIG.maxRedsDia) return;
+  if ((await redsToday()) >= CONFIG.maxRedsDia) {
+    log('SINAIS PAUSADOS', {
+      motivo: 'Limite diário de LOSS atingido',
+      maxRedsDia: CONFIG.maxRedsDia
+    });
+
+    return;
+  }
 
   const rows = await getRecentOutcomes(
     CONFIG.streakMin + 1
@@ -664,7 +820,7 @@ async function maybeCreateSignal(round) {
     criado_em: signal.criado_em
   };
 
-  await telegramSend(
+  const sent = await telegramSend(
     [
       '🎲 CAPUNGA DADOS 🇺🇸',
       '',
@@ -683,34 +839,34 @@ async function maybeCreateSignal(round) {
   log('SINAL CRIADO', {
     id: signal.id,
     cor: color,
-    rodada: round.id
+    rodada: round.id,
+    telegramEnviado: sent
   });
 }
 
 async function resolvePending(round) {
-  const pending = await pool.query(`
-    SELECT *
-    FROM sinais
-    WHERE estado = 'PENDENTE'
-    ORDER BY criado_em ASC, id ASC
-    LIMIT 1
-  `);
-
-  const signal = pending.rows[0];
+  const signal = await getPendingSignal();
 
   if (!signal) return;
 
-  // A rodada que originou o sinal não o pode resolver.
+  // Não utilizar a rodada que originou o sinal.
   if (String(signal.resultado_id) === String(round.id)) {
     return;
   }
 
-  if (round.resultado === 'Empate' && CONFIG.empateProtegido) {
+  if (await expirePendingSignal(signal)) {
+    return;
+  }
+
+  if (round.resultado === 'Empate') {
+    if (!CONFIG.empateProtegido) return;
+
     await pool.query(
       `
         UPDATE sinais
         SET empates = COALESCE(empates, 0) + 1
         WHERE id = $1
+          AND estado = 'PENDENTE'
       `,
       [signal.id]
     );
@@ -719,7 +875,7 @@ async function resolvePending(round) {
       [
         '🤝 EMPATE — SINAL PROTEGIDO',
         `Sinal: #${signal.id}`,
-        'A entrada mantém-se pendente.',
+        'O sinal continua pendente.',
         `Hora Angola: ${agoraAngola()}`
       ].join('\n')
     );
@@ -727,23 +883,21 @@ async function resolvePending(round) {
     return;
   }
 
-  if (round.resultado === 'Empate') {
-    return;
-  }
-
   if (round.resultado === signal.cor) {
+    const finalState =
+      Number(signal.gale || 0) === 0
+        ? 'GREEN'
+        : 'G1';
+
     await pool.query(
       `
         UPDATE sinais
         SET estado = $1,
             resultado_final = $2
         WHERE id = $3
+          AND estado = 'PENDENTE'
       `,
-      [
-        signal.gale === 0 ? 'GREEN' : 'G1',
-        round.resultado,
-        signal.id
-      ]
+      [finalState, round.resultado, signal.id]
     );
 
     await telegramSend(
@@ -751,8 +905,12 @@ async function resolvePending(round) {
         '✅ RESULTADO DO SINAL',
         `Sinal: #${signal.id}`,
         `Entrada: ${signal.cor}`,
-        `Resultado: ${signal.gale === 0 ? 'GREEN' : 'GREEN NO GALE ' + signal.gale}`,
-        `Resultado da rodada: ${round.resultado}`,
+        `Resultado: ${
+          finalState === 'GREEN'
+            ? 'GREEN DE PRIMEIRA'
+            : 'GREEN NO GALE ' + signal.gale
+        }`,
+        `Rodada: ${round.resultado}`,
         `Hora Angola: ${agoraAngola()}`
       ].join('\n')
     );
@@ -768,6 +926,7 @@ async function resolvePending(round) {
         UPDATE sinais
         SET gale = $1
         WHERE id = $2
+          AND estado = 'PENDENTE'
       `,
       [nextGale, signal.id]
     );
@@ -792,6 +951,7 @@ async function resolvePending(round) {
       SET estado = 'LOSS',
           resultado_final = $1
       WHERE id = $2
+        AND estado = 'PENDENTE'
     `,
     [round.resultado, signal.id]
   );
@@ -801,7 +961,7 @@ async function resolvePending(round) {
       '❌ SINAL FINALIZADO',
       `Sinal: #${signal.id}`,
       `Entrada: ${signal.cor}`,
-      `Resultado final: LOSS`,
+      'Resultado final: LOSS',
       `Gales utilizados: ${CONFIG.maxGale}`,
       `Hora Angola: ${agoraAngola()}`
     ].join('\n')
@@ -809,8 +969,13 @@ async function resolvePending(round) {
 }
 
 async function syncOnce() {
-  if (!pool) throw new Error('DATABASE_URL não configurada');
-  if (runtime.sincronizacaoEmCurso) return;
+  if (!pool) {
+    throw new Error('DATABASE_URL não configurada');
+  }
+
+  if (runtime.sincronizacaoEmCurso) {
+    return { ignorada: true, motivo: 'Sincronização em curso' };
+  }
 
   runtime.sincronizacaoEmCurso = true;
 
@@ -818,423 +983,103 @@ async function syncOnce() {
     await ensureSchema();
 
     const countResult = await pool.query(
-      'SELECT COUNT(*)::int AS total FROM bacbo_resultados'
-    );
-
-    const hadHistory = countResult.rows[0].total > 0;
-    const rounds = await fetchRounds();
-
-    let inserted = 0;
-    let duplicates = 0;
-    let evaluated = 0;
-    let lastNew = null;
-
-    for (const round of rounds) {
-      const saved = await insertRound(round);
-
-      if (!saved) {
-        duplicates++;
-        continue;
-      }
-
-      inserted++;
-      lastNew = round;
-
-      if (hadHistory) {
-        // Resolve o sinal existente antes de procurar outro.
-        await resolvePending(round);
-        await maybeCreateSignal(round);
-        evaluated++;
-      }
-    }
-
-    runtime.sincronizacaoInicialConcluida = true;
-    runtime.ultimaSincronizacao = new Date().toISOString();
-    runtime.duplicadosUltimoCiclo = duplicates;
-    runtime.erroSincronizacao = null;
-
-    if (lastNew) {
-      runtime.ultimaRodadaNova = new Date().toISOString();
-      runtime.ultimoIdNovo = lastNew.id;
-    }
-
-    log('SINCRONIZACAO', {
-      recebidos: rounds.length,
-      novosGuardados: inserted,
-      duplicados: duplicates,
-      sinaisAvaliados: evaluated,
-      primeiraSincronizacao: !runtime.sincronizacaoInicialConcluida,
-      historicoPreexistente: hadHistory,
-      ultimaRodadaNova: lastNew?.id || null,
-      horaAPI: runtime.ultimaHoraDaAPI,
-      horaAngola: agoraAngola()
-    });
-  } catch (error) {
-    runtime.erroSincronizacao = error.message;
-
-    console.error(
-      '[ERRO SINCRONIZACAO]',
-      error.response?.data || error.message
-    );
-  } finally {
-    runtime.sincronizacaoEmCurso = false;
-  }
-}
-
-async function requireDatabase(req, res, next) {
-  if (!pool) {
-    return res.status(503).json({
-      sucesso: false,
-      erro: 'DATABASE_URL não configurada'
-    });
-  }
-
-  try {
-    await ensureSchema();
-    next();
-  } catch (error) {
-    res.status(500).json({
-      sucesso: false,
-      erro: 'Erro na base de dados',
-      detalhe: error.message
-    });
-  }
-}
-
-function requireAdmin(req, res, next) {
-  if (!ADMIN_TOKEN) {
-    return res.status(503).json({
-      sucesso: false,
-      erro: 'Configure ADMIN_TOKEN no Render'
-    });
-  }
-
-  const supplied =
-    req.get('x-admin-token') ||
-    req.query.token ||
-    req.body?.token ||
-    '';
-
-  const a = Buffer.from(String(supplied));
-  const b = Buffer.from(String(ADMIN_TOKEN));
-
-  if (
-    a.length !== b.length ||
-    !crypto.timingSafeEqual(a, b)
-  ) {
-    return res.status(401).json({
-      sucesso: false,
-      erro: 'Não autorizado'
-    });
-  }
-
-  next();
-}
-
-app.get('/', (req, res) => {
-  res.json({
-    nome: 'Capunga Dados 🎲🇺🇸',
-    servidor: 'online',
-    horaAngola: agoraAngola(),
-    endpoints: [
-      '/health',
-      '/diagnostico',
-      '/resultados',
-      '/sinais',
-      '/estatisticas',
-      '/testes'
-    ]
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.json({
-    sucesso: true,
-    servidor: 'online',
-    horaAngola: agoraAngola()
-  });
-});
-
-app.get('/diagnostico', async (req, res) => {
-  let dbOk = false;
-  let dbError = null;
-
-  if (pool) {
-    try {
-      await pool.query('SELECT 1');
-      dbOk = true;
-    } catch (error) {
-      dbError = error.message;
-    }
-  }
-
-  res.json({
-    servidor: 'online',
-    baseConfigurada: Boolean(DATABASE_URL),
-    baseConectada: dbOk,
-    erroBase: dbError,
-    telegramConfigurado: Boolean(BOT_TOKEN && CHAT_ID),
-    sinaisAtivos: CONFIG.sinaisAtivos,
-    tabelasPreparadas: Boolean(schemaPromise),
-    sincronizacaoEmCurso: runtime.sincronizacaoEmCurso,
-    sincronizacaoInicialConcluida:
-      runtime.sincronizacaoInicialConcluida,
-    ultimaSincronizacao: runtime.ultimaSincronizacao,
-    ultimaRodadaNova: runtime.ultimaRodadaNova,
-    ultimoIdNovo: runtime.ultimoIdNovo,
-    ultimaHoraDaAPI: runtime.ultimaHoraDaAPI,
-    quantidadeAPI: runtime.quantidadeAPI,
-    duplicadosUltimoCiclo: runtime.duplicadosUltimoCiclo,
-    ultimaRespostaAPI: runtime.ultimaRespostaAPI,
-    ultimoSinal: runtime.ultimoSinal,
-    ultimaMensagemTelegram: runtime.ultimaMensagemTelegram,
-    erroTelegram: runtime.ultimoErroTelegram,
-    erroSincronizacao: runtime.erroSincronizacao,
-    horaAngola: agoraAngola(),
-    configuracao: {
-      streakMin: CONFIG.streakMin,
-      maxGale: CONFIG.maxGale,
-      empateProtegido: CONFIG.empateProtegido,
-      maxRedsDia: CONFIG.maxRedsDia,
-      intervaloMinimoMs: CONFIG.intervaloMinimoMs,
-      intervaloSyncMs: CONFIG.intervaloSyncMs
-    }
-  });
-});
-
-app.get('/resultados', requireDatabase, async (req, res) => {
-  try {
-    const limit = Math.min(
-      500,
-      Math.max(1, Number.parseInt(req.query.limit, 10) || 50)
-    );
-
-    const result = await pool.query(
-      `SELECT id, resultado, estado, inicio, fim,
-              pontos_jogador, pontos_banca, multiplicador,
-              guardado_em
-       FROM bacbo_resultados
-       ORDER BY fim DESC NULLS LAST, seq DESC
-       LIMIT $1`,
-      [limit]
-    );
-
-    res.json({
-      sucesso: true,
-      total: result.rows.length,
-      resultados: result.rows
-    });
-  } catch (error) {
-    res.status(500).json({
-      sucesso: false,
-      erro: error.message
-    });
-  }
-});
-
-app.get('/sinais', requireDatabase, async (req, res) => {
-  try {
-    const limit = Math.min(
-      500,
-      Math.max(1, Number.parseInt(req.query.limit, 10) || 50)
-    );
-
-    const result = await pool.query(
-      `SELECT *
-       FROM sinais
-       ORDER BY criado_em DESC, id DESC
-       LIMIT $1`,
-      [limit]
-    );
-
-    res.json({
-      sucesso: true,
-      total: result.rows.length,
-      sinais: result.rows
-    });
-  } catch (error) {
-    res.status(500).json({
-      sucesso: false,
-      erro: error.message
-    });
-  }
-});
-
-app.get('/estatisticas', requireDatabase, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        COUNT(*)::int AS total,
-        COUNT(*) FILTER (
-          WHERE estado = 'PENDENTE'
-        )::int AS pendentes,
-        COUNT(*) FILTER (
-          WHERE estado = 'GREEN'
-        )::int AS greens,
-        COUNT(*) FILTER (
-          WHERE estado = 'G1'
-        )::int AS greens_gale,
-        COUNT(*) FILTER (
-          WHERE estado = 'LOSS'
-        )::int AS losses,
-        COALESCE(SUM(empates), 0)::int AS empates_protegidos
-      FROM sinais
-    `);
-
-    res.json({
-      sucesso: true,
-      estatisticas: result.rows[0],
-      horaAngola: agoraAngola()
-    });
-  } catch (error) {
-    res.status(500).json({
-      sucesso: false,
-      erro: error.message
-    });
-  }
-});
-
-app.get('/testes', async (req, res) => {
-  let database = false;
-  let databaseError = null;
-
-  try {
-    if (pool) {
-      await pool.query('SELECT 1');
-      database = true;
-    }
-  } catch (error) {
-    databaseError = error.message;
-  }
-
-  res.json({
-    sucesso: true,
-    servidor: true,
-    database,
-    databaseError,
-    telegramConfigurado: Boolean(BOT_TOKEN && CHAT_ID),
-    apiConfigurada: Boolean(API_BACBO),
-    sinaisAtivos: CONFIG.sinaisAtivos,
-    horaAngola: agoraAngola()
-  });
-});
-
-app.post(
-  '/db/preparar',
-  requireAdmin,
-  requireDatabase,
-  async (req, res) => {
-    res.json({
-      sucesso: true,
-      mensagem: 'Estrutura verificada e preparada'
-    });
-  }
-);
-
-app.post(
-  '/db/sincronizar',
-  requireAdmin,
-  requireDatabase,
-  async (req, res) => {
-    await syncOnce();
-
-    res.json({
-      sucesso: !runtime.erroSincronizacao,
-      ultimaSincronizacao: runtime.ultimaSincronizacao,
-      ultimaHoraDaAPI: runtime.ultimaHoraDaAPI,
-      ultimoIdNovo: runtime.ultimoIdNovo,
-      erro: runtime.erroSincronizacao
-    });
-  }
-);
-
-app.post('/telegram/teste', requireAdmin, async (req, res) => {
-  const ok = await telegramSend(
-    [
-      '✅ TESTE CAPUNGA DADOS',
-      '',
-      'A ligação ao Telegram foi testada.',
-      `Hora Angola: ${agoraAngola()}`
-    ].join('\n')
-  );
-
-  res.status(ok ? 200 : 502).json({
-    sucesso: ok,
-    erro: runtime.ultimoErroTelegram
-  });
-});
-
-app.use((req, res) => {
-  res.status(404).json({
-    sucesso: false,
-    erro: 'Rota não encontrada'
-  });
-});
+  // ============================================================
+// INICIALIZAÇÃO DO SERVIDOR
+// ============================================================
 
 async function start() {
-  if (!DATABASE_URL) {
-    console.error('ERRO: falta DATABASE_URL no Render');
-  }
+  try {
+    console.log('========================================');
+    console.log('🎲 CAPUNGA DADOS — INICIALIZAÇÃO');
+    console.log('========================================');
 
-  if (!BOT_TOKEN || !CHAT_ID) {
-    console.error('AVISO: falta BOT_TOKEN ou CHAT_ID');
-  }
+    if (!DATABASE_URL) {
+      throw new Error('DATABASE_URL não configurada.');
+    }
 
-  if (pool) {
+    if (!BOT_TOKEN || !CHAT_ID) {
+      console.warn(
+        '[AVISO] BOT_TOKEN ou CHAT_ID não configurado. ' +
+        'As notificações Telegram não funcionarão.'
+      );
+    }
+
+    await ensureSchema();
+
+    console.log('[DB] Tabelas preparadas com sucesso.');
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 Capunga Dados ativo na porta ${PORT}`);
+      console.log(`🌍 Hora Angola: ${horaAngola()}`);
+      console.log(
+        `🎯 Sinais automáticos: ${SINAIS_ATIVOS ? 'ATIVOS' : 'DESATIVADOS'}`
+      );
+      console.log(`⏱️ Intervalo de sincronização: ${INTERVALO_SYNC_MS} ms`);
+    });
+
+    // Primeira sincronização
     try {
-      await ensureSchema();
+      await syncOnce();
     } catch (error) {
-      console.error('[DB INICIAL]', error.message);
+      runtime.erroSincronizacao =
+        error?.message || String(error);
+
+      console.error('[ERRO NA PRIMEIRA SINCRONIZAÇÃO]', error);
     }
-  }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `Capunga Dados 🎲🇺🇸 ativo na porta ${PORT}`
-    );
-    console.log(`Hora Angola: ${agoraAngola()}`);
-    console.log(
-      `Sinais automáticos: ${
-        CONFIG.sinaisAtivos ? 'ATIVOS' : 'DESATIVADOS'
-      }`
-    );
-  });
+    // Sincronização contínua, sem permitir ciclos simultâneos
+    setInterval(async () => {
+      if (runtime.sincronizacaoEmCurso) {
+        return;
+      }
 
-  if (pool) {
-    await syncOnce();
+      try {
+        await syncOnce();
+      } catch (error) {
+        runtime.erroSincronizacao =
+          error?.message || String(error);
 
-    syncTimer = setInterval(() => {
-      syncOnce().catch(error => {
-        runtime.erroSincronizacao = error.message;
-        console.error('[SYNC TIMER]', error.message);
-      });
-    }, CONFIG.intervaloSyncMs);
+        console.error('[ERRO NA SINCRONIZAÇÃO AUTOMÁTICA]', error);
+      }
+    }, INTERVALO_SYNC_MS);
 
-    if (typeof syncTimer.unref === 'function') {
-      syncTimer.unref();
-    }
+  } catch (error) {
+    console.error('[ERRO FATAL NA INICIALIZAÇÃO]', error);
+    process.exit(1);
   }
 }
 
-process.on('unhandledRejection', error => {
-  console.error('[UNHANDLED REJECTION]', error);
+// ============================================================
+// TRATAMENTO DE ERROS DO PROCESSO
+// ============================================================
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION]', reason);
 });
 
-process.on('uncaughtException', error => {
+process.on('uncaughtException', (error) => {
   console.error('[UNCAUGHT EXCEPTION]', error);
 });
 
 process.on('SIGTERM', async () => {
-  if (syncTimer) clearInterval(syncTimer);
+  console.log('[SISTEMA] Recebido SIGTERM. A encerrar...');
 
   try {
-    if (pool) await pool.end();
-  } finally {
-    process.exit(0);
+    if (pool) {
+      await pool.end();
+    }
+  } catch (error) {
+    console.error('[ERRO AO FECHAR A BASE DE DADOS]', error);
   }
+
+  process.exit(0);
 });
 
-start().catch(error => {
+// ============================================================
+// EXECUTAR
+// ============================================================
+
+start().catch((error) => {
   console.error('[FATAL]', error);
   process.exit(1);
 });
