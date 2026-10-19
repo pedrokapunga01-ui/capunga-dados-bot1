@@ -1,5 +1,3 @@
-JavaScript
-
 /**
  * Capunga Dados 🎲🇺🇸 — Servidor corrigido
  * Node.js + Express + PostgreSQL + Telegram
