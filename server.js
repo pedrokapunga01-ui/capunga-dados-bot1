@@ -75,7 +75,6 @@ async function obterResultados() {
   });
 
   const dados = resposta.data;
-
   const lista = Array.isArray(dados)
     ? dados
     : Array.isArray(dados?.data)
@@ -86,9 +85,7 @@ async function obterResultados() {
 
   return lista
     .map(normalizarRodada)
-    .filter(
-      r => r.id && r.resultado !== "Desconhecido"
-    );
+    .filter(r => r.id && r.resultado !== "Desconhecido");
 }
 
 async function prepararBaseDados() {
@@ -139,7 +136,15 @@ async function prepararBaseDados() {
     )
   `);
 
-  return true;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS testes_sinais (
+      id BIGSERIAL PRIMARY KEY,
+      criado_em TIMESTAMPTZ DEFAULT NOW(),
+      cenario TEXT NOT NULL,
+      resultado TEXT NOT NULL,
+      passou BOOLEAN NOT NULL
+    )
+  `);
 }
 
 async function enviarTelegram(mensagem) {
@@ -152,10 +157,7 @@ async function enviarTelegram(mensagem) {
 
   const resposta = await axios.post(
     `https://api.telegram.org/bot${token}/sendMessage`,
-    {
-      chat_id: chatId,
-      text: mensagem
-    },
+    { chat_id: chatId, text: mensagem },
     { timeout: 15000 }
   );
 
@@ -163,13 +165,13 @@ async function enviarTelegram(mensagem) {
 }
 
 async function atualizarEstatistica(campo, incremento = 1, dia = null) {
-  const camposPermitidos = [
+  const permitidos = [
     "total_sinais", "green", "loss", "g1", "g2", "empates"
   ];
 
-  if (!camposPermitidos.includes(campo)) return;
-
-  const data = dia || null;
+  if (!permitidos.includes(campo)) {
+    throw new Error("Campo estatístico inválido.");
+  }
 
   await pool.query(
     `INSERT INTO estatisticas_diarias
@@ -182,93 +184,173 @@ async function atualizarEstatistica(campo, incremento = 1, dia = null) {
      DO UPDATE SET
        ${campo} = estatisticas_diarias.${campo} + EXCLUDED.${campo},
        atualizada_em = NOW()`,
-    [data, incremento]
+    [dia, incremento]
+  );
+}
+
+/*
+  Motor de avaliação isolado.
+  Um empate protege a entrada e não avança a gale.
+*/
+function avaliarPasso(sinal, resultado) {
+  if (resultado === "Empate") {
+    return {
+      estado: "PENDENTE",
+      gale: sinal.gale,
+      empateProtegido: true
+    };
+  }
+
+  if (resultado === sinal.cor) {
+    return {
+      estado: sinal.gale === 0
+        ? "GREEN"
+        : sinal.gale === 1
+        ? "G1"
+        : "G2",
+      gale: sinal.gale,
+      empateProtegido: false
+    };
+  }
+
+  if (sinal.gale < MAX_GALE) {
+    return {
+      estado: "PENDENTE",
+      gale: sinal.gale + 1,
+      empateProtegido: false
+    };
+  }
+
+  return {
+    estado: "LOSS",
+    gale: sinal.gale,
+    empateProtegido: false
+  };
+}
+
+/*
+  Testes simulados: não consultam nem alteram sinais reais.
+*/
+function executarTestesLocais() {
+  const testes = [
+    {
+      cenario: "GREEN",
+      sinal: { cor: "Banca", gale: 0 },
+      sequencia: ["Banca"],
+      esperado: "GREEN"
+    },
+    {
+      cenario: "G1",
+      sinal: { cor: "Banca", gale: 0 },
+      sequencia: ["Jogador", "Banca"],
+      esperado: "G1"
+    },
+    {
+      cenario: "G2",
+      sinal: { cor: "Banca", gale: 0 },
+      sequencia: ["Jogador", "Jogador", "Banca"],
+      esperado: "G2"
+    },
+    {
+      cenario: "LOSS",
+      sinal: { cor: "Banca", gale: 0 },
+      sequencia: ["Jogador", "Jogador", "Jogador"],
+      esperado: "LOSS"
+    },
+    {
+      cenario: "EMPATE_PROTEGIDO",
+      sinal: { cor: "Banca", gale: 0 },
+      sequencia: ["Empate", "Banca"],
+      esperado: "GREEN"
+    }
+  ];
+
+  return testes.map(teste => {
+    let sinal = { ...teste.sinal };
+    let estadoFinal = sinal.gale === 0 ? "PENDENTE" : "PENDENTE";
+    let empateProtegido = false;
+
+    for (const resultado of teste.sequencia) {
+      const avaliacao = avaliarPasso(sinal, resultado);
+      sinal.gale = avaliacao.gale;
+      empateProtegido = empateProtegido || avaliacao.empateProtegido;
+
+      if (avaliacao.estado !== "PENDENTE") {
+        estadoFinal = avaliacao.estado;
+        break;
+      }
+    }
+
+    const passou = estadoFinal === teste.esperado;
+
+    return {
+      cenario: teste.cenario,
+      esperado: teste.esperado,
+      resultado: estadoFinal,
+      empateProtegido,
+      passou
+    };
+  });
+}
+
+async function guardarTeste(cenario, resultado, passou) {
+  await pool.query(
+    `INSERT INTO testes_sinais (cenario, resultado, passou)
+     VALUES ($1, $2, $3)`,
+    [cenario, resultado, passou]
   );
 }
 
 async function resolverSinalComRodada(rodada) {
-  const resultadoSinal = await pool.query(
+  const consulta = await pool.query(
     `SELECT *
      FROM sinais
      WHERE estado = 'PENDENTE'
-       AND resultado_id IS DISTINCT FROM $1
      ORDER BY id ASC
-     LIMIT 1`,
-    [rodada.id]
+     LIMIT 1`
   );
 
-  if (!resultadoSinal.rowCount) return;
+  if (!consulta.rowCount) return;
 
-  const sinal = resultadoSinal.rows[0];
+  const sinal = consulta.rows[0];
 
-  if (rodada.resultado === "Empate") {
+  if (sinal.resultado_id === rodada.id) return;
+
+  const avaliacao = avaliarPasso(sinal, rodada.resultado);
+
+  if (avaliacao.empateProtegido) {
     await atualizarEstatistica("empates", 1, sinal.dia_angola);
-
-    await enviarTelegram(
-      `🟡 DADOS AO BOT\n` +
-      `Resultado: EMPATE\n` +
-      `Sinal #${sinal.id} protegido.\n` +
-      `A gale não avança.\n` +
-      `A aguardar nova rodada.`
-    ).catch(err => console.error("Telegram:", err.message));
-
-    return;
-  }
-
-  if (rodada.resultado === sinal.cor) {
-    const estadoFinal =
-      sinal.gale === 0 ? "GREEN" :
-      sinal.gale === 1 ? "G1" : "G2";
 
     await pool.query(
       `UPDATE sinais
-       SET estado = $1, resolvido_em = NOW(),
-           observacoes = COALESCE(observacoes, '')
-             || $2
-       WHERE id = $3`,
-      [
-        estadoFinal,
-        ` | Resultado confirmado: ${rodada.resultado}`,
-        sinal.id
-      ]
+       SET observacoes = COALESCE(observacoes, '') ||
+         ' | Empate protegido; gale mantida.'
+       WHERE id = $1`,
+      [sinal.id]
     );
-
-    const campo =
-      estadoFinal === "GREEN" ? "green" : estadoFinal.toLowerCase();
-
-    await atualizarEstatistica(campo, 1, sinal.dia_angola);
-
-    await enviarTelegram(
-      `✅ DADOS AO BOT\n` +
-      `Sinal #${sinal.id}: ${estadoFinal}\n` +
-      `Resultado: ${rodada.resultado}\n` +
-      `Hora Angola: ${horaAngola()}`
-    ).catch(err => console.error("Telegram:", err.message));
 
     return;
   }
 
-  if (sinal.gale < MAX_GALE) {
-    const proximaGale = sinal.gale + 1;
-
+  if (avaliacao.estado === "PENDENTE") {
     await pool.query(
       `UPDATE sinais
        SET gale = $1,
-           observacoes = COALESCE(observacoes, '') || $2
-       WHERE id = $3`,
+           resultado_id = $2,
+           observacoes = COALESCE(observacoes, '') || $3
+       WHERE id = $4`,
       [
-        proximaGale,
-        ` | Divergência na gale ${sinal.gale}: ${rodada.resultado}`,
+        avaliacao.gale,
+        rodada.id,
+        ` | Resultado: ${rodada.resultado}; gale atual: ${avaliacao.gale}.`,
         sinal.id
       ]
     );
 
     await enviarTelegram(
-      `⚠️ DADOS AO BOT\n` +
-      `Sinal #${sinal.id}\n` +
+      `⚠️ Dados AO Bot — Sinal #${sinal.id}\n` +
       `Resultado: ${rodada.resultado}\n` +
-      `A avançar para G${proximaGale}.\n` +
-      `Cor original: ${sinal.cor}`
+      `Próxima etapa: G${avaliacao.gale}`
     ).catch(err => console.error("Telegram:", err.message));
 
     return;
@@ -276,40 +358,39 @@ async function resolverSinalComRodada(rodada) {
 
   await pool.query(
     `UPDATE sinais
-     SET estado = 'LOSS',
+     SET estado = $1,
+         resultado_id = $2,
          resolvido_em = NOW(),
-         observacoes = COALESCE(observacoes, '') || $1
-     WHERE id = $2`,
+         observacoes = COALESCE(observacoes, '') || $3
+     WHERE id = $4`,
     [
-      ` | LOSS após G2; último resultado: ${rodada.resultado}`,
+      avaliacao.estado,
+      rodada.id,
+      ` | Fechado com ${rodada.resultado}.`,
       sinal.id
     ]
   );
 
-  await atualizarEstatistica("loss", 1, sinal.dia_angola);
+  const campo = avaliacao.estado === "LOSS"
+    ? "loss"
+    : avaliacao.estado.toLowerCase();
+
+  await atualizarEstatistica(campo, 1, sinal.dia_angola);
 
   await enviarTelegram(
-    `❌ DADOS AO BOT\n` +
-    `Sinal #${sinal.id}: LOSS\n` +
-    `Gale máximo atingido.\n` +
+    `${avaliacao.estado === "LOSS" ? "❌" : "✅"} Dados AO Bot\n` +
+    `Sinal #${sinal.id}: ${avaliacao.estado}\n` +
+    `Resultado: ${rodada.resultado}\n` +
     `Hora Angola: ${horaAngola()}`
   ).catch(err => console.error("Telegram:", err.message));
 }
 
-/*
- Estratégia experimental:
- identifica três resultados iguais consecutivos,
- precedidos por um resultado diferente.
- Não existe garantia de previsão ou de lucro.
-*/
-async function tentarGerarSinal(rodadaAtual) {
+async function tentarGerarSinal(rodada) {
   if (!SINAIS_ATIVOS) return;
-  if (!["Banca", "Jogador"].includes(rodadaAtual.resultado)) return;
+  if (!["Banca", "Jogador"].includes(rodada.resultado)) return;
 
   const pendente = await pool.query(
-    `SELECT id FROM sinais
-     WHERE estado = 'PENDENTE'
-     LIMIT 1`
+    `SELECT id FROM sinais WHERE estado = 'PENDENTE' LIMIT 1`
   );
 
   if (pendente.rowCount) return;
@@ -327,15 +408,8 @@ async function tentarGerarSinal(rodadaAtual) {
 
   const [a, b, c, d] = ultimos.rows;
 
-  if (
-    a.resultado === "Empate" ||
-    b.resultado === "Empate" ||
-    c.resultado === "Empate" ||
-    d.resultado === "Empate"
-  ) return;
+  if ([a, b, c, d].some(r => r.resultado === "Empate")) return;
 
-  // a é o mais recente; b e c devem igualar a;
-  // d deve ser diferente.
   if (
     a.resultado !== b.resultado ||
     b.resultado !== c.resultado ||
@@ -348,82 +422,67 @@ async function tentarGerarSinal(rodadaAtual) {
     `INSERT INTO sinais
        (cor, estado, gale, resultado_id, observacoes)
      VALUES ($1, 'PENDENTE', 0, $2, $3)
-     RETURNING id, cor, criado_em`,
+     RETURNING id, cor`,
     [
       cor,
-      rodadaAtual.id,
-      "Estratégia experimental: sequência de três resultados iguais."
+      rodada.id,
+      "Estratégia experimental; sem garantia de acerto."
     ]
   );
 
+  await atualizarEstatistica("total_sinais");
+
   const sinal = criado.rows[0];
 
-  await atualizarEstatistica("total_sinais", 1);
-
-  try {
-    await enviarTelegram(
-      `🎯 DADOS AO BOT — NOVO SINAL\n\n` +
-      `Sinal: #${sinal.id}\n` +
-      `Mesa: Bac bo\n` +
-      `Entrada experimental: ${sinal.cor}\n` +
-      `Proteção: Empate não avança a gale\n` +
-      `Gale máximo: G2\n` +
-      `Hora Angola: ${horaAngola()}\n\n` +
-      `⚠️ Sinal experimental, sem garantia de acerto.`
-    );
-  } catch (erro) {
-    console.error("Falha ao enviar sinal:", erro.message);
-  }
-}
-
-async function processarNovaRodada(rodada) {
-  await resolverSinalComRodada(rodada);
-  await tentarGerarSinal(rodada);
+  await enviarTelegram(
+    `🎯 DADOS AO BOT — SINAL EXPERIMENTAL\n\n` +
+    `Sinal #${sinal.id}\n` +
+    `Entrada: ${sinal.cor}\n` +
+    `Proteção: Empate não avança a gale\n` +
+    `Máximo: G2\n` +
+    `Hora Angola: ${horaAngola()}\n\n` +
+    `Sem garantia de acerto ou lucro.`
+  ).catch(err => console.error("Telegram:", err.message));
 }
 
 async function sincronizarResultados() {
-  if (!pool) {
-    throw new Error("Base de dados não configurada.");
-  }
+  if (!pool) throw new Error("Base de dados não configurada.");
 
   await prepararBaseDados();
 
   const resultados = await obterResultados();
 
-  // Processar do mais antigo para o mais recente.
-  resultados.sort((a, b) => {
-    const dataA = new Date(a.fim || a.inicio || 0).getTime();
-    const dataB = new Date(b.fim || b.inicio || 0).getTime();
-    return dataA - dataB;
-  });
+  resultados.sort((a, b) =>
+    new Date(a.fim || a.inicio || 0).getTime() -
+    new Date(b.fim || b.inicio || 0).getTime()
+  );
 
   let novosGuardados = 0;
 
-  for (const r of resultados) {
+  for (const rodada of resultados) {
     const insercao = await pool.query(
       `INSERT INTO bacbo_resultados
-        (
-          id, resultado, estado, inicio, fim,
-          pontos_jogador, pontos_banca, multiplicador
-        )
+       (id, resultado, estado, inicio, fim,
+        pontos_jogador, pontos_banca, multiplicador)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (id) DO NOTHING
        RETURNING id`,
       [
-        r.id,
-        r.resultado,
-        r.estado,
-        r.inicio,
-        r.fim,
-        r.pontosJogador,
-        r.pontosBanca,
-        r.multiplicador
+        rodada.id,
+        rodada.resultado,
+        rodada.estado,
+        rodada.inicio,
+        rodada.fim,
+        rodada.pontosJogador,
+        rodada.pontosBanca,
+        rodada.multiplicador
       ]
     );
 
-    if (insercao.rowCount > 0) {
+    if (insercao.rowCount) {
       novosGuardados++;
-      await processarNovaRodada(r);
+      await resolverSinalComRodada(rodada);
+      await tentarGerarSinal(rodada);
     }
   }
 
@@ -442,17 +501,10 @@ async function sincronizarAutomaticamente() {
   sincronizacaoEmCurso = true;
 
   try {
-    const resultado = await sincronizarResultados();
-
-    if (resultado.novosGuardados > 0) {
-      console.log(`Novos resultados: ${resultado.novosGuardados}`);
-    }
+    await sincronizarResultados();
   } catch (erro) {
     ultimoErroSincronizacao =
-      erro.response?.data?.message ||
-      erro.response?.statusText ||
-      erro.message;
-
+      erro.response?.data?.message || erro.message;
     console.error("Erro de sincronização:", ultimoErroSincronizacao);
   } finally {
     sincronizacaoEmCurso = false;
@@ -474,26 +526,21 @@ app.get("/", (req, res) => {
       "/resultados",
       "/sinais",
       "/estatisticas",
+      "/testes",
       "/telegram/teste"
     ]
   });
 });
 
 app.get("/health", (req, res) => {
-  res.json({
-    sucesso: true,
-    online: true,
-    horaAngola: horaAngola()
-  });
+  res.json({ sucesso: true, online: true, horaAngola: horaAngola() });
 });
 
 app.get("/diagnostico", (req, res) => {
   res.json({
     servidor: "online",
     baseConfigurada: Boolean(process.env.DATABASE_URL),
-    telegramConfigurado: Boolean(
-      process.env.BOT_TOKEN && process.env.CHAT_ID
-    ),
+    telegramConfigurado: Boolean(process.env.BOT_TOKEN && process.env.CHAT_ID),
     sinaisAtivos: SINAIS_ATIVOS,
     sincronizacaoEmCurso,
     ultimaSincronizacao,
@@ -506,20 +553,17 @@ app.get("/db/teste", async (req, res) => {
   if (!pool) {
     return res.status(503).json({
       sucesso: false,
-      erro: "DATABASE_URL não está configurada no Render."
+      erro: "DATABASE_URL não está configurada."
     });
   }
 
   try {
-    const resultado = await pool.query(
-      "SELECT NOW() AS hora_servidor"
-    );
-
+    const resultado = await pool.query("SELECT NOW() AS hora_servidor");
     res.json({
       sucesso: true,
       mensagem: "Ligação PostgreSQL estabelecida.",
-      horaAngola: horaAngola(),
-      teste: resultado.rows[0]
+      teste: resultado.rows[0],
+      horaAngola: horaAngola()
     });
   } catch (erro) {
     res.status(500).json({ sucesso: false, erro: erro.message });
@@ -539,7 +583,7 @@ app.get("/db/sincronizar", async (req, res) => {
   if (sincronizacaoEmCurso) {
     return res.status(409).json({
       sucesso: false,
-      mensagem: "Já existe uma sincronização em curso."
+      mensagem: "Sincronização já em curso."
     });
   }
 
@@ -547,7 +591,6 @@ app.get("/db/sincronizar", async (req, res) => {
 
   try {
     const resultado = await sincronizarResultados();
-
     res.json({
       sucesso: true,
       ...resultado,
@@ -612,11 +655,9 @@ app.get("/sinais", async (req, res) => {
     );
 
     const resultado = await pool.query(
-      `SELECT id, criado_em, dia_angola, cor, estado,
-              gale, resultado_id, resolvido_em, observacoes
-       FROM sinais
-       ORDER BY id DESC
-       LIMIT $1`,
+      `SELECT id, criado_em, dia_angola, cor, estado, gale,
+              resultado_id, resolvido_em, observacoes
+       FROM sinais ORDER BY id DESC LIMIT $1`,
       [limite]
     );
 
@@ -641,28 +682,73 @@ app.get("/estatisticas", async (req, res) => {
 
   try {
     const hoje = await pool.query(`
-      SELECT dia_angola, total_sinais, green, loss,
-             g1, g2, empates, atualizada_em
+      SELECT dia_angola, total_sinais, green, loss, g1, g2,
+             empates, atualizada_em
       FROM estatisticas_diarias
       WHERE dia_angola =
         (NOW() AT TIME ZONE 'Africa/Luanda')::date
     `);
 
-    const ultimosDias = await pool.query(`
-      SELECT dia_angola, total_sinais, green, loss,
-             g1, g2, empates
+    const dias = await pool.query(`
+      SELECT dia_angola, total_sinais, green, loss, g1, g2, empates
       FROM estatisticas_diarias
-      ORDER BY dia_angola DESC
-      LIMIT 30
+      ORDER BY dia_angola DESC LIMIT 30
     `);
 
     res.json({
       sucesso: true,
       horaAngola: horaAngola(),
       hoje: hoje.rows[0] || {
-        mensagem: "Ainda não existem estatísticas para hoje."
+        mensagem: "Ainda não existem estatísticas registadas para hoje."
       },
-      ultimos30Dias: ultimosDias.rows
+      ultimos30Dias: dias.rows
+    });
+  } catch (erro) {
+    res.status(500).json({ sucesso: false, erro: erro.message });
+  }
+});
+
+/*
+  GET apenas simula os cenários em memória.
+  POST guarda os resultados dos testes na tabela testes_sinais.
+  Nenhum dos métodos cria sinais reais ou envia mensagens.
+*/
+app.get("/testes", (req, res) => {
+  const resultados = executarTestesLocais();
+
+  res.json({
+    sucesso: resultados.every(t => t.passou),
+    modo: "simulação isolada",
+    sinaisReaisCriados: false,
+    mensagensTelegramEnviadas: false,
+    resultados
+  });
+});
+
+app.post("/testes/guardar", async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({
+      sucesso: false,
+      erro: "Base de dados não configurada."
+    });
+  }
+
+  try {
+    await prepararBaseDados();
+    const resultados = executarTestesLocais();
+
+    for (const teste of resultados) {
+      await guardarTeste(
+        teste.cenario,
+        teste.resultado,
+        teste.passou
+      );
+    }
+
+    res.json({
+      sucesso: resultados.every(t => t.passou),
+      guardados: resultados.length,
+      resultados
     });
   } catch (erro) {
     res.status(500).json({ sucesso: false, erro: erro.message });
@@ -698,7 +784,7 @@ app.use((req, res) => {
 
 const servidor = app.listen(PORT, () => {
   console.log(`Dados AO Bot ativo na porta ${PORT}`);
-  console.log(`Hora de Angola: ${horaAngola()}`);
+  console.log(`Hora Angola: ${horaAngola()}`);
   console.log(`Sinais automáticos: ${SINAIS_ATIVOS ? "ATIVOS" : "DESATIVADOS"}`);
 
   setTimeout(() => {
@@ -710,9 +796,7 @@ const servidor = app.listen(PORT, () => {
 process.on("SIGTERM", async () => {
   servidor.close();
 
-  if (pool) {
-    await pool.end();
-  }
+  if (pool) await pool.end();
 
   process.exit(0);
 });
