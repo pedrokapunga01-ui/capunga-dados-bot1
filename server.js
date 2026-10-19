@@ -1025,6 +1025,20 @@ async function start() {
         error?.message || String(error);
 
       
+    
+    // Primeira sincronização
+    try {
+      await syncOnce();
+    } catch (error) {
+      runtime.erroSincronizacao =
+        error?.message || String(error);
+
+      console.error(
+        '[ERRO NA PRIMEIRA SINCRONIZAÇÃO]',
+        error
+      );
+    }
+
     // Sincronização contínua, sem permitir ciclos simultâneos
     setInterval(async () => {
       if (runtime.sincronizacaoEmCurso) {
@@ -1033,6 +1047,7 @@ async function start() {
 
       try {
         await syncOnce();
+
       } catch (error) {
         runtime.erroSincronizacao =
           error?.message || String(error);
