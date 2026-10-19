@@ -52,8 +52,11 @@ function traduzirResultado(resultado) {
     return "Jogador";
   }
 
-  if (valor.includes("tie") || valor.includes("draw") ||
-      valor === "empate") {
+  if (
+    valor.includes("tie") ||
+    valor.includes("draw") ||
+    valor === "empate"
+  ) {
     return "Empate";
   }
 
@@ -208,8 +211,7 @@ async function atualizarEstatistica(campo, incremento = 1, dia = null) {
 }
 
 /*
- * Avalia uma rodada contra um sinal.
- * Empate mantém o sinal aberto e não avança a gale.
+ * Empate protege o sinal e não avança a gale.
  */
 function avaliarPasso(sinal, resultado) {
   if (resultado === "Empate") {
@@ -326,13 +328,11 @@ async function resolverSinalComRodada(rodada) {
 
   const sinal = consulta.rows[0];
 
-  // Não avaliar novamente o mesmo resultado neste sinal.
   if (sinal.resultado_id === rodada.id) return;
 
   const avaliacao = avaliarPasso(sinal, rodada.resultado);
 
   if (avaliacao.empateProtegido) {
-    // Regista a rodada do empate para impedir reavaliação.
     await pool.query(
       `UPDATE sinais
        SET resultado_id = $1,
@@ -386,7 +386,6 @@ async function resolverSinalComRodada(rodada) {
     ]
   );
 
-  // Só atualizar estatísticas se o sinal foi fechado agora.
   if (!atualizacao.rowCount) return;
 
   const campo = avaliacao.estado === "LOSS"
@@ -432,10 +431,8 @@ async function tentarGerarSinal(rodada) {
 
   const [a, b, c, d] = consulta.rows;
 
-  // Não gerar sinal se houver empate na amostra.
   if ([a, b, c, d].some(r => r.resultado === "Empate")) return;
 
-  // Três resultados iguais, precedidos por um resultado diferente.
   if (
     a.resultado !== b.resultado ||
     b.resultado !== c.resultado ||
@@ -507,7 +504,6 @@ async function sincronizarResultados() {
       ]
     );
 
-    // Só processar rodadas que acabaram de ser guardadas.
     if (insercao.rowCount) {
       novosGuardados++;
       await resolverSinalComRodada(rodada);
@@ -844,4 +840,18 @@ const servidor = app.listen(PORT, () => {
 
   setTimeout(() => {
     sincronizarAutomaticamente();
-    setInte
+    setInterval(
+      sincronizarAutomaticamente,
+      INTERVALO_SINCRONIZACAO
+    );
+  }, 3000);
+});
+
+process.on("SIGTERM", async () => {
+  servidor.close();
+
+  if (pool) await pool.end();
+
+  process.exit(0);
+});
+    
