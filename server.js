@@ -1,16 +1,16 @@
-
 'use strict';
 
 /**
  * CAPUNGA DADOS — BAC BO
  * Node.js + Express + PostgreSQL + Telegram
  *
- * Variáveis obrigatórias:
+ * Variáveis no Render:
  * DATABASE_URL
  * BOT_TOKEN
  * CHAT_ID
+ * ADMIN_TOKEN
  *
- * SINAIS_ATIVOS começa desativado por segurança.
+ * SINAIS_ATIVOS=false por padrão.
  */
 
 const express = require('express');
@@ -179,6 +179,7 @@ function extractItems(body) {
 
 function normalizeRound(item) {
   const d = item?.data || item?.round || item || {};
+
   const r = d.result && typeof d.result === 'object'
     ? d.result
     : item?.result && typeof item.result === 'object'
@@ -276,10 +277,9 @@ async function telegramSend(texto) {
     runtime.ultimoErroTelegram = JSON.stringify(response.data);
     return false;
   } catch (error) {
-    runtime.ultimoErroTelegram =
-      error.response?.data
-        ? JSON.stringify(error.response.data)
-        : error.message;
+    runtime.ultimoErroTelegram = error.response?.data
+      ? JSON.stringify(error.response.data)
+      : error.message;
 
     console.error('[TELEGRAM]', runtime.ultimoErroTelegram);
     return false;
@@ -499,9 +499,11 @@ async function maybeCreateSignal(round) {
 
   const last = lastResult.rows[0];
 
-  if (last?.criado_em &&
-      Date.now() - new Date(last.criado_em).getTime()
-        < CONFIG.intervaloMinimoMs) {
+  if (
+    last?.criado_em &&
+    Date.now() - new Date(last.criado_em).getTime()
+      < CONFIG.intervaloMinimoMs
+  ) {
     return;
   }
 
@@ -662,10 +664,11 @@ async function syncOnce() {
       runtime.ultimoIdNovo = lastNew.id;
     }
 
+    // CORREÇÃO: a variável definida acima chama-se duplicates.
     const summary = {
       recebidos: rounds.length,
       novosGuardados: inserted,
-      duplicados,
+      duplicados: duplicates,
       sinaisAvaliados: evaluated,
       historicoPreexistente: hadHistory,
       ultimaRodadaNova: lastNew?.id || null,
@@ -852,9 +855,15 @@ app.post('/db/preparar', requireAdmin, async (req, res) => {
 });
 
 app.post('/db/sincronizar', requireAdmin, async (req, res) => {
-  const result = await syncOnce();
-
-  res.status(result.sucesso ? 200 : 500).json(result);
+  try {
+    const result = await syncOnce();
+    res.status(result.sucesso ? 200 : 500).json(result);
+  } catch (error) {
+    res.status(500).json({
+      sucesso: false,
+      erro: error.message || String(error)
+    });
+  }
 });
 
 app.post('/telegram/teste', requireAdmin, async (req, res) => {
@@ -900,7 +909,6 @@ async function start() {
 
   syncTimer = setInterval(async () => {
     if (runtime.sincronizacaoEmCurso) return;
-
     await syncOnce();
   }, CONFIG.intervaloSyncMs);
 
