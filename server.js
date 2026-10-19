@@ -1,4 +1,4 @@
-
+JavaScript
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -6,9 +6,15 @@ const { Pool } = require("pg");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+const NOME_BOT = "Capunga Dados🎲🇺🇸";
 const INTERVALO_SINCRONIZACAO = 10000;
+const INTERVALO_MINIMO_SINAIS = 180000;
 const MAX_GALE = 2;
 const SINAIS_ATIVOS = process.env.SINAIS_ATIVOS === "true";
+
+const API_BACBO =
+  "https://api-cs.casino.org/svc-evolution-game-events/api/bacbo";
 
 app.use(cors());
 app.use(express.json({ limit: "100kb" }));
@@ -23,13 +29,11 @@ const pool = process.env.DATABASE_URL
     })
   : null;
 
-const API_BACBO =
-  "https://api-cs.casino.org/svc-evolution-game-events/api/bacbo";
-
 let sincronizacaoEmCurso = false;
 let sincronizacaoInicialConcluida = false;
 let ultimaSincronizacao = null;
 let ultimoErroSincronizacao = null;
+let tabelasPreparadas = false;
 
 function horaAngola(data = new Date()) {
   return new Intl.DateTimeFormat("pt-PT", {
@@ -82,12 +86,13 @@ async function obterResultados() {
   const resposta = await axios.get(API_BACBO, {
     timeout: 15000,
     headers: {
-      "User-Agent": "Dados-AO-Bot/1.0",
+      "User-Agent": "Capunga-Dados/2.0",
       Accept: "application/json"
     }
   });
 
   const dados = resposta.data;
+
   const lista = Array.isArray(dados)
     ? dados
     : Array.isArray(dados?.data)
@@ -107,7 +112,7 @@ async function obterResultados() {
 
 async function prepararBaseDados() {
   if (!pool) {
-    throw new Error("DATABASE_URL não está configurada no Render.");
+    throw new Error("DATABASE_URL não está configurada.");
   }
 
   await pool.query(`
@@ -162,6 +167,8 @@ async function prepararBaseDados() {
       passou BOOLEAN NOT NULL
     )
   `);
+
+  tabelasPreparadas = true;
 }
 
 async function enviarTelegram(mensagem) {
@@ -169,17 +176,38 @@ async function enviarTelegram(mensagem) {
   const chatId = process.env.CHAT_ID;
 
   if (!token || !chatId) {
-    throw new Error("BOT_TOKEN ou CHAT_ID não configurado no Render.");
+    throw new Error("BOT_TOKEN ou CHAT_ID não configurado.");
   }
 
-  const resposta = await axios.post(
-    `https://api.telegram.org/bot${token}/sendMessage`,
-    { chat_id: chatId, text: mensagem },
-    { timeout: 15000 }
-  );
+  // Se for configurado um URL público de imagem,
+  // o Telegram envia o cartão com a mensagem.
+  const imagem = process.env.BOT_CARD_IMAGE_URL;
+
+  let resposta;
+
+  if (imagem) {
+    resposta = await axios.post(
+      `https://api.telegram.org/bot${token}/sendPhoto`,
+      {
+        chat_id: chatId,
+        photo: imagem,
+        caption: mensagem.slice(0, 1024)
+      },
+      { timeout: 20000 }
+    );
+  } else {
+    resposta = await axios.post(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        chat_id: chatId,
+        text: mensagem
+      },
+      { timeout: 15000 }
+    );
+  }
 
   if (!resposta.data?.ok) {
-    throw new Error("O Telegram não confirmou o envio.");
+    throw new Error("Telegram não confirmou o envio.");
   }
 
   return resposta.data;
@@ -187,7 +215,12 @@ async function enviarTelegram(mensagem) {
 
 async function atualizarEstatistica(campo, incremento = 1, dia = null) {
   const permitidos = [
-    "total_sinais", "green", "loss", "g1", "g2", "empates"
+    "total_sinais",
+    "green",
+    "loss",
+    "g1",
+    "g2",
+    "empates"
   ];
 
   if (!permitidos.includes(campo)) {
@@ -243,88 +276,32 @@ function avaliarPasso(sinal, resultado) {
   };
 }
 
-function executarTestesLocais() {
-  const testes = [
-    {
-      cenario: "GREEN",
-      sinal: { cor: "Banca", gale: 0 },
-      sequencia: ["Banca"],
-      esperado: "GREEN"
-    },
-    {
-      cenario: "G1",
-      sinal: { cor: "Banca", gale: 0 },
-      sequencia: ["Jogador", "Banca"],
-      esperado: "G1"
-    },
-    {
-      cenario: "G2",
-      sinal: { cor: "Banca", gale: 0 },
-      sequencia: ["Jogador", "Jogador", "Banca"],
-      esperado: "G2"
-    },
-    {
-      cenario: "LOSS",
-      sinal: { cor: "Banca", gale: 0 },
-      sequencia: ["Jogador", "Jogador", "Jogador"],
-      esperado: "LOSS"
-    },
-    {
-      cenario: "EMPATE_PROTEGIDO",
-      sinal: { cor: "Banca", gale: 0 },
-      sequencia: ["Empate", "Banca"],
-      esperado: "GREEN"
-    }
-  ];
-
-  return testes.map(teste => {
-    const sinal = { ...teste.sinal };
-    let estadoFinal = "PENDENTE";
-    let empateProtegido = false;
-
-    for (const resultado of teste.sequencia) {
-      const avaliacao = avaliarPasso(sinal, resultado);
-      sinal.gale = avaliacao.gale;
-      empateProtegido ||= avaliacao.empateProtegido;
-
-      if (avaliacao.estado !== "PENDENTE") {
-        estadoFinal = avaliacao.estado;
-        break;
-      }
-    }
-
-    return {
-      cenario: teste.cenario,
-      esperado: teste.esperado,
-      resultado: estadoFinal,
-      empateProtegido,
-      passou: estadoFinal === teste.esperado
-    };
-  });
-}
-
-async function guardarTeste(cenario, resultado, passou) {
-  await pool.query(
-    `INSERT INTO testes_sinais (cenario, resultado, passou)
-     VALUES ($1, $2, $3)`,
-    [cenario, resultado, passou]
-  );
-}
-
 async function resolverSinalComRodada(rodada) {
-  const consulta = await pool.query(
-    `SELECT *
-     FROM sinais
-     WHERE estado = 'PENDENTE'
-     ORDER BY id ASC
-     LIMIT 1`
-  );
+  const consulta = await pool.query(`
+    SELECT *
+    FROM sinais
+    WHERE estado = 'PENDENTE'
+    ORDER BY id ASC
+    LIMIT 1
+  `);
 
   if (!consulta.rowCount) return;
 
   const sinal = consulta.rows[0];
 
   if (sinal.resultado_id === rodada.id) return;
+
+  // Não usar rondas anteriores à criação do sinal
+  // para resolver uma entrada que ainda não existia.
+  const instanteRodada = rodada.fim || rodada.inicio;
+
+  if (
+    instanteRodada &&
+    new Date(instanteRodada).getTime() <
+      new Date(sinal.criado_em).getTime()
+  ) {
+    return;
+  }
 
   const avaliacao = avaliarPasso(sinal, rodada.resultado);
 
@@ -339,6 +316,8 @@ async function resolverSinalComRodada(rodada) {
     );
 
     await atualizarEstatistica("empates", 1, sinal.dia_angola);
+
+    console.log("[SINAL] Empate protegido:", sinal.id);
     return;
   }
 
@@ -352,16 +331,20 @@ async function resolverSinalComRodada(rodada) {
       [
         avaliacao.gale,
         rodada.id,
-        ` | Resultado: ${rodada.resultado}; próxima gale: G${avaliacao.gale}.`,
+        ` | Resultado: ${rodada.resultado}; próxima etapa G${avaliacao.gale}.`,
         sinal.id
       ]
     );
 
     await enviarTelegram(
-      `⚠️ Dados AO Bot — Sinal #${sinal.id}\n` +
+      `🎲 ${NOME_BOT}\n` +
+      `Sinal #${sinal.id}\n` +
       `Resultado: ${rodada.resultado}\n` +
-      `Próxima etapa: G${avaliacao.gale}`
-    ).catch(err => console.error("Erro Telegram:", err.message));
+      `Próxima etapa: G${avaliacao.gale}\n` +
+      `Hora de Angola: ${horaAngola()}`
+    ).catch(err =>
+      console.error("[TELEGRAM] Erro:", err.message)
+    );
 
     return;
   }
@@ -391,27 +374,25 @@ async function resolverSinalComRodada(rodada) {
   await atualizarEstatistica(campo, 1, sinal.dia_angola);
 
   await enviarTelegram(
-    `${avaliacao.estado === "LOSS" ? "❌" : "✅"} Dados AO Bot\n` +
+    `${avaliacao.estado === "LOSS" ? "❌" : "✅"} ${NOME_BOT}\n` +
     `Sinal #${sinal.id}: ${avaliacao.estado}\n` +
     `Resultado: ${rodada.resultado}\n` +
-    `Hora Angola: ${horaAngola()}`
-  ).catch(err => console.error("Erro Telegram:", err.message));
+    `Hora de Angola: ${horaAngola()}`
+  ).catch(err =>
+    console.error("[TELEGRAM] Erro:", err.message)
+  );
+
+  console.log("[SINAL] Resolvido:", sinal.id, avaliacao.estado);
 }
 
 async function tentarGerarSinal(rodada) {
-  console.log(
-    "[FILTRO] A analisar ronda:",
-    rodada.id,
-    rodada.resultado
-  );
-
   if (!SINAIS_ATIVOS) {
-    console.log("[FILTRO] Parado: sinais desativados.");
+    console.log("[FILTRO] Sinais desativados.");
     return;
   }
 
   if (!["Banca", "Jogador"].includes(rodada.resultado)) {
-    console.log("[FILTRO] Ignorado: resultado não elegível.");
+    console.log("[FILTRO] Ronda não elegível:", rodada.resultado);
     return;
   }
 
@@ -422,12 +403,29 @@ async function tentarGerarSinal(rodada) {
   `);
 
   if (pendente.rowCount) {
-    console.log("[FILTRO] Já existe sinal pendente:", pendente.rows[0].id);
+    console.log("[FILTRO] Já existe sinal pendente.");
     return;
   }
 
+  const ultimo = await pool.query(`
+    SELECT criado_em
+    FROM sinais
+    ORDER BY id DESC
+    LIMIT 1
+  `);
+
+  if (ultimo.rowCount) {
+    const decorrido =
+      Date.now() - new Date(ultimo.rows[0].criado_em).getTime();
+
+    if (decorrido < INTERVALO_MINIMO_SINAIS) {
+      console.log("[FILTRO] Intervalo mínimo ainda não cumprido.");
+      return;
+    }
+  }
+
   const consulta = await pool.query(`
-    SELECT id, resultado
+    SELECT id, resultado, inicio, fim
     FROM bacbo_resultados
     WHERE resultado IN ('Banca', 'Jogador', 'Empate')
     ORDER BY COALESCE(fim, inicio) DESC NULLS LAST,
@@ -436,19 +434,19 @@ async function tentarGerarSinal(rodada) {
   `);
 
   if (consulta.rowCount < 5) {
-    console.log("[FILTRO] Histórico insuficiente:", consulta.rowCount);
+    console.log("[FILTRO] Histórico insuficiente.");
     return;
   }
 
   const [a, b, c, d, e] = consulta.rows;
 
   console.log(
-    "[FILTRO] Últimas 5 rondas:",
+    "[FILTRO] Histórico:",
     consulta.rows.map(r => r.resultado).join(" → ")
   );
 
   if ([a, b, c, d, e].some(r => r.resultado === "Empate")) {
-    console.log("[FILTRO] Sem sinal: empate nas últimas 5.");
+    console.log("[FILTRO] Sem sinal: empate no histórico recente.");
     return;
   }
 
@@ -460,7 +458,7 @@ async function tentarGerarSinal(rodada) {
   const anteriorDiferente = d.resultado !== e.resultado;
 
   if (!quatroIguais || !anteriorDiferente) {
-    console.log("[FILTRO] Sem sinal: padrão não confirmado.");
+    console.log("[FILTRO] Condição de entrada não satisfeita.");
     return;
   }
 
@@ -474,7 +472,7 @@ async function tentarGerarSinal(rodada) {
     [
       cor,
       rodada.id,
-      "Filtro experimental de sequência; sem garantia de acerto ou lucro."
+      "Regra experimental; sem garantia de acerto ou lucro."
     ]
   );
 
@@ -485,21 +483,23 @@ async function tentarGerarSinal(rodada) {
   console.log("[FILTRO] SINAL CRIADO:", sinal.id, sinal.cor);
 
   await enviarTelegram(
-    `🎯 DADOS AO BOT — SINAL EXPERIMENTAL\n\n` +
-    `Sinal #${sinal.id}\n` +
+    `🎲 ${NOME_BOT}\n\n` +
+    `🎯 SINAL EXPERIMENTAL #${sinal.id}\n` +
     `Entrada: ${sinal.cor}\n` +
-    `Objetivo: GREEN de primeira\n` +
-    `Proteção: empate não avança a gale\n` +
-    `Máximo: G2\n` +
-    `Hora Angola: ${horaAngola()}\n\n` +
-    `Regra experimental; sem garantia de acerto ou lucro.`
+    `Objetivo: GREEN\n` +
+    `Proteção: empate mantém a etapa\n` +
+    `Limite: G2\n` +
+    `Hora de Angola: ${horaAngola()}\n\n` +
+    `Sinal experimental; não garante acerto ou lucro.`
   ).catch(err =>
-    console.error("[FILTRO] Erro Telegram:", err.message)
+    console.error("[TELEGRAM] Erro no sinal:", err.message)
   );
 }
 
 async function sincronizarResultados() {
-  if (!pool) throw new Error("Base de dados não configurada.");
+  if (!pool) {
+    throw new Error("Base de dados não configurada.");
+  }
 
   await prepararBaseDados();
 
@@ -512,6 +512,7 @@ async function sincronizarResultados() {
 
   const primeiraSincronizacao = !sincronizacaoInicialConcluida;
   let novosGuardados = 0;
+  let sinaisAvaliados = 0;
 
   for (const rodada of resultados) {
     const insercao = await pool.query(
@@ -533,13 +534,17 @@ async function sincronizarResultados() {
       ]
     );
 
-    if (insercao.rowCount) {
-      novosGuardados++;
+    if (!insercao.rowCount) continue;
 
-      if (!primeiraSincronizacao) {
-        await resolverSinalComRodada(rodada);
-        await tentarGerarSinal(rodada);
-      }
+    novosGuardados++;
+
+    // Na primeira sincronização, recupera apenas o sinal pendente.
+    // Não gera entradas retroativas com o histórico inicial.
+    await resolverSinalComRodada(rodada);
+    sinaisAvaliados++;
+
+    if (!primeiraSincronizacao) {
+      await tentarGerarSinal(rodada);
     }
   }
 
@@ -550,8 +555,9 @@ async function sincronizarResultados() {
   return {
     recebidos: resultados.length,
     novosGuardados,
+    sinaisAvaliados,
     primeiraSincronizacao,
-    historicoProcessado: !primeiraSincronizacao
+    historicoProcessado: true
   };
 }
 
@@ -563,33 +569,32 @@ async function sincronizarAutomaticamente() {
   try {
     const resultado = await sincronizarResultados();
 
-    console.log(
-      "[SINCRONIZACAO]",
-      JSON.stringify(resultado)
-    );
+    console.log("[SINCRONIZACAO]", JSON.stringify(resultado));
   } catch (erro) {
     ultimoErroSincronizacao =
       erro.response?.data?.message || erro.message;
 
-    console.error(
-      "Erro de sincronização:",
-      ultimoErroSincronizacao
-    );
+    console.error("[SINCRONIZACAO] Erro:", ultimoErroSincronizacao);
   } finally {
     sincronizacaoEmCurso = false;
   }
-}
-
-app.get("/", (req, res) => {
+}app.get("/", (req, res) => {
   res.json({
-    nome: "Dados AO Bot",
+    nome: NOME_BOT,
     online: true,
     sinaisAtivos: SINAIS_ATIVOS,
     horaAngola: horaAngola(),
     rotas: [
-      "/health", "/diagnostico", "/db/teste", "/db/preparar",
-      "/db/sincronizar", "/resultados", "/sinais",
-      "/estatisticas", "/testes", "/telegram/teste"
+      "/health",
+      "/diagnostico",
+      "/db/teste",
+      "/db/preparar",
+      "/db/sincronizar",
+      "/resultados",
+      "/sinais",
+      "/estatisticas",
+      "/testes",
+      "/telegram/teste"
     ]
   });
 });
@@ -610,6 +615,7 @@ app.get("/diagnostico", (req, res) => {
       process.env.BOT_TOKEN && process.env.CHAT_ID
     ),
     sinaisAtivos: SINAIS_ATIVOS,
+    tabelasPreparadas,
     sincronizacaoEmCurso,
     sincronizacaoInicialConcluida,
     ultimaSincronizacao,
@@ -619,14 +625,9 @@ app.get("/diagnostico", (req, res) => {
 });
 
 app.get("/db/teste", async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({
-      sucesso: false,
-      erro: "DATABASE_URL não está configurada."
-    });
-  }
-
   try {
+    if (!pool) throw new Error("DATABASE_URL não configurada.");
+
     const resultado = await pool.query("SELECT NOW() AS hora_servidor");
 
     res.json({
@@ -679,14 +680,9 @@ app.get("/db/sincronizar", async (req, res) => {
 });
 
 app.get("/resultados", async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({
-      sucesso: false,
-      erro: "Base de dados não configurada."
-    });
-  }
-
   try {
+    if (!pool) throw new Error("Base de dados não configurada.");
+
     const limite = Math.min(
       Math.max(parseInt(req.query.limite, 10) || 10, 1),
       100
@@ -713,14 +709,9 @@ app.get("/resultados", async (req, res) => {
 });
 
 app.get("/sinais", async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({
-      sucesso: false,
-      erro: "Base de dados não configurada."
-    });
-  }
-
   try {
+    if (!pool) throw new Error("Base de dados não configurada.");
+
     const limite = Math.min(
       Math.max(parseInt(req.query.limite, 10) || 20, 1),
       100
@@ -747,14 +738,9 @@ app.get("/sinais", async (req, res) => {
 });
 
 app.get("/estatisticas", async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({
-      sucesso: false,
-      erro: "Base de dados não configurada."
-    });
-  }
-
   try {
+    if (!pool) throw new Error("Base de dados não configurada.");
+
     const hoje = await pool.query(`
       SELECT dia_angola, total_sinais, green, loss, g1, g2,
              empates, atualizada_em
@@ -774,7 +760,7 @@ app.get("/estatisticas", async (req, res) => {
       sucesso: true,
       horaAngola: horaAngola(),
       hoje: hoje.rows[0] || {
-        mensagem: "Ainda não existem estatísticas registadas para hoje."
+        mensagem: "Ainda não existem estatísticas de hoje."
       },
       ultimos30Dias: dias.rows
     });
@@ -784,10 +770,53 @@ app.get("/estatisticas", async (req, res) => {
 });
 
 app.get("/testes", (req, res) => {
-  const resultados = executarTestesLocais();
+  const casos = [
+    { nome: "GREEN", seq: ["Banca"], esperado: "GREEN" },
+    { nome: "G1", seq: ["Jogador", "Banca"], esperado: "G1" },
+    {
+      nome: "G2",
+      seq: ["Jogador", "Jogador", "Banca"],
+      esperado: "G2"
+    },
+    {
+      nome: "LOSS",
+      seq: ["Jogador", "Jogador", "Jogador"],
+      esperado: "LOSS"
+    },
+    {
+      nome: "EMPATE_PROTEGIDO",
+      seq: ["Empate", "Banca"],
+      esperado: "GREEN"
+    }
+  ];
+
+  const resultados = casos.map(caso => {
+    const sinal = { cor: "Banca", gale: 0 };
+    let estado = "PENDENTE";
+    let empateProtegido = false;
+
+    for (const resultado of caso.seq) {
+      const passo = avaliarPasso(sinal, resultado);
+      sinal.gale = passo.gale;
+      empateProtegido ||= passo.empateProtegido;
+
+      if (passo.estado !== "PENDENTE") {
+        estado = passo.estado;
+        break;
+      }
+    }
+
+    return {
+      cenario: caso.nome,
+      esperado: caso.esperado,
+      resultado: estado,
+      empateProtegido,
+      passou: estado === caso.esperado
+    };
+  });
 
   res.json({
-    sucesso: resultados.every(t => t.passou),
+    sucesso: resultados.every(r => r.passou),
     modo: "simulação isolada",
     sinaisReaisCriados: false,
     mensagensTelegramEnviadas: false,
@@ -795,47 +824,19 @@ app.get("/testes", (req, res) => {
   });
 });
 
-app.post("/testes/guardar", async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({
-      sucesso: false,
-      erro: "Base de dados não configurada."
-    });
-  }
-
-  try {
-    await prepararBaseDados();
-    const resultados = executarTestesLocais();
-
-    for (const teste of resultados) {
-      await guardarTeste(teste.cenario, teste.resultado, teste.passou);
-    }
-
-    res.json({
-      sucesso: resultados.every(t => t.passou),
-      guardados: resultados.length,
-      resultados
-    });
-  } catch (erro) {
-    res.status(500).json({ sucesso: false, erro: erro.message });
-  }
-});
-
 app.get("/telegram/teste", async (req, res) => {
   try {
     await enviarTelegram(
-      "✅ Dados AO Bot: teste de ligação ao Telegram.\n" +
-      "Hora de Angola: " + horaAngola()
+      `✅ ${NOME_BOT}\n` +
+      `Teste de ligação ao Telegram.\n` +
+      `Hora de Angola: ${horaAngola()}`
     );
 
     res.json({
       sucesso: true,
-      mensagem: "Mensagem de teste enviada ao Telegram."
+      mensagem: "Teste enviado ao Telegram."
     });
-  
   } catch (erro) {
-    console.error("Erro no teste Telegram:", erro.message);
-
     res.status(500).json({
       sucesso: false,
       erro: erro.response?.data?.description || erro.message
@@ -844,7 +845,7 @@ app.get("/telegram/teste", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Dados AO Bot ativo na porta ${PORT}`);
+  console.log(`${NOME_BOT} ativo na porta ${PORT}`);
   console.log(`Hora Angola: ${horaAngola()}`);
   console.log(
     `Sinais automáticos: ${SINAIS_ATIVOS ? "ATIVOS" : "DESATIVADOS"}`
@@ -861,21 +862,13 @@ app.listen(PORT, () => {
   }
 });
 
-process.on("SIGTERM", async () => {
-  console.log("A encerrar Dados AO Bot...");
+async function encerrar() {
+  console.log(`A encerrar ${NOME_BOT}...`);
 
-  if (pool) {
-    await pool.end();
-  }
+  if (pool) await pool.end();
 
   process.exit(0);
-});
+}
 
-process.on("SIGINT", async () => {
-  if (pool) {
-    await pool.end();
-  }
-
-  process.exit(0);
-});
-    
+process.on("SIGTERM", encerrar);
+process.on("SIGINT", encerrar);
