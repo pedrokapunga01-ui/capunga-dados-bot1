@@ -997,6 +997,7 @@ async function start() {
       throw new Error('DATABASE_URL não configurada.');
     }
 
+    
     if (!BOT_TOKEN || !CHAT_ID) {
       console.warn(
         '[AVISO] BOT_TOKEN ou CHAT_ID não configurado. ' +
@@ -1024,22 +1025,13 @@ async function start() {
       runtime.erroSincronizacao =
         error?.message || String(error);
 
-      
-    
-    // Primeira sincronização
-    try {
-      await syncOnce();
-    } catch (error) {
-      runtime.erroSincronizacao =
-        error?.message || String(error);
-
       console.error(
         '[ERRO NA PRIMEIRA SINCRONIZAÇÃO]',
         error
       );
     }
 
-    // Sincronização contínua, sem permitir ciclos simultâneos
+    // Sincronização contínua
     setInterval(async () => {
       if (runtime.sincronizacaoEmCurso) {
         return;
@@ -1047,7 +1039,6 @@ async function start() {
 
       try {
         await syncOnce();
-
       } catch (error) {
         runtime.erroSincronizacao =
           error?.message || String(error);
@@ -1079,6 +1070,26 @@ process.on('uncaughtException', (error) => {
 
 process.on('SIGTERM', async () => {
   console.log('[SISTEMA] Recebido SIGTERM. A encerrar...');
+
+  try {
+    if (pool) {
+      await pool.end();
+    }
+  } catch (error) {
+    console.error('[ERRO AO FECHAR A BASE DE DADOS]', error);
+  }
+
+  process.exit(0);
+});
+
+// ============================================================
+// EXECUTAR O SERVIDOR
+// ============================================================
+
+start().catch((error) => {
+  console.error('[FATAL]', error);
+  process.exit(1);
+});
 
   try {
     if (pool) {
