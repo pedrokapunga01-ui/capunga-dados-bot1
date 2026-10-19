@@ -1033,31 +1033,32 @@ async function start() {
         return;
       }
 
-      try {
-        await syncOnce();
-      } catch (error) {
-        runtime.erroSincronizacao =
-          error?.message || String(error);
-
-        console.error('[ERRO NA SINCRONIZAÇÃO AUTOMÁTICA]', error);
-      }
-    }, INTERVALO_SYNC_MS);
-
-  } catch (error) {
-    console.error('[ERRO FATAL NA INICIALIZAÇÃO]', error);
-    process.exit(1);
-  }
-}
-
-// ============================================================
-// TRATAMENTO DE ERROS DO PROCESSO
-// ============================================================
-
-process.on('unhandledRejection', (reason) => {
-  console.error('[UNHANDLED REJECTION]', reason);
+      process.on('uncaughtException', (error) => {
+  console.error('[UNCAUGHT EXCEPTION]', error);
 });
 
-process.on('uncaughtException', (error) => {
+process.on('SIGTERM', async () => {
+  console.log('[SISTEMA] Recebido SIGTERM. A encerrar...');
+
+  try {
+    if (pool) {
+      await pool.end();
+    }
+  } catch (error) {
+    console.error('[ERRO AO FECHAR A BASE DE DADOS]', error);
+  }
+
+  process.exit(0);
+});
+
+// ============================================================
+// EXECUTAR O SERVIDOR
+// ============================================================
+
+start().catch((error) => {
+  console.error('[FATAL]', error);
+  process.exit(1);
+});
   console.error('[UNCAUGHT EXCEPTION]', error);
 });
 
