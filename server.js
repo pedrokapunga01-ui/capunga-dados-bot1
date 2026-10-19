@@ -1043,10 +1043,7 @@ async function start() {
         runtime.erroSincronizacao =
           error?.message || String(error);
 
-        console.error(
-          '[ERRO NA SINCRONIZAÇÃO AUTOMÁTICA]',
-          error
-        );
+ 
       }
     }, INTERVALO_SYNC_MS);
 
@@ -1090,23 +1087,4 @@ start().catch((error) => {
   console.error('[FATAL]', error);
   process.exit(1);
 });
-
-  try {
-    if (pool) {
-      await pool.end();
-    }
-  } catch (error) {
-    console.error('[ERRO AO FECHAR A BASE DE DADOS]', error);
-  }
-
-  process.exit(0);
-});
-
-// ============================================================
-// EXECUTAR O SERVIDOR
-// ============================================================
-
-start().catch((error) => {
-  console.error('[FATAL]', error);
-  process.exit(1);
-});
+;
