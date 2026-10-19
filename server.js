@@ -1,6 +1,4 @@
-JavaScript
-
-const express = require("express");
+  const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const { Pool } = require("pg");
@@ -823,4 +821,18 @@ const servidor = app.listen(PORT, () => {
   );
 
   setTimeout(() => {
-  
+    sincronizarAutomaticamente();
+    setInterval(
+      sincronizarAutomaticamente,
+      INTERVALO_SINCRONIZACAO
+    );
+  }, 3000);
+});
+
+process.on("SIGTERM", async () => {
+  servidor.close();
+
+  if (pool) await pool.end();
+
+  process.exit(0);
+});
