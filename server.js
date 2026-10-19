@@ -832,4 +832,50 @@ app.get("/telegram/teste", async (req, res) => {
       sucesso: true,
       mensagem: "Mensagem de teste enviada ao Telegram."
     });
-  } ca
+  
+  } catch (erro) {
+    console.error("Erro no teste Telegram:", erro.message);
+
+    res.status(500).json({
+      sucesso: false,
+      erro: erro.response?.data?.description || erro.message
+    });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Dados AO Bot ativo na porta ${PORT}`);
+  console.log(`Hora Angola: ${horaAngola()}`);
+  console.log(
+    `Sinais automáticos: ${SINAIS_ATIVOS ? "ATIVOS" : "DESATIVADOS"}`
+  );
+
+  if (pool) {
+    sincronizarAutomaticamente();
+    setInterval(
+      sincronizarAutomaticamente,
+      INTERVALO_SINCRONIZACAO
+    );
+  } else {
+    console.error("DATABASE_URL não está configurada.");
+  }
+});
+
+process.on("SIGTERM", async () => {
+  console.log("A encerrar Dados AO Bot...");
+
+  if (pool) {
+    await pool.end();
+  }
+
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  if (pool) {
+    await pool.end();
+  }
+
+  process.exit(0);
+});
+    
