@@ -1,3 +1,4 @@
+JavaScript
 
 const express = require("express");
 const cors = require("cors");
@@ -8,8 +9,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const INTERVALO_SINCRONIZACAO = 10000;
 const MAX_GALE = 2;
-
-// Manter false até concluir a validação.
 const SINAIS_ATIVOS = process.env.SINAIS_ATIVOS === "true";
 
 app.use(cors());
@@ -29,6 +28,7 @@ const API_BACBO =
   "https://api-cs.casino.org/svc-evolution-game-events/api/bacbo";
 
 let sincronizacaoEmCurso = false;
+let sincronizacaoInicialConcluida = false;
 let ultimaSincronizacao = null;
 let ultimoErroSincronizacao = null;
 
@@ -102,7 +102,7 @@ async function obterResultados() {
     .filter(r =>
       r.id &&
       ["Banca", "Jogador", "Empate"].includes(r.resultado) &&
-      r.estado.toLowerCase() === "resolved"
+      String(r.estado).toLowerCase() === "resolved"
     );
 }
 
@@ -210,9 +210,6 @@ async function atualizarEstatistica(campo, incremento = 1, dia = null) {
   );
 }
 
-/*
- * Empate protege o sinal e não avança a gale.
- */
 function avaliarPasso(sinal, resultado) {
   if (resultado === "Empate") {
     return {
@@ -403,8 +400,9 @@ async function resolverSinalComRodada(rodada) {
 }
 
 /*
- * Estratégia experimental, não preditiva.
- * Só considera sinais se SINAIS_ATIVOS=true no Render.
+ * Filtro experimental seletivo para procurar GS.
+ * Exige quatro resultados iguais consecutivos e um resultado
+ * diferente antes dessa sequência. Não é garantia de previsão.
  */
 async function tentarGerarSinal(rodada) {
   if (!SINAIS_ATIVOS) return;
@@ -424,24 +422,25 @@ async function tentarGerarSinal(rodada) {
     WHERE resultado IN ('Banca', 'Jogador', 'Empate')
     ORDER BY COALESCE(fim, inicio) DESC NULLS LAST,
              guardado_em DESC
-    LIMIT 4
+    LIMIT 5
   `);
 
-  if (consulta.rowCount < 4) return;
+  if (consulta.rowCount < 5) return;
 
-  const [a, b, c, d] = consulta.rows;
+  const [a, b, c, d, e] = consulta.rows;
 
-  if ([a, b, c, d].some(r => r.resultado === "Empate")) return;
+  if ([a, b, c, d, e].some(r => r.resultado === "Empate")) return;
 
-  if (
-    a.resultado !== b.resultado ||
-    b.resultado !== c.resultado ||
-    c.resultado === d.resultado
-  ) {
-    return;
-  }
+  const quatroIguais =
+    a.resultado === b.resultado &&
+    b.resultado === c.resultado &&
+    c.resultado === d.resultado;
 
-  const cor = a.resultado === "Banca" ? "Jogador" : "Banca";
+  const anteriorDiferente = d.resultado !== e.resultado;
+
+  if (!quatroIguais || !anteriorDiferente) return;
+
+  const cor = a.resultado;
 
   const criado = await pool.query(
     `INSERT INTO sinais
@@ -451,7 +450,7 @@ async function tentarGerarSinal(rodada) {
     [
       cor,
       rodada.id,
-      "Estratégia experimental; não garante acerto ou lucro."
+      "Filtro experimental de sequência; sem garantia de acerto ou lucro."
     ]
   );
 
@@ -463,10 +462,11 @@ async function tentarGerarSinal(rodada) {
     `🎯 DADOS AO BOT — SINAL EXPERIMENTAL\n\n` +
     `Sinal #${sinal.id}\n` +
     `Entrada: ${sinal.cor}\n` +
+    `Objetivo: GREEN de primeira\n` +
     `Proteção: empate não avança a gale\n` +
     `Máximo: G2\n` +
     `Hora Angola: ${horaAngola()}\n\n` +
-    `Estratégia experimental, sem garantia de acerto ou lucro.`
+    `Regra experimental; sem garantia de acerto ou lucro.`
   ).catch(err => console.error("Erro Telegram:", err.message));
 }
 
@@ -482,6 +482,11 @@ async function sincronizarResultados() {
     new Date(b.fim || b.inicio || 0).getTime()
   );
 
+  /*
+   * Na primeira sincronização, apenas carrega o histórico.
+   * Não gera nem resolve sinais com rondas antigas.
+   */
+  const primeiraSincronizacao = !sincronizacaoInicialConcluida;
   let novosGuardados = 0;
 
   for (const rodada of resultados) {
@@ -506,17 +511,23 @@ async function sincronizarResultados() {
 
     if (insercao.rowCount) {
       novosGuardados++;
-      await resolverSinalComRodada(rodada);
-      await tentarGerarSinal(rodada);
+
+      if (!primeiraSincronizacao) {
+        await resolverSinalComRodada(rodada);
+        await tentarGerarSinal(rodada);
+      }
     }
   }
 
+  sincronizacaoInicialConcluida = true;
   ultimaSincronizacao = horaAngola();
   ultimoErroSincronizacao = null;
 
   return {
     recebidos: resultados.length,
-    novosGuardados
+    novosGuardados,
+    primeiraSincronizacao,
+    historicoProcessado: !primeiraSincronizacao
   };
 }
 
@@ -543,16 +554,9 @@ app.get("/", (req, res) => {
     sinaisAtivos: SINAIS_ATIVOS,
     horaAngola: horaAngola(),
     rotas: [
-      "/health",
-      "/diagnostico",
-      "/db/teste",
-      "/db/preparar",
-      "/db/sincronizar",
-      "/resultados",
-      "/sinais",
-      "/estatisticas",
-      "/testes",
-      "/telegram/teste"
+      "/health", "/diagnostico", "/db/teste", "/db/preparar",
+      "/db/sincronizar", "/resultados", "/sinais",
+      "/estatisticas", "/testes", "/telegram/teste"
     ]
   });
 });
@@ -574,6 +578,7 @@ app.get("/diagnostico", (req, res) => {
     ),
     sinaisAtivos: SINAIS_ATIVOS,
     sincronizacaoEmCurso,
+    sincronizacaoInicialConcluida,
     ultimaSincronizacao,
     erroSincronizacao: ultimoErroSincronizacao,
     horaAngola: horaAngola()
@@ -598,10 +603,7 @@ app.get("/db/teste", async (req, res) => {
       horaAngola: horaAngola()
     });
   } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.message
-    });
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
@@ -610,10 +612,7 @@ app.get("/db/preparar", async (req, res) => {
     await prepararBaseDados();
     res.json({ sucesso: true, mensagem: "Tabelas preparadas." });
   } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.message
-    });
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
@@ -664,7 +663,8 @@ app.get("/resultados", async (req, res) => {
       `SELECT id, resultado, estado, inicio, fim,
               pontos_jogador, pontos_banca, multiplicador
        FROM bacbo_resultados
-       ORDER BY fim DESC NULLS LAST
+       ORDER BY COALESCE(fim, inicio) DESC NULLS LAST,
+                guardado_em DESC
        LIMIT $1`,
       [limite]
     );
@@ -675,10 +675,7 @@ app.get("/resultados", async (req, res) => {
       resultados: resultado.rows
     });
   } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.message
-    });
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
@@ -712,10 +709,7 @@ app.get("/sinais", async (req, res) => {
       sinais: resultado.rows
     });
   } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.message
-    });
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
@@ -752,10 +746,7 @@ app.get("/estatisticas", async (req, res) => {
       ultimos30Dias: dias.rows
     });
   } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.message
-    });
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
@@ -784,11 +775,7 @@ app.post("/testes/guardar", async (req, res) => {
     const resultados = executarTestesLocais();
 
     for (const teste of resultados) {
-      await guardarTeste(
-        teste.cenario,
-        teste.resultado,
-        teste.passou
-      );
+      await guardarTeste(teste.cenario, teste.resultado, teste.passou);
     }
 
     res.json({
@@ -797,10 +784,7 @@ app.post("/testes/guardar", async (req, res) => {
       resultados
     });
   } catch (erro) {
-    res.status(500).json({
-      sucesso: false,
-      erro: erro.message
-    });
+    res.status(500).json({ sucesso: false, erro: erro.message });
   }
 });
 
@@ -839,19 +823,4 @@ const servidor = app.listen(PORT, () => {
   );
 
   setTimeout(() => {
-    sincronizarAutomaticamente();
-    setInterval(
-      sincronizarAutomaticamente,
-      INTERVALO_SINCRONIZACAO
-    );
-  }, 3000);
-});
-
-process.on("SIGTERM", async () => {
-  servidor.close();
-
-  if (pool) await pool.end();
-
-  process.exit(0);
-});
-    
+  
