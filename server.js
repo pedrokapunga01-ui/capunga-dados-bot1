@@ -1,22 +1,24 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO
+ * CAPUNGA DADOS — BAC BO (reconfigurado)
  * Servidor com validação estatística e Gale máximo 2.
  *
- * Variáveis necessárias:
- * DATABASE_URL
- * BOT_TOKEN
- * CHAT_ID
- * INGEST_TOKEN
+ * Variáveis obrigatórias:
+ *   DATABASE_URL
+ *   BOT_TOKEN
+ *   CHAT_ID
+ *   INGEST_TOKEN
  *
  * Opcionais:
- * API_BACBO
- * PORT
- * MIN_AMOSTRA
- * MIN_ACERTO
- * INTERVALO_SYNC_MS
- * MIN_INTERVAL_SINAL_MS
+ *   API_BACBO          (URL da API de resultados; se vazio usa só POST /resultado)
+ *   PORT               (default 3000)
+ *   MIN_AMOSTRA        (default 300)
+ *   MIN_ACERTO         (default 52)
+ *   INTERVALO_SYNC_MS  (default 8000)
+ *   MIN_INTERVAL_SINAL_MS (default 90000)
+ *   SINAL_EXPIRA_MS    (default 480000 = 8 min)
+ *   DATABASE_SSL       (default true)
  */
 
 const express = require('express');
@@ -25,44 +27,28 @@ const axios = require('axios');
 const { Pool } = require('pg');
 
 const app = express();
-
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
-const BOT_TOKEN = process.env.BOT_TOKEN || '';
-const CHAT_ID = process.env.CHAT_ID || '';
-const INGEST_TOKEN = process.env.INGEST_TOKEN;
+const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
+const CHAT_ID = (process.env.CHAT_ID || '').trim();
+const INGEST_TOKEN = (process.env.INGEST_TOKEN || '').trim();
+const API_BACBO = (process.env.API_BACBO || '').trim();
 
-const API_BACBO = process.env.API_BACBO || '';
 const MAX_GALE = 2;
 
-const MIN_AMOSTRA = Math.max(
-  100,
-  Number(process.env.MIN_AMOSTRA || 500)
-);
-
-const MIN_ACERTO = Math.min(
-  100,
-  Math.max(0, Number(process.env.MIN_ACERTO || 55))
-);
-
-const INTERVALO_SYNC_MS = Math.max(
-  5000,
-  Number(process.env.INTERVALO_SYNC_MS || 10000)
-);
-
-const MIN_INTERVAL_SINAL_MS = Math.max(
-  120000,
-  Number(process.env.MIN_INTERVAL_SINAL_MS || 120000)
-);
+const MIN_AMOSTRA = Math.max(80, Number(process.env.MIN_AMOSTRA || 300));
+const MIN_ACERTO = Math.min(100, Math.max(0, Number(process.env.MIN_ACERTO || 52)));
+const INTERVALO_SYNC_MS = Math.max(4000, Number(process.env.INTERVALO_SYNC_MS || 8000));
+const MIN_INTERVAL_SINAL_MS = Math.max(30000, Number(process.env.MIN_INTERVAL_SINAL_MS || 90000));
+const SINAL_EXPIRA_MS = Math.max(120000, Number(process.env.SINAL_EXPIRA_MS || 480000));
 
 if (!DATABASE_URL) {
   console.error('[FATAL] Configura DATABASE_URL.');
   process.exit(1);
 }
-
 if (!INGEST_TOKEN) {
   console.error('[FATAL] Configura INGEST_TOKEN.');
   process.exit(1);
@@ -70,10 +56,8 @@ if (!INGEST_TOKEN) {
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === 'false'
-    ? false
-    : { rejectUnauthorized: false },
-  max: 5,
+  ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
+  max: 8,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000
 });
@@ -81,31 +65,53 @@ const pool = new Pool({
 let sincronizando = false;
 let ultimaTentativaSinal = 0;
 let timerSync = null;
+let lastSyncAt = null;
+let lastError = null;
+let totalProcessados = 0;
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
 
 function normalizarResultado(valor) {
-  const v = String(valor || '').trim().toLowerCase();
+  if (valor == null) return null;
+  if (typeof valor === 'object') {
+    valor = valor.outcome ?? valor.resultado ?? valor.winner ?? valor.color ?? valor.name ?? '';
+  }
+  const v = String(valor).normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase().replace(/[\s_-]+/g, '');
 
-  if (['red', 'vermelho', 'r'].includes(v)) return 'RED';
-  if (['blue', 'azul', 'b'].includes(v)) return 'BLUE';
-  if (['tie', 'empate', 'draw', 't'].includes(v)) return 'TIE';
-
+  // RED / Banca / Banker
+  if (['red', 'vermelho', 'r', 'banca', 'banker', 'bankerwin', 'bankerwins', 'bankerwon'].includes(v) || v.startsWith('banker')) {
+    return 'RED';
+  }
+  // BLUE / Jogador / Player
+  if (['blue', 'azul', 'b', 'jogador', 'player', 'playerwin', 'playerwins', 'playerwon'].includes(v) || v.startsWith('player')) {
+    return 'BLUE';
+  }
+  // TIE / Empate
+  if (['tie', 'empate', 'draw', 't', 'equal', 'push', 'tied'].includes(v) || v.startsWith('tie') || v.startsWith('empate')) {
+    return 'TIE';
+  }
   return null;
 }
 
 function normalizarId(valor) {
   if (valor === undefined || valor === null) return null;
-
   const id = String(valor).trim();
-
   return id ? id.slice(0, 180) : null;
 }
+
+function labelCor(cor) {
+  if (cor === 'RED') return '🔴 BANCA';
+  if (cor === 'BLUE') return '🔵 JOGADOR';
+  return '🟡 EMPATE';
+}
+
+// ─── Telegram ──────────────────────────────────────────────────────────────
 
 async function telegram(texto) {
   if (!BOT_TOKEN || !CHAT_ID) {
     console.warn('[TELEGRAM] BOT_TOKEN ou CHAT_ID ausente.');
     return false;
   }
-
   try {
     const response = await axios.post(
       `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
@@ -114,66 +120,50 @@ async function telegram(texto) {
         text: texto,
         disable_web_page_preview: true
       },
-      { timeout: 15000 }
+      { timeout: 12000 }
     );
-
     return response.data?.ok === true;
   } catch (err) {
-    console.error(
-      '[TELEGRAM]',
-      err.response?.data || err.message
-    );
-
+    console.error('[TELEGRAM]', err.response?.data || err.message);
+    lastError = `telegram: ${err.message}`;
     return false;
   }
 }
+
+// ─── Schema ────────────────────────────────────────────────────────────────
 
 async function criarTabelas() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bacbo_resultados (
       id BIGSERIAL PRIMARY KEY,
       rodada_id TEXT UNIQUE NOT NULL,
-      resultado TEXT NOT NULL
-        CHECK (resultado IN ('RED', 'BLUE', 'TIE')),
+      resultado TEXT NOT NULL CHECK (resultado IN ('RED', 'BLUE', 'TIE')),
       ocorrido_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_bacbo_resultados_data
-    ON bacbo_resultados (id DESC)
-  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_bacbo_resultados_data ON bacbo_resultados (id DESC)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bacbo_testes (
       id BIGSERIAL PRIMARY KEY,
       rodada_id TEXT UNIQUE NOT NULL,
-      previsao TEXT NOT NULL
-        CHECK (previsao IN ('RED', 'BLUE')),
-      estado TEXT NOT NULL DEFAULT 'PENDENTE'
-        CHECK (estado IN ('PENDENTE', 'GREEN', 'LOSS')),
+      previsao TEXT NOT NULL CHECK (previsao IN ('RED', 'BLUE')),
+      estado TEXT NOT NULL DEFAULT 'PENDENTE' CHECK (estado IN ('PENDENTE', 'GREEN', 'LOSS')),
       resultado TEXT,
       criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       resolvido_em TIMESTAMPTZ
     )
   `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_bacbo_testes_estado
-    ON bacbo_testes (estado, id DESC)
-  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_bacbo_testes_estado ON bacbo_testes (estado, id DESC)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sinais (
       id BIGSERIAL PRIMARY KEY,
       rodada_origem TEXT NOT NULL,
-      previsao TEXT NOT NULL
-        CHECK (previsao IN ('RED', 'BLUE')),
+      previsao TEXT NOT NULL CHECK (previsao IN ('RED', 'BLUE')),
       estado TEXT NOT NULL DEFAULT 'PENDENTE'
-        CHECK (
-          estado IN ('PENDENTE', 'GREEN', 'LOSS', 'CANCELADO')
-        ),
+        CHECK (estado IN ('PENDENTE', 'GREEN', 'LOSS', 'CANCELADO')),
       gale INTEGER NOT NULL DEFAULT 0,
       resultado_final TEXT,
       taxa_teste NUMERIC(6,2),
@@ -182,16 +172,14 @@ async function criarTabelas() {
       resolvido_em TIMESTAMPTZ
     )
   `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_sinais_estado
-    ON sinais (estado, id DESC)
-  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_estado ON sinais (estado, id DESC)`);
 
   console.log('[DB] Tabelas verificadas.');
 }
 
-async function obterUltimosResultados(limite = 12) {
+// ─── Leitura ───────────────────────────────────────────────────────────────
+
+async function obterUltimosResultados(limite = 20) {
   const { rows } = await pool.query(
     `SELECT rodada_id, resultado, ocorrido_em
      FROM bacbo_resultados
@@ -199,45 +187,88 @@ async function obterUltimosResultados(limite = 12) {
      LIMIT $1`,
     [limite]
   );
-
   return rows.reverse();
-}
-
-/**
- * Filtro experimental de desequilíbrio recente.
- * Não é um modelo preditivo validado: resultados de Bac Bo podem ser
- * independentes e padrões passados não garantem vantagem futura.
- * Exige uma janela decisiva altamente desequilibrada; caso contrário abstém-se.
- */
-function gerarPrevisao(resultados) {
-  const decisivos = resultados
-    .map(item => item.resultado)
-    .filter(item => item === 'RED' || item === 'BLUE');
-
-  if (decisivos.length < 12) return null;
-
-  const janela = decisivos.slice(-12);
-  const reds = janela.filter(item => item === 'RED').length;
-  const blues = janela.length - reds;
-
-  // Segue o lado mais frequente apenas como hipótese experimental.
-  // A alta seletividade reduz volume; não aumenta a certeza do próximo resultado.
-  if (reds >= 10) return 'RED';
-  if (blues >= 10) return 'BLUE';
-  return null;
 }
 
 async function obterSinalPendente() {
   const { rows } = await pool.query(`
-    SELECT *
-    FROM sinais
+    SELECT * FROM sinais
     WHERE estado = 'PENDENTE'
     ORDER BY id ASC
     LIMIT 1
   `);
-
   return rows[0] || null;
 }
+
+// ─── Expirar sinais presos ─────────────────────────────────────────────────
+
+async function expirarSinaisAntigos() {
+  const { rows } = await pool.query(
+    `UPDATE sinais
+     SET estado = 'CANCELADO', resolvido_em = NOW()
+     WHERE estado = 'PENDENTE'
+       AND criado_em < NOW() - ($1::text || ' milliseconds')::interval
+     RETURNING id, previsao`,
+    [String(SINAL_EXPIRA_MS)]
+  );
+  for (const s of rows) {
+    await telegram(
+      `⚠️ SINAL ANULADO · EXPIRADO\n` +
+      `Sinal #${s.id}\n` +
+      `Previsão: ${labelCor(s.previsao)}\n` +
+      `Não foi contado como Green nem Loss.`
+    );
+    console.log('[EXPIRA] Sinal', s.id, 'cancelado por timeout');
+  }
+}
+
+// ─── Lógica de previsão (experimental, seletiva) ───────────────────────────
+
+/**
+ * Gera previsão só em cenários de forte desequilíbrio recente.
+ * Não promete edge; serve apenas como filtro experimental.
+ */
+function gerarPrevisao(resultados) {
+  const decisivos = resultados
+    .map(r => r.resultado)
+    .filter(r => r === 'RED' || r === 'BLUE');
+
+  if (decisivos.length < 10) return null;
+
+  const janela12 = decisivos.slice(-12);
+  const janela8 = decisivos.slice(-8);
+  const janela6 = decisivos.slice(-6);
+
+  const contar = (arr, cor) => arr.filter(x => x === cor).length;
+
+  const r12 = contar(janela12, 'RED');
+  const b12 = janela12.length - r12;
+  const r8 = contar(janela8, 'RED');
+  const b8 = janela8.length - r8;
+  const r6 = contar(janela6, 'RED');
+  const b6 = janela6.length - r6;
+
+  // Pressão forte na janela longa
+  if (r12 >= 10) return 'RED';
+  if (b12 >= 10) return 'BLUE';
+
+  // Pressão média + confirmação na janela curta
+  if (r8 >= 7 && r6 >= 5) return 'RED';
+  if (b8 >= 7 && b6 >= 5) return 'BLUE';
+
+  // Streak atual muito longa
+  let streak = 1;
+  const ultimo = decisivos[decisivos.length - 1];
+  for (let i = decisivos.length - 2; i >= 0; i--) {
+    if (decisivos[i] === ultimo) streak++;
+    else break;
+  }
+  if (streak >= 6) return ultimo; // continua a streak
+
+  return null;
+}
+
+// ─── Testes internos (calibração) ──────────────────────────────────────────
 
 async function resolverTestes(resultadoAtual, rodadaAtualId) {
   const { rows } = await pool.query(`
@@ -248,25 +279,15 @@ async function resolverTestes(resultadoAtual, rodadaAtualId) {
   `);
 
   for (const teste of rows) {
-    // Nunca avaliar uma previsão usando o próprio resultado
-    // que originou a previsão.
     if (teste.rodada_id === rodadaAtualId) continue;
 
-    const green =
-      resultadoAtual === 'TIE' ||
-      resultadoAtual === teste.previsao;
+    const green = resultadoAtual === 'TIE' || resultadoAtual === teste.previsao;
 
     await pool.query(
       `UPDATE bacbo_testes
-       SET estado = $1,
-           resultado = $2,
-           resolvido_em = NOW()
+       SET estado = $1, resultado = $2, resolvido_em = NOW()
        WHERE id = $3 AND estado = 'PENDENTE'`,
-      [
-        green ? 'GREEN' : 'LOSS',
-        resultadoAtual,
-        teste.id
-      ]
+      [green ? 'GREEN' : 'LOSS', resultadoAtual, teste.id]
     );
   }
 }
@@ -277,34 +298,29 @@ async function obterEstatisticasTeste() {
     FROM bacbo_testes
     WHERE estado IN ('GREEN', 'LOSS')
     ORDER BY resolvido_em DESC, id DESC
-    LIMIT 100
+    LIMIT 200
   `);
 
   const amostra = rows.length;
   const greens = rows.filter(r => r.estado === 'GREEN').length;
-  const taxa = amostra ? greens * 100 / amostra : 0;
+  const taxa = amostra ? (greens * 100) / amostra : 0;
 
-  const recentes = rows.slice(0, 50);
-  const greensRecentes = recentes.filter(
-    r => r.estado === 'GREEN'
-  ).length;
-
-  const taxaRecente = recentes.length
-    ? greensRecentes * 100 / recentes.length
-    : 0;
+  const recentes = rows.slice(0, 40);
+  const greensRecentes = recentes.filter(r => r.estado === 'GREEN').length;
+  const taxaRecente = recentes.length ? (greensRecentes * 100) / recentes.length : 0;
 
   return {
     amostra,
     greens,
     losses: amostra - greens,
     taxa: Number(taxa.toFixed(2)),
-    amostra50: recentes.length,
-    taxa50: Number(taxaRecente.toFixed(2)),
+    amostra40: recentes.length,
+    taxa40: Number(taxaRecente.toFixed(2)),
     autorizado:
       amostra >= MIN_AMOSTRA &&
-      recentes.length >= 50 &&
+      recentes.length >= 30 &&
       taxa >= MIN_ACERTO &&
-      taxaRecente >= MIN_ACERTO
+      taxaRecente >= (MIN_ACERTO - 3)
   };
 }
 
@@ -317,142 +333,126 @@ async function criarTeste(rodadaId, previsao) {
   );
 }
 
+// ─── Resolução de sinais ───────────────────────────────────────────────────
+
 async function resolverSinal(resultado, rodadaId) {
   const sinal = await obterSinalPendente();
-
   if (!sinal) return;
-
-  // Não contar a rodada que originou o sinal como resultado.
   if (sinal.rodada_origem === rodadaId) return;
 
-  // Empate protegido: fecha como GREEN.
+  // Empate protegido
   if (resultado === 'TIE') {
     await pool.query(
       `UPDATE sinais
-       SET estado = 'GREEN',
-           resultado_final = 'TIE',
-           resolvido_em = NOW()
+       SET estado = 'GREEN', resultado_final = 'TIE', resolvido_em = NOW()
        WHERE id = $1 AND estado = 'PENDENTE'`,
       [sinal.id]
     );
-
     await telegram(
-      `🟢 GREEN — EMPATE PROTEGIDO\n` +
+      `🟢 GREEN · EMPATE PROTEGIDO\n` +
       `Sinal #${sinal.id}\n` +
-      `Gale utilizado: ${sinal.gale}`
+      `Previsão: ${labelCor(sinal.previsao)}\n` +
+      `Gale usado: ${sinal.gale}`
     );
-
     return;
   }
 
   if (resultado === sinal.previsao) {
     await pool.query(
       `UPDATE sinais
-       SET estado = 'GREEN',
-           resultado_final = $2,
-           resolvido_em = NOW()
+       SET estado = 'GREEN', resultado_final = $2, resolvido_em = NOW()
        WHERE id = $1 AND estado = 'PENDENTE'`,
       [sinal.id, resultado]
     );
-
     await telegram(
-      `🟢 GREEN — CAPUNGA DADOS\n` +
+      `🟢 GREEN · CAPUNGA DADOS\n` +
       `Sinal #${sinal.id}\n` +
-      `Previsão: ${sinal.previsao}\n` +
-      `Resultado: ${resultado}\n` +
-      `Gale utilizado: ${sinal.gale}`
+      `Previsão: ${labelCor(sinal.previsao)}\n` +
+      `Resultado: ${labelCor(resultado)}\n` +
+      `Gale usado: ${sinal.gale}`
     );
-
     return;
   }
 
+  // Errou → Gale
   if (Number(sinal.gale) < MAX_GALE) {
     const novoGale = Number(sinal.gale) + 1;
-
     await pool.query(
-      `UPDATE sinais SET gale = $2
-       WHERE id = $1 AND estado = 'PENDENTE'`,
+      `UPDATE sinais SET gale = $2 WHERE id = $1 AND estado = 'PENDENTE'`,
       [sinal.id, novoGale]
     );
-
     await telegram(
-      `⚠️ GALE ${novoGale}\n` +
+      `🐔 GALE ${novoGale}\n` +
       `Sinal #${sinal.id}\n` +
-      `Manter previsão: ${sinal.previsao}\n` +
-      `Resultado observado: ${resultado}\n` +
-      `Recuperação não garantida.`
+      `Manter: ${labelCor(sinal.previsao)}\n` +
+      `Resultado visto: ${labelCor(resultado)}`
     );
-
     return;
   }
 
+  // Loss final
   await pool.query(
     `UPDATE sinais
-     SET estado = 'LOSS',
-         resultado_final = $2,
-         resolvido_em = NOW()
+     SET estado = 'LOSS', resultado_final = $2, resolvido_em = NOW()
      WHERE id = $1 AND estado = 'PENDENTE'`,
     [sinal.id, resultado]
   );
-
   await telegram(
-    `🔴 LOSS — GALE MÁXIMO ATINGIDO\n` +
+    `🔴 LOSS · GALE MÁXIMO\n` +
     `Sinal #${sinal.id}\n` +
-    `Previsão: ${sinal.previsao}\n` +
-    `Resultado: ${resultado}\n` +
-    `Gales utilizados: ${MAX_GALE}`
+    `Previsão: ${labelCor(sinal.previsao)}\n` +
+    `Resultado: ${labelCor(resultado)}\n` +
+    `Gales: ${MAX_GALE}`
   );
 }
 
+// ─── Envio de novo sinal ───────────────────────────────────────────────────
+
 async function tentarEnviarSinal(rodadaId, previsao) {
   if (!previsao) return;
-
   if (await obterSinalPendente()) return;
-
-  if (Date.now() - ultimaTentativaSinal < MIN_INTERVAL_SINAL_MS) {
-    return;
-  }
+  if (Date.now() - ultimaTentativaSinal < MIN_INTERVAL_SINAL_MS) return;
 
   const stats = await obterEstatisticasTeste();
-
   if (!stats.autorizado) {
-    console.log(
-      '[FILTRO] Sinal bloqueado:',
-      JSON.stringify(stats)
-    );
+    console.log('[FILTRO] Bloqueado:', JSON.stringify({
+      amostra: stats.amostra,
+      taxa: stats.taxa,
+      taxa40: stats.taxa40,
+      minAmostra: MIN_AMOSTRA,
+      minAcerto: MIN_ACERTO
+    }));
     return;
   }
 
   const insert = await pool.query(
-    `INSERT INTO sinais
-       (rodada_origem, previsao, taxa_teste, amostra_teste)
+    `INSERT INTO sinais (rodada_origem, previsao, taxa_teste, amostra_teste)
      VALUES ($1, $2, $3, $4)
      RETURNING id`,
     [rodadaId, previsao, stats.taxa, stats.amostra]
   );
-
   const sinal = insert.rows[0];
-
-  // Evita tentativas em sequência, mesmo se o Telegram falhar.
   ultimaTentativaSinal = Date.now();
 
   const enviado = await telegram(
-    `🎲 CAPUNGA DADOS — BAC BO | EXPERIMENTAL\n\n` +
-    `📢 HIPÓTESE DE SINAL (não é garantia)\n` +
-    `Previsão: ${previsao}\n` +
+    `🎲 CAPUNGA DADOS · BAC BO\n\n` +
+    `📢 ENTRADA\n` +
+    `Previsão: ${labelCor(previsao)}\n` +
     `Gale máximo: ${MAX_GALE}\n` +
-    `Empate: protegido\n\n` +
-    `📊 Testes resolvidos: ${stats.amostra}\n` +
-    `Taxa histórica observada: ${stats.taxa}% (n=${stats.amostra})\n` +
-    `Últimos 50 testes: ${stats.taxa50}%\n\n` +
-    `⚠️ Frequência histórica não é probabilidade nem garantia do próximo resultado.\n` +
-    `ID do sinal: ${sinal.id}`
+    `Empate protegido\n\n` +
+    `📊 Testes: ${stats.amostra} · Taxa ${stats.taxa}%\n` +
+    `Últimos 40: ${stats.taxa40}%\n\n` +
+    `ID: ${sinal.id}`
   );
 
   if (!enviado) {
-    console.error('[TELEGRAM] Falha no envio do sinal:', sinal.id);
+    console.error('[TELEGRAM] Falha no envio do sinal', sinal.id);
+  } else {
+    console.log('[SINAL] Enviado #', sinal.id, previsao);
   }
 }
+
+// ─── Processamento de uma rodada ───────────────────────────────────────────
 
 async function processarResultado(rodadaId, resultado, ocorridoEm) {
   const id = normalizarId(rodadaId);
@@ -463,8 +463,7 @@ async function processarResultado(rodadaId, resultado, ocorridoEm) {
   }
 
   const insert = await pool.query(
-    `INSERT INTO bacbo_resultados
-       (rodada_id, resultado, ocorrido_em)
+    `INSERT INTO bacbo_resultados (rodada_id, resultado, ocorrido_em)
      VALUES ($1, $2, COALESCE($3::timestamptz, NOW()))
      ON CONFLICT (rodada_id) DO NOTHING
      RETURNING id`,
@@ -475,12 +474,17 @@ async function processarResultado(rodadaId, resultado, ocorridoEm) {
     return { duplicado: true, rodada_id: id };
   }
 
-  // Primeiro avalia as previsões anteriores.
+  totalProcessados += 1;
+
+  // 1. Expira sinais antigos
+  await expirarSinaisAntigos();
+
+  // 2. Resolve testes e sinal pendente com este resultado
   await resolverTestes(res, id);
   await resolverSinal(res, id);
 
-  // Só depois cria a previsão para futuras rodadas.
-  const historico = await obterUltimosResultados(12);
+  // 3. Gera nova previsão para o futuro
+  const historico = await obterUltimosResultados(20);
   const previsao = gerarPrevisao(historico);
 
   if (previsao) {
@@ -496,37 +500,39 @@ async function processarResultado(rodadaId, resultado, ocorridoEm) {
   };
 }
 
+// ─── Auth ──────────────────────────────────────────────────────────────────
+
 function autenticarEntrada(req, res, next) {
   if (req.get('x-ingest-token') !== INGEST_TOKEN) {
-    return res.status(401).json({
-      ok: false,
-      erro: 'Token inválido.'
-    });
+    return res.status(401).json({ ok: false, erro: 'Token inválido.' });
   }
-
   next();
 }
 
+// ─── Rotas ─────────────────────────────────────────────────────────────────
+
 app.get('/', (_req, res) => {
   res.json({
-    nome: 'CAPUNGA DADOS — BAC BO | experimental',
-    aviso: 'Sem garantia de acerto; jogo aleatório envolve risco de perda.',
+    nome: 'CAPUNGA DADOS — BAC BO',
     estado: 'online',
     gale_maximo: MAX_GALE,
-    garantia_100: false
+    versao: '2.0-reconfig'
   });
 });
 
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ ok: true, database: 'connected' });
-  } catch (err) {
-    res.status(503).json({
-      ok: false,
-      database: 'error',
-      erro: err.message
+    res.json({
+      ok: true,
+      database: 'connected',
+      lastSyncAt,
+      totalProcessados,
+      lastError,
+      telegramConfigured: Boolean(BOT_TOKEN && CHAT_ID)
     });
+  } catch (err) {
+    res.status(503).json({ ok: false, database: 'error', erro: err.message });
   }
 });
 
@@ -539,28 +545,28 @@ app.get('/status', async (_req, res) => {
       SELECT
         COUNT(*) FILTER (WHERE estado = 'GREEN')::int AS greens,
         COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS losses,
-        COUNT(*) FILTER (WHERE estado = 'PENDENTE')::int AS pendentes
+        COUNT(*) FILTER (WHERE estado = 'PENDENTE')::int AS pendentes,
+        COUNT(*) FILTER (WHERE estado = 'CANCELADO')::int AS cancelados
       FROM sinais
     `);
 
-    const { rows: rodadas } = await pool.query(`
-      SELECT COUNT(*)::int AS total
-      FROM bacbo_resultados
-    `);
+    const { rows: rodadas } = await pool.query(`SELECT COUNT(*)::int AS total FROM bacbo_resultados`);
 
     res.json({
       ok: true,
       estrategia_autorizada: stats.autorizado,
-      aviso: 'Sinais experimentais; não representam probabilidade calibrada nem garantia de acerto.',
       criterios: {
         amostra_minima: MIN_AMOSTRA,
         taxa_minima: MIN_ACERTO,
-        gale_maximo: MAX_GALE
+        gale_maximo: MAX_GALE,
+        intervalo_min_sinal_ms: MIN_INTERVAL_SINAL_MS
       },
       testes: stats,
       sinais: totais[0],
       sinal_pendente: pendente,
-      rodadas_registadas: rodadas[0].total
+      rodadas_registadas: rodadas[0].total,
+      lastSyncAt,
+      totalProcessados
     });
   } catch (err) {
     res.status(500).json({ ok: false, erro: err.message });
@@ -570,19 +576,13 @@ app.get('/status', async (_req, res) => {
 app.get('/estatisticas', async (_req, res) => {
   try {
     const testes = await obterEstatisticasTeste();
-
     const { rows } = await pool.query(`
       SELECT estado, COUNT(*)::int AS total
       FROM sinais
       GROUP BY estado
       ORDER BY estado
     `);
-
-    res.json({
-      ok: true,
-      testes,
-      sinais_por_estado: rows
-    });
+    res.json({ ok: true, testes, sinais_por_estado: rows });
   } catch (err) {
     res.status(500).json({ ok: false, erro: err.message });
   }
@@ -591,28 +591,16 @@ app.get('/estatisticas', async (_req, res) => {
 app.post('/resultado', autenticarEntrada, async (req, res) => {
   try {
     const { rodada_id, resultado, ocorrido_em } = req.body || {};
-
-    const dados = await processarResultado(
-      rodada_id,
-      resultado,
-      ocorrido_em
-    );
-
+    const dados = await processarResultado(rodada_id, resultado, ocorrido_em);
     res.json({ ok: true, ...dados });
   } catch (err) {
     console.error('[RESULTADO]', err.message);
-
-    res.status(400).json({
-      ok: false,
-      erro: err.message
-    });
+    res.status(400).json({ ok: false, erro: err.message });
   }
 });
 
-/**
- * Extrator genérico.
- * Confirma a estrutura da API antes de depender dela.
- */
+// ─── Sync da API externa ───────────────────────────────────────────────────
+
 function extrairRodadas(payload) {
   const candidatos = [
     payload,
@@ -620,115 +608,120 @@ function extrairRodadas(payload) {
     payload?.results,
     payload?.rounds,
     payload?.history,
+    payload?.items,
     payload?.data?.results,
     payload?.data?.rounds,
-    payload?.data?.history
+    payload?.data?.history,
+    payload?.data?.items
   ];
 
   const lista = candidatos.find(Array.isArray);
-
   if (!lista) return [];
 
-  return lista.map(item => ({
-    rodada_id:
-      item?.roundId ??
-      item?.round_id ??
-      item?.id ??
-      item?.gameId ??
-      item?.game_id,
-    resultado:
-      item?.result ??
-      item?.winner ??
-      item?.outcome ??
-      item?.color ??
-      item?.winningSide,
-    ocorrido_em:
-      item?.timestamp ??
-      item?.createdAt ??
-      item?.created_at
-  })).filter(item =>
-    normalizarId(item.rodada_id) &&
-    normalizarResultado(item.resultado)
-  );
+  return lista
+    .map(item => {
+      const data = item?.data && typeof item.data === 'object' ? item.data : item;
+      const result = data?.result && typeof data.result === 'object' ? data.result : data;
+
+      return {
+        rodada_id:
+          data?.id ??
+          data?.roundId ??
+          data?.round_id ??
+          item?.id ??
+          item?.roundId ??
+          item?.gameId,
+        resultado:
+          result?.outcome ??
+          result?.resultado ??
+          result?.winner ??
+          data?.outcome ??
+          data?.resultado ??
+          data?.winner ??
+          data?.result ??
+          item?.result ??
+          item?.winner ??
+          item?.color,
+        ocorrido_em:
+          data?.settledAt ??
+          data?.finishedAt ??
+          data?.endedAt ??
+          data?.timestamp ??
+          data?.createdAt ??
+          item?.settledAt ??
+          item?.timestamp
+      };
+    })
+    .filter(item => normalizarId(item.rodada_id) && normalizarResultado(item.resultado));
 }
 
 async function sincronizarFonte() {
   if (!API_BACBO || sincronizando) return;
-
   sincronizando = true;
 
   try {
     const response = await axios.get(API_BACBO, {
-      timeout: 15000,
-      headers: { Accept: 'application/json' }
+      timeout: 12000,
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'CapungaDados/2.0'
+      }
     });
 
     const rodadas = extrairRodadas(response.data);
-
     if (!rodadas.length) {
-      console.warn(
-        '[FONTE] Nenhuma rodada reconhecida. ' +
-        'Verifica o formato real da API.'
-      );
+      console.warn('[FONTE] Nenhuma rodada reconhecida. Verifica o formato da API.');
+      lastError = 'api_sem_rodadas';
       return;
     }
 
-    // Processa da mais antiga para a mais recente quando
-    // a API entrega a lista em ordem decrescente.
+    // Processa da mais antiga para a mais recente
     for (const rodada of rodadas.reverse()) {
-      await processarResultado(
-        rodada.rodada_id,
-        rodada.resultado,
-        rodada.ocorrido_em
-      );
+      await processarResultado(rodada.rodada_id, rodada.resultado, rodada.ocorrido_em);
     }
+
+    lastSyncAt = new Date().toISOString();
+    lastError = null;
   } catch (err) {
-    console.error(
-      '[SYNC]',
-      err.response?.status || '',
-      err.message
-    );
+    console.error('[SYNC]', err.response?.status || '', err.message);
+    lastError = `sync: ${err.message}`;
   } finally {
     sincronizando = false;
   }
 }
 
+// ─── Arranque ──────────────────────────────────────────────────────────────
+
 async function iniciar() {
   await criarTabelas();
 
-  const server = app.listen(PORT, () => {
-    console.log(`[HTTP] Ativo na porta ${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[HTTP] CAPUNGA DADOS ativo na porta ${PORT}`);
   });
 
   if (API_BACBO) {
+    console.log('[FONTE] A sincronizar com', API_BACBO.slice(0, 60) + '...');
     await sincronizarFonte();
     timerSync = setInterval(sincronizarFonte, INTERVALO_SYNC_MS);
   } else {
-    console.warn(
-      '[FONTE] API_BACBO ausente. ' +
-      'Aguarda resultados em POST /resultado. Sem fonte não há análise nem sinais.'
-    );
+    console.warn('[FONTE] API_BACBO ausente. Usa POST /resultado com x-ingest-token.');
   }
 
-  let encerrando = false;
+  // Limpeza periódica de sinais expirados
+  setInterval(() => {
+    expirarSinaisAntigos().catch(err => console.error('[EXPIRA]', err.message));
+  }, 60000).unref();
 
+  let encerrando = false;
   async function encerrar() {
     if (encerrando) return;
     encerrando = true;
-
-    console.log('[SHUTDOWN] A encerrar o servidor.');
-
+    console.log('[SHUTDOWN] A encerrar...');
     if (timerSync) clearInterval(timerSync);
-
     server.close(async () => {
-      try {
-        await pool.end();
-      } finally {
-        process.exit(0);
-      }
+      try { await pool.end(); } finally { process.exit(0); }
     });
-
-    setTimeout(() => process.exit(1), 10000).unref();
+    setTimeout(() => process.exit(1), 8000).unref();
   }
 
   process.on('SIGTERM', encerrar);
