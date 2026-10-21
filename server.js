@@ -1,903 +1,495 @@
-
 'use strict';
 
 /**
- * CAPUNGA BAC BO — RENDER
+ * CAPUNGA DADOS — BAC BO
  * Node.js + Express + PostgreSQL + Telegram
+ * Arranque automático no Render.
  *
- * Gale máximo: 2
- * Empate: devolução; mantém o sinal aberto
- * Resultados: RED / BLUE / TIE
+ * Ficheiros necessários:
+ *   ./bot/tick.js
+ *   ./bot/telegram.js
+ *   ./bot/db.js
+ *   ./bot/migrate.js
  *
- * Variáveis:
- * DATABASE_URL
- * BOT_TOKEN
- * CHAT_ID
- * INGEST_TOKEN
- * API_BACBO
+ * Variáveis obrigatórias:
+ *   DATABASE_URL
+ *   BOT_TOKEN
+ *   CHAT_ID
  *
- * Opcionais:
- * PORT=10000
- * POLL_INTERVAL_MS=60000
- * MIN_AMOSTRA=40
- * MIN_PROPORCAO=0.58
- * MAX_RESULTADOS=300
+ * Variáveis opcionais:
+ *   PORT=10000
+ *   INTERVALO_SYNC_MS=6000
+ *   KEEP_ALIVE_MS=60000
+ *   KEEP_ALIVE_URL
+ *   KEEP_ALIVE_URLS
+ *   PAINEL_TOKEN
+ *   DATABASE_SSL=false
  */
 
 const express = require('express');
-const { Pool } = require('pg');
-const crypto = require('crypto');
+const cors = require('cors');
 
 const app = express();
+
 app.disable('x-powered-by');
-app.use(express.json({ limit: '32kb' }));
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 
-const PORT = Number(process.env.PORT || 10000);
-const POLL_INTERVAL_MS = Math.max(
-  30000,
-  Number(process.env.POLL_INTERVAL_MS || 60000)
-);
-const MIN_AMOSTRA = Math.max(
-  20,
-  Number(process.env.MIN_AMOSTRA || 40)
-);
-const MIN_PROPORCAO = Math.min(
-  0.90,
-  Math.max(0.50, Number(process.env.MIN_PROPORCAO || 0.58))
-);
-const MAX_RESULTADOS = Math.max(
-  50,
-  Number(process.env.MAX_RESULTADOS || 300)
+const PORT = limitar(
+  process.env.PORT,
+  10000,
+  1,
+  65535
 );
 
-const DATABASE_URL = process.env.DATABASE_URL;
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
-const INGEST_TOKEN = process.env.INGEST_TOKEN;
-const API_BACBO = process.env.API_BACBO;
+const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
+const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
+const CHAT_ID = (process.env.CHAT_ID || '').trim();
+const PAINEL_TOKEN = (process.env.PAINEL_TOKEN || '').trim();
 
-if (!DATABASE_URL) {
-  throw new Error('Configura DATABASE_URL no Render.');
+const INTERVALO_SYNC_MS = limitar(
+  process.env.INTERVALO_SYNC_MS,
+  6000,
+  4000,
+  30000
+);
+
+const KEEP_ALIVE_MS = limitar(
+  process.env.KEEP_ALIVE_MS,
+  60000,
+  15000,
+  900000
+);
+
+function limitar(valor, padrao, minimo, maximo) {
+  const n = Number.parseInt(valor, 10);
+
+  if (!Number.isFinite(n)) {
+    return padrao;
+  }
+
+  return Math.max(minimo, Math.min(maximo, n));
 }
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.PGSSLMODE === 'disable'
-    ? false
-    : { rejectUnauthorized: false },
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000
-});
+function normalizarUrlSaude(valor) {
+  if (!valor) return '';
 
-let server;
-let pollTimer;
-let polling = false;
-let shuttingDown = false;
-let startedAt = Date.now();
+  const base = String(valor).trim().replace(/\/+$/, '');
 
-const stats = {
-  apiRequests: 0,
-  apiErrors: 0,
-  resultsInserted: 0,
-  signalsCreated: 0,
-  lastPollAt: null,
-  lastResultAt: null,
-  lastError: null
+  if (!base) return '';
+
+  return /\/health$/i.test(base)
+    ? base
+    : `${base}/health`;
+}
+
+const KEEP_ALIVE_URLS = [
+  process.env.KEEP_ALIVE_URL,
+  process.env.RENDER_EXTERNAL_URL,
+  process.env.PUBLIC_URL,
+  ...(process.env.KEEP_ALIVE_URLS || '').split(',')
+]
+  .map(normalizarUrlSaude)
+  .filter(Boolean)
+  .filter((url, index, lista) => lista.indexOf(url) === index);
+
+const runtime = {
+  iniciadoEm: new Date().toISOString(),
+  ciclos: 0,
+  ultimoPainel: null,
+  ultimoErro: null,
+  ultimoKeepAlive: null,
+  ultimoKeepAliveUrl: null,
+  keepAliveAtivo: false,
+  encerrando: false
 };
 
-function normalizeOutcome(value) {
-  const v = String(value ?? '').trim().toUpperCase();
+let bot = null;
+let server = null;
+let cicloTimer = null;
+let keepAliveTimer = null;
+let encerrando = false;
+let cicloEmExecucao = false;
 
-  if (['A', 'AZUL', 'BLUE', 'PLAYER'].includes(v)) {
-    return 'BLUE';
+/* =====================================================
+   KEEP-ALIVE
+   Apenas monitoriza URLs; não garante disponibilidade
+   permanente do plano de alojamento.
+===================================================== */
+
+async function keepAliveTick() {
+  if (encerrando || KEEP_ALIVE_URLS.length === 0) {
+    return;
   }
 
-  if (['V', 'VERMELHO', 'RED', 'BANKER'].includes(v)) {
-    return 'RED';
-  }
+  let sucesso = false;
 
-  if (['E', 'EMPATE', 'TIE', 'DRAW'].includes(v)) {
-    return 'TIE';
-  }
+  for (const url of KEEP_ALIVE_URLS) {
+    try {
+      const resposta = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'capunga-dados-monitor/1.0'
+        },
+        signal: AbortSignal.timeout(10000)
+      });
 
-  return null;
-}
-
-function safeError(error) {
-  return String(error?.message || error || 'Erro desconhecido')
-    .replace(/https?:\/\/\S+/gi, '[URL ocultada]')
-    .slice(0, 300);
-}
-
-function jsonError(res, status, message) {
-  return res.status(status).json({ ok: false, error: message });
-}
-
-function isConfiguredSecret() {
-  return typeof INGEST_TOKEN === 'string' &&
-    INGEST_TOKEN.length >= 32;
-}
-
-function requireIngestAuth(req, res, next) {
-  if (!isConfiguredSecret()) {
-    return jsonError(
-      res,
-      503,
-      'INGEST_TOKEN não configurado corretamente no Render.'
-    );
-  }
-
-  const auth = req.get('authorization') || '';
-  const expected = `Bearer ${INGEST_TOKEN}`;
-  const actualBuffer = Buffer.from(auth);
-  const expectedBuffer = Buffer.from(expected);
-
-  if (
-    actualBuffer.length !== expectedBuffer.length ||
-    !crypto.timingSafeEqual(actualBuffer, expectedBuffer)
-  ) {
-    return jsonError(res, 401, 'Não autorizado.');
-  }
-
-  next();
-}
-
-async function telegram(message) {
-  if (!BOT_TOKEN || !CHAT_ID) {
-    console.log('[TELEGRAM NÃO CONFIGURADO]', message);
-    return false;
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
-
-  try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: CHAT_ID,
-          text: message,
-          disable_web_page_preview: true
-        }),
-        signal: controller.signal
+      if (!resposta.ok) {
+        continue;
       }
-    );
 
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok || !data.ok) {
-      throw new Error('Falha no envio para o Telegram.');
+      sucesso = true;
+      runtime.ultimoKeepAlive = new Date().toISOString();
+      runtime.ultimoKeepAliveUrl = url;
+      runtime.keepAliveAtivo = true;
+      break;
+    } catch (erro) {
+      // Tenta o próximo URL configurado.
     }
+  }
 
-    return true;
-  } finally {
-    clearTimeout(timeout);
+  if (!sucesso) {
+    runtime.keepAliveAtivo = false;
   }
 }
 
-async function logEvent(type, detail = {}) {
-  try {
-    await pool.query(
-      `INSERT INTO eventos (tipo, detalhe)
-       VALUES ($1, $2::jsonb)`,
-      [type, JSON.stringify(detail)]
-    );
-  } catch (error) {
-    console.error('Erro ao guardar evento:', safeError(error));
-  }
+/* =====================================================
+   CICLO AUTOMÁTICO DO MOTOR
+===================================================== */
+
+function agendarProximoCiclo() {
+  if (encerrando) return;
+
+  cicloTimer = setTimeout(() => {
+    ciclo().catch((erro) => {
+      runtime.ultimoErro = erro.message;
+      console.error('[CICLO]', erro.message);
+    });
+  }, INTERVALO_SYNC_MS);
 }
 
-async function initDatabase() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS resultados (
-      id BIGSERIAL PRIMARY KEY,
-      rodada_id TEXT UNIQUE NOT NULL,
-      resultado TEXT NOT NULL
-        CHECK (resultado IN ('RED', 'BLUE', 'TIE')),
-      hora_resultado TIMESTAMPTZ,
-      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
+async function ciclo() {
+  if (encerrando || cicloEmExecucao) return;
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS sinais (
-      id BIGSERIAL PRIMARY KEY,
-      sinal_id TEXT UNIQUE NOT NULL,
-      previsao TEXT NOT NULL
-        CHECK (previsao IN ('RED', 'BLUE')),
-      estado TEXT NOT NULL DEFAULT 'PENDENTE',
-      gale_level INTEGER NOT NULL DEFAULT 0,
-      confianca NUMERIC(6,5),
-      amostra INTEGER NOT NULL DEFAULT 0,
-      resultado_final TEXT,
-      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      resolvido_em TIMESTAMPTZ
-    )
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS eventos (
-      id BIGSERIAL PRIMARY KEY,
-      tipo TEXT NOT NULL,
-      detalhe JSONB NOT NULL DEFAULT '{}'::jsonb,
-      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  // Adiciona colunas em instalações compatíveis mais antigas.
-  await pool.query(`
-    ALTER TABLE sinais
-    ADD COLUMN IF NOT EXISTS gale_level INTEGER NOT NULL DEFAULT 0
-  `);
-
-  await pool.query(`
-    ALTER TABLE sinais
-    ADD COLUMN IF NOT EXISTS resultado_final TEXT
-  `);
-
-  await pool.query(`
-    ALTER TABLE sinais
-    ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  `);
-
-  await pool.query(`
-    ALTER TABLE sinais
-    ADD COLUMN IF NOT EXISTS resolvido_em TIMESTAMPTZ
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_resultados_criado
-    ON resultados (criado_em DESC)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_sinais_estado
-    ON sinais (estado, criado_em DESC)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_eventos_criado
-    ON eventos (criado_em DESC)
-  `);
-
-  console.log('Estrutura PostgreSQL verificada.');
-}
-
-async function getRecentResults(limit = MAX_RESULTADOS) {
-  const result = await pool.query(
-    `SELECT rodada_id, resultado, hora_resultado, criado_em
-     FROM resultados
-     ORDER BY criado_em DESC, id DESC
-     LIMIT $1`,
-    [limit]
-  );
-
-  return result.rows;
-}
-
-async function hasPendingSignal(client = pool) {
-  const result = await client.query(
-    `SELECT id
-     FROM sinais
-     WHERE estado = 'PENDENTE'
-     ORDER BY criado_em ASC, id ASC
-     LIMIT 1`
-  );
-
-  return result.rows[0] || null;
-}
-
-/**
- * Motor estatístico básico.
- *
- * A frequência histórica não é uma probabilidade garantida
- * do próximo resultado. Esta função não garante vitórias.
- */
-function analyzeHistory(rows) {
-  const usable = [...rows]
-    .reverse()
-    .filter(row =>
-      row.resultado === 'RED' || row.resultado === 'BLUE'
-    );
-
-  if (usable.length < MIN_AMOSTRA) {
-    return {
-      eligible: false,
-      reason: 'AMOSTRA_INSUFICIENTE',
-      sample: usable.length
-    };
-  }
-
-  const window = usable.slice(-Math.min(100, usable.length));
-
-  let red = 0;
-  let blue = 0;
-
-  for (const row of window) {
-    if (row.resultado === 'RED') red++;
-    if (row.resultado === 'BLUE') blue++;
-  }
-
-  const total = window.length;
-  const redRate = red / total;
-  const blueRate = blue / total;
-  const prediction = redRate >= blueRate ? 'RED' : 'BLUE';
-  const proportion = Math.max(redRate, blueRate);
-
-  if (proportion < MIN_PROPORCAO) {
-    return {
-      eligible: false,
-      reason: 'FILTRO_HISTORICO',
-      sample: total,
-      redRate,
-      blueRate
-    };
-  }
-
-  return {
-    eligible: true,
-    prediction,
-    proportion,
-    sample: total,
-    redRate,
-    blueRate
-  };
-}
-
-async function createSignal(analysis) {
-  if (!analysis.eligible) return null;
-
-  const client = await pool.connect();
-  let created = null;
+  cicloEmExecucao = true;
 
   try {
-    await client.query('BEGIN');
-
-    // Serializa a criação para impedir dois sinais simultâneos
-    // quando chegam resultados ao mesmo tempo.
-    await client.query(
-      'SELECT pg_advisory_xact_lock($1)',
-      [748291]
-    );
-
-    const pending = await hasPendingSignal(client);
-
-    if (pending) {
-      await client.query('COMMIT');
-      return null;
+    if (!bot || typeof bot.tickAndSnapshot !== 'function') {
+      throw new Error('Motor do bot não inicializado.');
     }
 
-    const signalId = crypto.randomUUID();
+    const painel = await bot.tickAndSnapshot();
 
-    const inserted = await client.query(
-      `INSERT INTO sinais
-        (sinal_id, previsao, estado, gale_level, confianca, amostra)
-       VALUES ($1, $2, 'PENDENTE', 0, $3, $4)
-       RETURNING *`,
-      [
-        signalId,
-        analysis.prediction,
-        analysis.proportion,
-        analysis.sample
-      ]
-    );
+    runtime.ultimoPainel = painel || null;
+    runtime.ultimoErro = painel && painel.erro
+      ? String(painel.erro)
+      : null;
 
-    created = inserted.rows[0];
+    runtime.ciclos++;
 
-    await client.query('COMMIT');
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
+    if (runtime.ultimoErro) {
+      console.error('[MOTOR]', runtime.ultimoErro);
+    }
+  } catch (erro) {
+    runtime.ultimoErro = erro.message;
+    console.error('[CICLO]', erro.message);
   } finally {
-    client.release();
+    cicloEmExecucao = false;
+    agendarProximoCiclo();
   }
+}
 
-  if (!created) return null;
+/* =====================================================
+   ROTAS HTTP
+===================================================== */
 
-  stats.signalsCreated++;
-
-  await logEvent('SINAL_CRIADO', {
-    sinalId: created.sinal_id,
-    prediction: analysis.prediction,
-    sample: analysis.sample,
-    historicalRate: analysis.proportion
+app.get('/', (_req, res) => {
+  res.json({
+    nome: 'CAPUNGA DADOS — BAC BO',
+    estado: encerrando ? 'encerrando' : 'online',
+    iniciadoEm: runtime.iniciadoEm,
+    hora: new Date().toISOString()
   });
+});
 
-  const message = [
-    '🎲 CAPUNGA BAC BO',
-    '',
-    `Sinal: ${analysis.prediction}`,
-    'Entrada: inicial',
-    'Proteção: Gale máximo 2',
-    `Amostra: ${analysis.sample}`,
-    `Frequência histórica: ${(analysis.proportion * 100).toFixed(1)}%`,
-    '',
-    'A frequência histórica não garante o próximo resultado.',
-    `ID: ${created.sinal_id}`
-  ].join('\n');
+function saude(_req, res) {
+  const painel = runtime.ultimoPainel;
 
-  try {
-    await telegram(message);
-  } catch (error) {
-    console.error('Falha ao enviar sinal:', safeError(error));
-  }
+  const baseConfigurada = Boolean(DATABASE_URL);
+  const telegramConfigurado = Boolean(BOT_TOKEN && CHAT_ID);
+  const motorInicializado = Boolean(bot);
 
-  return created;
+  res.status(encerrando ? 503 : 200).json({
+    sucesso: !encerrando,
+    estado: encerrando ? 'encerrando' : 'online',
+    baseConfigurada,
+    telegramConfigurado,
+    motorInicializado,
+    ciclos: runtime.ciclos,
+    hora: painel && painel.hora ? painel.hora : null,
+    motivo: painel && painel.motivo
+      ? painel.motivo
+      : 'A aguardar primeira sincronização',
+    aoVivo: painel ? Boolean(painel.aoVivo) : false,
+    retomado: painel ? Boolean(painel.retomado) : false,
+    ultimaSincronizacao: painel
+      ? painel.sincronizadoEm || null
+      : null,
+    ultimoErro: runtime.ultimoErro,
+    ultimoKeepAlive: runtime.ultimoKeepAlive,
+    ultimoKeepAliveUrl: runtime.ultimoKeepAliveUrl,
+    keepAliveAtivo: runtime.keepAliveAtivo
+  });
 }
 
-async function settleSignal(resultRow) {
-  const client = await pool.connect();
+app.get('/health', saude);
+app.get('/api/health', saude);
+
+/* Estado detalhado */
+app.get('/status', async (_req, res) => {
+  let baseDadosOK = false;
+  let totaisSinais = null;
 
   try {
-    await client.query('BEGIN');
+    if (!bot || typeof bot.getSql !== 'function') {
+      throw new Error('Motor ainda não inicializado.');
+    }
 
-    const pending = await client.query(
-      `SELECT *
-       FROM sinais
-       WHERE estado = 'PENDENTE'
-       ORDER BY criado_em ASC, id ASC
-       LIMIT 1
-       FOR UPDATE`
+    const sql = await bot.getSql();
+
+    const resultado = await sql.query(
+      'SELECT estado, COUNT(*)::int AS quantidade ' +
+      'FROM bacbo_sinais GROUP BY estado ORDER BY estado'
     );
 
-    if (!pending.rowCount) {
-      await client.query('COMMIT');
-      return { action: 'NO_ACTIVE_SIGNAL' };
-    }
-
-    const signal = pending.rows[0];
-    const outcome = resultRow.resultado;
-
-    // Empate: devolução, sem avançar o Gale.
-    if (outcome === 'TIE') {
-      await client.query(
-        `UPDATE sinais
-         SET atualizado_em = NOW()
-         WHERE id = $1`,
-        [signal.id]
-      );
-
-      await client.query('COMMIT');
-
-      return {
-        action: 'TIE_REFUND',
-        signalId: signal.sinal_id,
-        gale: signal.gale_level
-      };
-    }
-
-    if (outcome === signal.previsao) {
-      const label = signal.gale_level === 0
-        ? 'GREEN'
-        : `G${signal.gale_level}`;
-
-      await client.query(
-        `UPDATE sinais
-         SET estado = $2,
-             resultado_final = $3,
-             atualizado_em = NOW(),
-             resolvido_em = NOW()
-         WHERE id = $1`,
-        [signal.id, label, outcome]
-      );
-
-      await client.query('COMMIT');
-
-      return {
-        action: 'WIN',
-        signalId: signal.sinal_id,
-        label,
-        prediction: signal.previsao,
-        outcome
-      };
-    }
-
-    if (signal.gale_level < 2) {
-      const nextLevel = signal.gale_level + 1;
-
-      await client.query(
-        `UPDATE sinais
-         SET gale_level = $2,
-             atualizado_em = NOW()
-         WHERE id = $1`,
-        [signal.id, nextLevel]
-      );
-
-      await client.query('COMMIT');
-
-      return {
-        action: 'GALE',
-        signalId: signal.sinal_id,
-        level: nextLevel,
-        prediction: signal.previsao,
-        outcome
-      };
-    }
-
-    await client.query(
-      `UPDATE sinais
-       SET estado = 'LOSS',
-           resultado_final = $2,
-           atualizado_em = NOW(),
-           resolvido_em = NOW()
-       WHERE id = $1`,
-      [signal.id, outcome]
-    );
-
-    await client.query('COMMIT');
-
-    return {
-      action: 'LOSS',
-      signalId: signal.sinal_id,
-      prediction: signal.previsao,
-      outcome
-    };
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-async function announceSettlement(result) {
-  if (!result || result.action === 'NO_ACTIVE_SIGNAL') return;
-
-  let message;
-
-  switch (result.action) {
-    case 'TIE_REFUND':
-      message =
-        `🤝 EMPATE — DEVOLUÇÃO\n` +
-        `Sinal: ${result.signalId}\n` +
-        `Gale mantido: ${result.gale}`;
-      break;
-
-    case 'WIN':
-      message =
-        `✅ ${result.label}\n` +
-        `Sinal: ${result.signalId}\n` +
-        `Previsão: ${result.prediction}\n` +
-        `Resultado: ${result.outcome}`;
-      break;
-
-    case 'GALE':
-      message =
-        `⚠️ GALE ${result.level}\n` +
-        `Sinal: ${result.signalId}\n` +
-        `Resultado: ${result.outcome}\n` +
-        `Previsão mantida: ${result.prediction}`;
-      break;
-
-    case 'LOSS':
-      message =
-        `❌ LOSS — GALE 2 ESGOTADO\n` +
-        `Sinal: ${result.signalId}\n` +
-        `Previsão: ${result.prediction}\n` +
-        `Resultado: ${result.outcome}`;
-      break;
-
-    default:
-      return;
+    totaisSinais = resultado.rows || resultado;
+    baseDadosOK = true;
+  } catch (erro) {
+    runtime.ultimoErro = erro.message;
   }
 
-  try {
-    await telegram(message);
-  } catch (error) {
-    console.error('Erro Telegram:', safeError(error));
+  const painel = runtime.ultimoPainel;
+
+  res.json({
+    nome: 'CAPUNGA DADOS — BAC BO',
+    estado: encerrando ? 'encerrando' : 'online',
+    iniciadoEm: runtime.iniciadoEm,
+    ciclos: runtime.ciclos,
+    ultimaSincronizacao: painel
+      ? painel.sincronizadoEm || null
+      : null,
+    motivo: painel
+      ? painel.motivoHumano || painel.motivo || null
+      : null,
+    sinalAberto: painel ? painel.aberto ?? null : null,
+    folhaDoDia: painel ? painel.folha ?? null : null,
+    totalRodadas: painel && painel.totais
+      ? painel.totais.rodadas ?? null
+      : null,
+    baseDadosOK,
+    totaisSinais,
+    ultimoErro: runtime.ultimoErro
+  });
+});
+
+/* Painel privado, se PAINEL_TOKEN estiver definido */
+app.get('/api/painel', (req, res) => {
+  if (PAINEL_TOKEN) {
+    const bearer = req.headers.authorization || '';
+    const autorizado =
+      req.query.token === PAINEL_TOKEN ||
+      bearer === `Bearer ${PAINEL_TOKEN}`;
+
+    if (!autorizado) {
+      return res.status(401).json({
+        sucesso: false,
+        erro: 'nao_autorizado'
+      });
+    }
   }
 
-  await logEvent('SINAL_RESOLVIDO', result);
-}
+  if (!runtime.ultimoPainel) {
+    return res.status(503).json({
+      sucesso: false,
+      estado: 'iniciando',
+      erro: runtime.ultimoErro || 'A aguardar primeira sincronização'
+    });
+  }
 
-function extractApiResults(payload) {
-  const list = Array.isArray(payload)
-    ? payload
-    : payload?.resultados ??
-      payload?.results ??
-      payload?.data?.resultados ??
-      payload?.data?.results;
+  res.json(runtime.ultimoPainel);
+});
 
-  if (!Array.isArray(list)) {
+/* Resposta para rotas inexistentes */
+app.use((_req, res) => {
+  res.status(404).json({
+    sucesso: false,
+    erro: 'rota_nao_encontrada'
+  });
+});
+
+/* Erros de JSON e de middleware */
+app.use((erro, _req, res, _next) => {
+  console.error('[HTTP]', erro.message);
+
+  if (res.headersSent) return;
+
+  res.status(400).json({
+    sucesso: false,
+    erro: 'pedido_invalido'
+  });
+});
+
+/* =====================================================
+   ARRANQUE
+===================================================== */
+
+async function iniciar() {
+  if (!DATABASE_URL) {
+    throw new Error('Configura DATABASE_URL no Render.');
+  }
+
+  if (!BOT_TOKEN) {
+    throw new Error('Configura BOT_TOKEN no Render.');
+  }
+
+  if (!CHAT_ID) {
+    throw new Error('Configura CHAT_ID no Render.');
+  }
+
+  // Carrega os módulos ESM da pasta ./bot.
+  const [tick, telegram, db, migrate] = await Promise.all([
+    import('./bot/tick.js'),
+    import('./bot/telegram.js'),
+    import('./bot/db.js'),
+    import('./bot/migrate.js')
+  ]);
+
+  if (typeof tick.tickAndSnapshot !== 'function') {
     throw new Error(
-      'Formato da API desconhecido. Ajusta extractApiResults à resposta real.'
+      './bot/tick.js não exporta tickAndSnapshot().'
     );
   }
 
-  return list.map(item => {
-    const rodadaId = String(
-      item.id ?? item.round_id ?? item.roundId ?? ''
-    ).trim();
-
-    const resultado = normalizeOutcome(
-      item.resultado ?? item.result ?? item.winner
+  if (typeof db.getSql !== 'function') {
+    throw new Error(
+      './bot/db.js não exporta getSql().'
     );
-
-    const rawDate =
-      item.hora ?? item.timestamp ?? item.created_at;
-
-    const date = rawDate ? new Date(rawDate) : null;
-
-    const horaResultado =
-      date && !Number.isNaN(date.getTime())
-        ? date.toISOString()
-        : null;
-
-    if (!rodadaId || !resultado) return null;
-
-    return {
-      rodadaId,
-      resultado,
-      horaResultado
-    };
-  }).filter(Boolean);
-}
-
-async function fetchApiResults() {
-  if (!API_BACBO) return [];
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-
-  try {
-    stats.apiRequests++;
-
-    const response = await fetch(API_BACBO, {
-      headers: { Accept: 'application/json' },
-      signal: controller.signal
-    });
-
-    if (!response.ok) {
-      throw new Error(`API respondeu HTTP ${response.status}`);
-    }
-
-    return extractApiResults(await response.json());
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function storeResult(item) {
-  const inserted = await pool.query(
-    `INSERT INTO resultados
-       (rodada_id, resultado, hora_resultado)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (rodada_id) DO NOTHING
-     RETURNING id, rodada_id, resultado, hora_resultado, criado_em`,
-    [item.rodadaId, item.resultado, item.horaResultado]
-  );
-
-  if (!inserted.rowCount) return false;
-
-  const resultRow = inserted.rows[0];
-
-  stats.resultsInserted++;
-  stats.lastResultAt = new Date().toISOString();
-
-  await logEvent('RESULTADO_RECEBIDO', {
-    rodadaId: resultRow.rodada_id,
-    resultado: resultRow.resultado
-  });
-
-  const settled = await settleSignal(resultRow);
-  await announceSettlement(settled);
-
-  // Criar outro sinal somente quando o anterior foi encerrado
-  // ou quando ainda não havia sinal ativo.
-  if (
-    settled.action === 'NO_ACTIVE_SIGNAL' ||
-    settled.action === 'WIN' ||
-    settled.action === 'LOSS'
-  ) {
-    const pending = await hasPendingSignal();
-
-    if (!pending) {
-      const history = await getRecentResults(MAX_RESULTADOS);
-      const analysis = analyzeHistory(history);
-      await createSignal(analysis);
-    }
   }
 
-  return true;
-}
-
-async function pollOnce() {
-  if (polling || shuttingDown || !API_BACBO) return;
-
-  polling = true;
-  stats.lastPollAt = new Date().toISOString();
-
-  try {
-    const results = await fetchApiResults();
-
-    // Só funciona corretamente se a API fornecer IDs únicos
-    // e os resultados vierem numa lista ordenável por antiguidade.
-    for (const item of results.reverse()) {
-      await storeResult(item);
-    }
-
-    stats.lastError = null;
-  } catch (error) {
-    stats.apiErrors++;
-    stats.lastError = safeError(error);
-
-    console.error('Erro na sincronização:', stats.lastError);
-
-    await logEvent('ERRO_API', { message: stats.lastError });
-  } finally {
-    polling = false;
-  }
-}
-
-app.get('/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-
-    res.json({
-      ok: true,
-      service: 'Capunga Bac Bo',
-      uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
-      database: 'connected',
-      apiConfigured: Boolean(API_BACBO),
-      ingestConfigured: isConfiguredSecret(),
-      telegramConfigured: Boolean(BOT_TOKEN && CHAT_ID),
-      lastPollAt: stats.lastPollAt,
-      lastResultAt: stats.lastResultAt,
-      lastError: stats.lastError
-    });
-  } catch {
-    res.status(503).json({
-      ok: false,
-      database: 'disconnected'
-    });
-  }
-});
-
-app.get('/api/stats', requireIngestAuth, async (req, res) => {
-  try {
-    const results = await pool.query(`
-      SELECT resultado, COUNT(*)::int AS total
-      FROM resultados
-      GROUP BY resultado
-    `);
-
-    const signals = await pool.query(`
-      SELECT estado, COUNT(*)::int AS total
-      FROM sinais
-      GROUP BY estado
-    `);
-
-    res.json({
-      resultados: results.rows,
-      sinais: signals.rows,
-      runtime: stats
-    });
-  } catch (error) {
-    console.error('Erro nas estatísticas:', safeError(error));
-    jsonError(res, 500, 'Falha nas estatísticas.');
-  }
-});
-
-app.post('/api/result', requireIngestAuth, async (req, res) => {
-  try {
-    const rodadaId = String(req.body?.rodada_id ?? '').trim();
-    const resultado = normalizeOutcome(req.body?.resultado);
-
-    if (!rodadaId || rodadaId.length > 150 || !resultado) {
-      return jsonError(
-        res,
-        400,
-        'Fornece rodada_id e resultado RED, BLUE ou TIE.'
-      );
-    }
-
-    const rawDate = req.body?.hora;
-    const date = rawDate ? new Date(rawDate) : null;
-
-    const horaResultado =
-      date && !Number.isNaN(date.getTime())
-        ? date.toISOString()
-        : null;
-
-    const inserted = await storeResult({
-      rodadaId,
-      resultado,
-      horaResultado
-    });
-
-    res.status(inserted ? 201 : 200).json({
-      ok: true,
-      duplicate: !inserted,
-      rodada_id: rodadaId,
-      resultado
-    });
-  } catch (error) {
-    console.error('Erro ao registar resultado:', safeError(error));
-    jsonError(res, 500, 'Não foi possível guardar o resultado.');
-  }
-});
-
-app.get('/api/history', requireIngestAuth, async (req, res) => {
-  try {
-    const requested = Number(req.query.limit || 30);
-    const limit = Math.min(100, Math.max(
-      1,
-      Number.isFinite(requested) ? requested : 30
-    ));
-
-    const result = await pool.query(
-      `SELECT rodada_id, resultado, hora_resultado, criado_em
-       FROM resultados
-       ORDER BY criado_em DESC, id DESC
-       LIMIT $1`,
-      [limit]
+  if (typeof migrate.migrate !== 'function') {
+    throw new Error(
+      './bot/migrate.js não exporta migrate().'
     );
-
-    res.json({ results: result.rows });
-  } catch (error) {
-    console.error('Erro no histórico:', safeError(error));
-    jsonError(res, 500, 'Erro ao consultar histórico.');
   }
-});
 
-async function start() {
-  await initDatabase();
+  bot = {
+    tickAndSnapshot: tick.tickAndSnapshot,
+    telegramConfigurado: telegram.telegramConfigurado,
+    getSql: db.getSql,
+    closeDb: db.closeDb
+  };
+
+  // Assegura que as tabelas existem antes de iniciar o HTTP.
+  await migrate.migrate();
+
+  console.log('[DB] Migração concluída.');
 
   server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Capunga Bac Bo ativo na porta ${PORT}`);
-    console.log(`API configurada: ${Boolean(API_BACBO)}`);
-    console.log(`Token de ingestão configurado: ${isConfiguredSecret()}`);
+    console.log(`[HTTP] Servidor iniciado na porta ${PORT}.`);
   });
 
-  if (API_BACBO) {
-    await pollOnce();
+  server.on('error', (erro) => {
+    runtime.ultimoErro = erro.message;
+    console.error('[HTTP FATAL]', erro.message);
+  });
 
-    pollTimer = setInterval(() => {
-      pollOnce().catch(error => {
-        console.error('Erro no ciclo:', safeError(error));
+  if (KEEP_ALIVE_URLS.length > 0) {
+    keepAliveTimer = setInterval(() => {
+      keepAliveTick().catch((erro) => {
+        console.error('[KEEP-ALIVE]', erro.message);
       });
-    }, POLL_INTERVAL_MS);
-  } else {
-    console.warn(
-      'API_BACBO ausente. Nenhum resultado será obtido automaticamente.'
-    );
+    }, KEEP_ALIVE_MS);
+
+    if (typeof keepAliveTimer.unref === 'function') {
+      keepAliveTimer.unref();
+    }
+
+    setTimeout(() => {
+      keepAliveTick().catch(() => {});
+    }, 15000);
   }
+
+  console.log('[BOT] A iniciar o ciclo automático.');
+  console.log(`[BOT] Intervalo: ${INTERVALO_SYNC_MS} ms.`);
+
+  // Primeira execução imediata.
+  await ciclo();
 }
 
-async function shutdown() {
-  if (shuttingDown) return;
-  shuttingDown = true;
+/* =====================================================
+   ENCERRAMENTO CONTROLADO
+===================================================== */
 
-  console.log('A encerrar servidor...');
+async function encerrar() {
+  if (encerrando) return;
 
-  if (pollTimer) clearInterval(pollTimer);
+  encerrando = true;
+  runtime.encerrando = true;
+
+  if (cicloTimer) {
+    clearTimeout(cicloTimer);
+    cicloTimer = null;
+  }
+
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
 
   if (server) {
-    await new Promise(resolve => server.close(resolve));
+    await new Promise((resolve) => {
+      server.close(() => resolve());
+    });
   }
 
-  try {
-    await pool.end();
-  } catch (error) {
-    console.error('Erro ao fechar PostgreSQL:', safeError(error));
+  if (bot && typeof bot.closeDb === 'function') {
+    try {
+      await bot.closeDb();
+    } catch (erro) {
+      console.error('[DB CLOSE]', erro.message);
+    }
   }
 
-  process.exit(0);
+  console.log('[BOT] Servidor encerrado corretamente.');
 }
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-
-process.on('unhandledRejection', error => {
-  console.error('Promise rejeitada:', safeError(error));
+process.on('SIGTERM', () => {
+  encerrar().catch((erro) => {
+    console.error('[SIGTERM]', erro.message);
+    process.exitCode = 1;
+  });
 });
 
-start().catch(error => {
-  console.error('Falha ao iniciar:', safeError(error));
-  process.exit(1);
+process.on('SIGINT', () => {
+  encerrar().catch((erro) => {
+    console.error('[SIGINT]', erro.message);
+    process.exitCode = 1;
+  });
+});
+
+process.on('unhandledRejection', (erro) => {
+  console.error('[UNHANDLED REJECTION]', erro);
+});
+
+process.on('uncaughtException', (erro) => {
+  console.error('[UNCAUGHT EXCEPTION]', erro);
+  process.exitCode = 1;
+
+  encerrar().catch(() => {});
+});
+
+/* Arranque com falha explícita para o Render detetar */
+iniciar().catch((erro) => {
+  console.error('[FATAL]', erro.message);
+  process.exitCode = 1;
 });
