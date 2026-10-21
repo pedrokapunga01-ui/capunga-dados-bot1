@@ -2,26 +2,26 @@
 'use strict';
 
 /**
- * CAPUNGA BAC BO — RENDER / NODE.JS
- * PostgreSQL + Telegram + API de resultados configurável
+ * CAPUNGA BAC BO — RENDER
+ * Node.js + Express + PostgreSQL + Telegram
  *
  * Gale máximo: 2
- * Empate: devolução; o sinal continua aberto
- * Sem garantia de acerto.
+ * Empate: devolução; mantém o sinal aberto
+ * Resultados: RED / BLUE / TIE
  *
- * Variáveis obrigatórias:
+ * Variáveis:
  * DATABASE_URL
  * BOT_TOKEN
  * CHAT_ID
  * INGEST_TOKEN
  * API_BACBO
  *
- * Opcional:
- * POLL_INTERVAL_MS (padrão 60000)
- * MIN_AMOSTRA (padrão 40)
- * MIN_PROPORCAO (padrão 0.58)
- * MAX_RESULTADOS (padrão 300)
- * PORT
+ * Opcionais:
+ * PORT=10000
+ * POLL_INTERVAL_MS=60000
+ * MIN_AMOSTRA=40
+ * MIN_PROPORCAO=0.58
+ * MAX_RESULTADOS=300
  */
 
 const express = require('express');
@@ -29,6 +29,7 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const app = express();
+app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb' }));
 
 const PORT = Number(process.env.PORT || 10000);
@@ -56,21 +57,7 @@ const INGEST_TOKEN = process.env.INGEST_TOKEN;
 const API_BACBO = process.env.API_BACBO;
 
 if (!DATABASE_URL) {
-  throw new Error('Falta configurar DATABASE_URL.');
-}
-
-if (!INGEST_TOKEN || INGEST_TOKEN.length < 24) {
-  throw new Error('INGEST_TOKEN deve ter pelo menos 24 caracteres.');
-}
-
-if (!BOT_TOKEN || !CHAT_ID) {
-  console.warn('Telegram não configurado completamente.');
-}
-
-if (!API_BACBO) {
-  console.warn(
-    'API_BACBO não configurada. A ingestão automática ficará inativa.'
-  );
+  throw new Error('Configura DATABASE_URL no Render.');
 }
 
 const pool = new Pool({
@@ -83,10 +70,11 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000
 });
 
-let startedAt = Date.now();
+let server;
+let pollTimer;
 let polling = false;
-let pollTimer = null;
 let shuttingDown = false;
+let startedAt = Date.now();
 
 const stats = {
   apiRequests: 0,
@@ -99,9 +87,7 @@ const stats = {
 };
 
 function normalizeOutcome(value) {
-  const v = String(value ?? '')
-    .trim()
-    .toUpperCase();
+  const v = String(value ?? '').trim().toUpperCase();
 
   if (['A', 'AZUL', 'BLUE', 'PLAYER'].includes(v)) {
     return 'BLUE';
@@ -119,15 +105,47 @@ function normalizeOutcome(value) {
 }
 
 function safeError(error) {
-  // Não expor URLs que possam conter tokens.
   return String(error?.message || error || 'Erro desconhecido')
     .replace(/https?:\/\/\S+/gi, '[URL ocultada]')
     .slice(0, 300);
 }
 
+function jsonError(res, status, message) {
+  return res.status(status).json({ ok: false, error: message });
+}
+
+function isConfiguredSecret() {
+  return typeof INGEST_TOKEN === 'string' &&
+    INGEST_TOKEN.length >= 32;
+}
+
+function requireIngestAuth(req, res, next) {
+  if (!isConfiguredSecret()) {
+    return jsonError(
+      res,
+      503,
+      'INGEST_TOKEN não configurado corretamente no Render.'
+    );
+  }
+
+  const auth = req.get('authorization') || '';
+  const expected = `Bearer ${INGEST_TOKEN}`;
+  const actualBuffer = Buffer.from(auth);
+  const expectedBuffer = Buffer.from(expected);
+
+  if (
+    actualBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+  ) {
+    return jsonError(res, 401, 'Não autorizado.');
+  }
+
+  next();
+}
+
 async function telegram(message) {
   if (!BOT_TOKEN || !CHAT_ID) {
-    console.log('[TELEGRAM DESATIVADO]', message);
+    console.log('[TELEGRAM NÃO CONFIGURADO]', message);
     return false;
   }
 
@@ -152,7 +170,7 @@ async function telegram(message) {
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok || !data.ok) {
-      throw new Error('Telegram recusou o envio.');
+      throw new Error('Falha no envio para o Telegram.');
     }
 
     return true;
@@ -165,7 +183,7 @@ async function logEvent(type, detail = {}) {
   try {
     await pool.query(
       `INSERT INTO eventos (tipo, detalhe)
-       VALUES ($1, $2)`,
+       VALUES ($1, $2::jsonb)`,
       [type, JSON.stringify(detail)]
     );
   } catch (error) {
@@ -192,9 +210,8 @@ async function initDatabase() {
       previsao TEXT NOT NULL
         CHECK (previsao IN ('RED', 'BLUE')),
       estado TEXT NOT NULL DEFAULT 'PENDENTE',
-      gale_level INTEGER NOT NULL DEFAULT 0
-        CHECK (gale_level BETWEEN 0 AND 2),
-      confianca NUMERIC(6, 5),
+      gale_level INTEGER NOT NULL DEFAULT 0,
+      confianca NUMERIC(6,5),
       amostra INTEGER NOT NULL DEFAULT 0,
       resultado_final TEXT,
       criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -212,24 +229,7 @@ async function initDatabase() {
     )
   `);
 
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_resultados_data
-    ON resultados (criado_em DESC)
-  `);
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_sinais_estado
-    ON sinais (estado, criado_em DESC)
-  `);
-
-  // Uma só sequência ativa de sinais por servidor.
-  await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_um_sinal_pendente
-    ON sinais ((estado))
-    WHERE estado = 'PENDENTE'
-  `);
-
-  // Compatibilidade com tabelas já existentes.
+  // Adiciona colunas em instalações compatíveis mais antigas.
   await pool.query(`
     ALTER TABLE sinais
     ADD COLUMN IF NOT EXISTS gale_level INTEGER NOT NULL DEFAULT 0
@@ -240,7 +240,32 @@ async function initDatabase() {
     ADD COLUMN IF NOT EXISTS resultado_final TEXT
   `);
 
-  console.log('PostgreSQL inicializado.');
+  await pool.query(`
+    ALTER TABLE sinais
+    ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    ALTER TABLE sinais
+    ADD COLUMN IF NOT EXISTS resolvido_em TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_resultados_criado
+    ON resultados (criado_em DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_sinais_estado
+    ON sinais (estado, criado_em DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_eventos_criado
+    ON eventos (criado_em DESC)
+  `);
+
+  console.log('Estrutura PostgreSQL verificada.');
 }
 
 async function getRecentResults(limit = MAX_RESULTADOS) {
@@ -255,11 +280,30 @@ async function getRecentResults(limit = MAX_RESULTADOS) {
   return result.rows;
 }
 
-function analyzeHistory(rows) {
-  const ordered = [...rows].reverse();
-  const usable = ordered.filter(
-    row => row.resultado === 'RED' || row.resultado === 'BLUE'
+async function hasPendingSignal(client = pool) {
+  const result = await client.query(
+    `SELECT id
+     FROM sinais
+     WHERE estado = 'PENDENTE'
+     ORDER BY criado_em ASC, id ASC
+     LIMIT 1`
   );
+
+  return result.rows[0] || null;
+}
+
+/**
+ * Motor estatístico básico.
+ *
+ * A frequência histórica não é uma probabilidade garantida
+ * do próximo resultado. Esta função não garante vitórias.
+ */
+function analyzeHistory(rows) {
+  const usable = [...rows]
+    .reverse()
+    .filter(row =>
+      row.resultado === 'RED' || row.resultado === 'BLUE'
+    );
 
   if (usable.length < MIN_AMOSTRA) {
     return {
@@ -270,28 +314,25 @@ function analyzeHistory(rows) {
   }
 
   const window = usable.slice(-Math.min(100, usable.length));
-  const counts = {
-    RED: 0,
-    BLUE: 0
-  };
+
+  let red = 0;
+  let blue = 0;
 
   for (const row of window) {
-    counts[row.resultado]++;
+    if (row.resultado === 'RED') red++;
+    if (row.resultado === 'BLUE') blue++;
   }
 
   const total = window.length;
-  const redRate = counts.RED / total;
-  const blueRate = counts.BLUE / total;
-
+  const redRate = red / total;
+  const blueRate = blue / total;
   const prediction = redRate >= blueRate ? 'RED' : 'BLUE';
   const proportion = Math.max(redRate, blueRate);
 
-  // Frequência histórica não equivale à probabilidade futura.
-  // Este filtro é apenas exploratório.
   if (proportion < MIN_PROPORCAO) {
     return {
       eligible: false,
-      reason: 'SEM_DIFERENCA_HISTORICA_SUFICIENTE',
+      reason: 'FILTRO_HISTORICO',
       sample: total,
       redRate,
       blueRate
@@ -311,14 +352,32 @@ function analyzeHistory(rows) {
 async function createSignal(analysis) {
   if (!analysis.eligible) return null;
 
-  const signalId = crypto.randomUUID();
+  const client = await pool.connect();
+  let created = null;
 
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+
+    // Serializa a criação para impedir dois sinais simultâneos
+    // quando chegam resultados ao mesmo tempo.
+    await client.query(
+      'SELECT pg_advisory_xact_lock($1)',
+      [748291]
+    );
+
+    const pending = await hasPendingSignal(client);
+
+    if (pending) {
+      await client.query('COMMIT');
+      return null;
+    }
+
+    const signalId = crypto.randomUUID();
+
+    const inserted = await client.query(
       `INSERT INTO sinais
-         (sinal_id, previsao, estado, gale_level, confianca, amostra)
+        (sinal_id, previsao, estado, gale_level, confianca, amostra)
        VALUES ($1, $2, 'PENDENTE', 0, $3, $4)
-       ON CONFLICT DO NOTHING
        RETURNING *`,
       [
         signalId,
@@ -328,41 +387,47 @@ async function createSignal(analysis) {
       ]
     );
 
-    if (!result.rowCount) return null;
+    created = inserted.rows[0];
 
-    stats.signalsCreated++;
-
-    const message = [
-      '🎲 CAPUNGA BAC BO',
-      '',
-      `Sinal: ${analysis.prediction}`,
-      'Entrada: inicial',
-      'Proteção: Gale máximo 2',
-      `Amostra histórica: ${analysis.sample}`,
-      `Frequência histórica observada: ${(analysis.proportion * 100).toFixed(1)}%`,
-      '',
-      'AVISO: estatística histórica, não garantia de acerto.',
-      `ID: ${signalId}`
-    ].join('\n');
-
-    try {
-      await telegram(message);
-    } catch (error) {
-      console.error('Erro Telegram:', safeError(error));
-    }
-
-    await logEvent('SINAL_CRIADO', {
-      sinalId,
-      prediction: analysis.prediction,
-      sample: analysis.sample,
-      historicalRate: analysis.proportion
-    });
-
-    return result.rows[0];
+    await client.query('COMMIT');
   } catch (error) {
-    if (error.code === '23505') return null;
+    await client.query('ROLLBACK');
     throw error;
+  } finally {
+    client.release();
   }
+
+  if (!created) return null;
+
+  stats.signalsCreated++;
+
+  await logEvent('SINAL_CRIADO', {
+    sinalId: created.sinal_id,
+    prediction: analysis.prediction,
+    sample: analysis.sample,
+    historicalRate: analysis.proportion
+  });
+
+  const message = [
+    '🎲 CAPUNGA BAC BO',
+    '',
+    `Sinal: ${analysis.prediction}`,
+    'Entrada: inicial',
+    'Proteção: Gale máximo 2',
+    `Amostra: ${analysis.sample}`,
+    `Frequência histórica: ${(analysis.proportion * 100).toFixed(1)}%`,
+    '',
+    'A frequência histórica não garante o próximo resultado.',
+    `ID: ${created.sinal_id}`
+  ].join('\n');
+
+  try {
+    await telegram(message);
+  } catch (error) {
+    console.error('Falha ao enviar sinal:', safeError(error));
+  }
+
+  return created;
 }
 
 async function settleSignal(resultRow) {
@@ -371,25 +436,25 @@ async function settleSignal(resultRow) {
   try {
     await client.query('BEGIN');
 
-    const active = await client.query(
+    const pending = await client.query(
       `SELECT *
        FROM sinais
        WHERE estado = 'PENDENTE'
-       ORDER BY criado_em ASC
+       ORDER BY criado_em ASC, id ASC
        LIMIT 1
        FOR UPDATE`
     );
 
-    if (!active.rowCount) {
+    if (!pending.rowCount) {
       await client.query('COMMIT');
       return { action: 'NO_ACTIVE_SIGNAL' };
     }
 
-    const signal = active.rows[0];
+    const signal = pending.rows[0];
     const outcome = resultRow.resultado;
 
+    // Empate: devolução, sem avançar o Gale.
     if (outcome === 'TIE') {
-      // Empate devolve: não avançar Gale.
       await client.query(
         `UPDATE sinais
          SET atualizado_em = NOW()
@@ -505,7 +570,7 @@ async function announceSettlement(result) {
       message =
         `⚠️ GALE ${result.level}\n` +
         `Sinal: ${result.signalId}\n` +
-        `Resultado contrário: ${result.outcome}\n` +
+        `Resultado: ${result.outcome}\n` +
         `Previsão mantida: ${result.prediction}`;
       break;
 
@@ -524,14 +589,13 @@ async function announceSettlement(result) {
   try {
     await telegram(message);
   } catch (error) {
-    console.error('Falha de notificação:', safeError(error));
+    console.error('Erro Telegram:', safeError(error));
   }
 
   await logEvent('SINAL_RESOLVIDO', result);
 }
 
 function extractApiResults(payload) {
-  // Adaptador para respostas com resultados em array.
   const list = Array.isArray(payload)
     ? payload
     : payload?.resultados ??
@@ -541,7 +605,7 @@ function extractApiResults(payload) {
 
   if (!Array.isArray(list)) {
     throw new Error(
-      'Formato de API desconhecido: falta um array de resultados.'
+      'Formato da API desconhecido. Ajusta extractApiResults à resposta real.'
     );
   }
 
@@ -554,18 +618,22 @@ function extractApiResults(payload) {
       item.resultado ?? item.result ?? item.winner
     );
 
-    const rawDate = item.hora ?? item.timestamp ?? item.created_at;
+    const rawDate =
+      item.hora ?? item.timestamp ?? item.created_at;
+
     const date = rawDate ? new Date(rawDate) : null;
-    const validDate = date && !Number.isNaN(date.getTime())
-      ? date.toISOString()
-      : null;
+
+    const horaResultado =
+      date && !Number.isNaN(date.getTime())
+        ? date.toISOString()
+        : null;
 
     if (!rodadaId || !resultado) return null;
 
     return {
       rodadaId,
       resultado,
-      horaResultado: validDate
+      horaResultado
     };
   }).filter(Boolean);
 }
@@ -580,17 +648,15 @@ async function fetchApiResults() {
     stats.apiRequests++;
 
     const response = await fetch(API_BACBO, {
-      method: 'GET',
       headers: { Accept: 'application/json' },
       signal: controller.signal
     });
 
     if (!response.ok) {
-      throw new Error(`API de resultados respondeu HTTP ${response.status}`);
+      throw new Error(`API respondeu HTTP ${response.status}`);
     }
 
-    const payload = await response.json();
-    return extractApiResults(payload);
+    return extractApiResults(await response.json());
   } finally {
     clearTimeout(timeout);
   }
@@ -609,6 +675,7 @@ async function storeResult(item) {
   if (!inserted.rowCount) return false;
 
   const resultRow = inserted.rows[0];
+
   stats.resultsInserted++;
   stats.lastResultAt = new Date().toISOString();
 
@@ -620,20 +687,16 @@ async function storeResult(item) {
   const settled = await settleSignal(resultRow);
   await announceSettlement(settled);
 
-  // Gerar um novo sinal apenas depois de um resultado novo
-  // e quando não existir um sinal ativo.
+  // Criar outro sinal somente quando o anterior foi encerrado
+  // ou quando ainda não havia sinal ativo.
   if (
     settled.action === 'NO_ACTIVE_SIGNAL' ||
     settled.action === 'WIN' ||
     settled.action === 'LOSS'
   ) {
-    const active = await pool.query(
-      `SELECT 1 FROM sinais
-       WHERE estado = 'PENDENTE'
-       LIMIT 1`
-    );
+    const pending = await hasPendingSignal();
 
-    if (!active.rowCount) {
+    if (!pending) {
       const history = await getRecentResults(MAX_RESULTADOS);
       const analysis = analyzeHistory(history);
       await createSignal(analysis);
@@ -652,8 +715,8 @@ async function pollOnce() {
   try {
     const results = await fetchApiResults();
 
-    // A maioria das APIs devolve o mais recente primeiro.
-    // Processar do mais antigo para o mais recente.
+    // Só funciona corretamente se a API fornecer IDs únicos
+    // e os resultados vierem numa lista ordenável por antiguidade.
     for (const item of results.reverse()) {
       await storeResult(item);
     }
@@ -665,29 +728,10 @@ async function pollOnce() {
 
     console.error('Erro na sincronização:', stats.lastError);
 
-    await logEvent('ERRO_API', {
-      message: stats.lastError
-    });
+    await logEvent('ERRO_API', { message: stats.lastError });
   } finally {
     polling = false;
   }
-}
-
-function requireIngestAuth(req, res, next) {
-  const auth = req.get('authorization') || '';
-  const expected = `Bearer ${INGEST_TOKEN}`;
-
-  const actualBuffer = Buffer.from(auth);
-  const expectedBuffer = Buffer.from(expected);
-
-  if (
-    actualBuffer.length !== expectedBuffer.length ||
-    !crypto.timingSafeEqual(actualBuffer, expectedBuffer)
-  ) {
-    return res.status(401).json({ error: 'Não autorizado' });
-  }
-
-  next();
 }
 
 app.get('/health', async (req, res) => {
@@ -700,6 +744,8 @@ app.get('/health', async (req, res) => {
       uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
       database: 'connected',
       apiConfigured: Boolean(API_BACBO),
+      ingestConfigured: isConfiguredSecret(),
+      telegramConfigured: Boolean(BOT_TOKEN && CHAT_ID),
       lastPollAt: stats.lastPollAt,
       lastResultAt: stats.lastResultAt,
       lastError: stats.lastError
@@ -729,39 +775,34 @@ app.get('/api/stats', requireIngestAuth, async (req, res) => {
     res.json({
       resultados: results.rows,
       sinais: signals.rows,
-      runtime: {
-        apiRequests: stats.apiRequests,
-        apiErrors: stats.apiErrors,
-        resultsInserted: stats.resultsInserted,
-        signalsCreated: stats.signalsCreated,
-        lastPollAt: stats.lastPollAt,
-        lastResultAt: stats.lastResultAt,
-        lastError: stats.lastError
-      }
+      runtime: stats
     });
   } catch (error) {
     console.error('Erro nas estatísticas:', safeError(error));
-    res.status(500).json({ error: 'Falha nas estatísticas' });
+    jsonError(res, 500, 'Falha nas estatísticas.');
   }
 });
 
-// Entrada manual/externa para uma fonte de resultados autorizada.
 app.post('/api/result', requireIngestAuth, async (req, res) => {
   try {
     const rodadaId = String(req.body?.rodada_id ?? '').trim();
     const resultado = normalizeOutcome(req.body?.resultado);
 
     if (!rodadaId || rodadaId.length > 150 || !resultado) {
-      return res.status(400).json({
-        error: 'É necessário fornecer rodada_id e resultado válido.'
-      });
+      return jsonError(
+        res,
+        400,
+        'Fornece rodada_id e resultado RED, BLUE ou TIE.'
+      );
     }
 
     const rawDate = req.body?.hora;
     const date = rawDate ? new Date(rawDate) : null;
-    const horaResultado = date && !Number.isNaN(date.getTime())
-      ? date.toISOString()
-      : null;
+
+    const horaResultado =
+      date && !Number.isNaN(date.getTime())
+        ? date.toISOString()
+        : null;
 
     const inserted = await storeResult({
       rodadaId,
@@ -777,16 +818,17 @@ app.post('/api/result', requireIngestAuth, async (req, res) => {
     });
   } catch (error) {
     console.error('Erro ao registar resultado:', safeError(error));
-    res.status(500).json({ error: 'Não foi possível guardar o resultado.' });
+    jsonError(res, 500, 'Não foi possível guardar o resultado.');
   }
 });
 
 app.get('/api/history', requireIngestAuth, async (req, res) => {
   try {
-    const limit = Math.min(
-      100,
-      Math.max(1, Number(req.query.limit || 30))
-    );
+    const requested = Number(req.query.limit || 30);
+    const limit = Math.min(100, Math.max(
+      1,
+      Number.isFinite(requested) ? requested : 30
+    ));
 
     const result = await pool.query(
       `SELECT rodada_id, resultado, hora_resultado, criado_em
@@ -799,15 +841,17 @@ app.get('/api/history', requireIngestAuth, async (req, res) => {
     res.json({ results: result.rows });
   } catch (error) {
     console.error('Erro no histórico:', safeError(error));
-    res.status(500).json({ error: 'Erro ao consultar histórico.' });
+    jsonError(res, 500, 'Erro ao consultar histórico.');
   }
 });
 
 async function start() {
   await initDatabase();
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Servidor ativo na porta ${PORT}`);
+  server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Capunga Bac Bo ativo na porta ${PORT}`);
+    console.log(`API configurada: ${Boolean(API_BACBO)}`);
+    console.log(`Token de ingestão configurado: ${isConfiguredSecret()}`);
   });
 
   if (API_BACBO) {
@@ -818,16 +862,24 @@ async function start() {
         console.error('Erro no ciclo:', safeError(error));
       });
     }, POLL_INTERVAL_MS);
+  } else {
+    console.warn(
+      'API_BACBO ausente. Nenhum resultado será obtido automaticamente.'
+    );
   }
 }
 
 async function shutdown() {
   if (shuttingDown) return;
-
   shuttingDown = true;
+
   console.log('A encerrar servidor...');
 
   if (pollTimer) clearInterval(pollTimer);
+
+  if (server) {
+    await new Promise(resolve => server.close(resolve));
+  }
 
   try {
     await pool.end();
@@ -840,6 +892,10 @@ async function shutdown() {
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+process.on('unhandledRejection', error => {
+  console.error('Promise rejeitada:', safeError(error));
+});
 
 start().catch(error => {
   console.error('Falha ao iniciar:', safeError(error));
