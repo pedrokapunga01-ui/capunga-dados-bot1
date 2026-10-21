@@ -1,4 +1,4 @@
-JavaScript
+
 'use strict';
 
 /**
@@ -209,4 +209,481 @@ function bonusMesa(cor, mesa) {
   if (mesa.alt12 <= 0.28 && mesa.seq.cor === cor) b += 6;
 
   return b;
+}
+const LOGICAS = [
+  {
+    id: 'SURF4', p: 93,
+    avaliar(dec) {
+      const s = sequencia(dec);
+      if (s.tamanho === 4 && dec.length > 4 && dec[4] !== s.cor) {
+        return { cor: s.cor };
+      }
+      return null;
+    }
+  },
+  {
+    id: 'PAD22', p: 95,
+    avaliar(dec) {
+      if (dec.length < 4) return null;
+      const [a, b, c, d] = dec;
+      return a === b && c === d && a !== c ? { cor: a } : null;
+    }
+  },
+  {
+    id: 'DUPLO22', p: 97,
+    avaliar(dec) {
+      if (dec.length < 6) return null;
+      const [a, b, c, d, e, f] = dec;
+      return a === b && e === f && a === e && c === d && a !== c
+        ? { cor: a } : null;
+    }
+  },
+  {
+    id: 'ALT5', p: 91,
+    avaliar(dec) {
+      const s = dec.slice(0, 5);
+      if (s.length < 5) return null;
+      for (let i = 1; i < 5; i++) {
+        if (s[i] === s[i - 1]) return null;
+      }
+      return { cor: OPOSTO[s[0]] };
+    }
+  },
+  {
+    id: 'ALT6', p: 94,
+    avaliar(dec) {
+      const s = dec.slice(0, 6);
+      if (s.length < 6) return null;
+      for (let i = 1; i < 6; i++) {
+        if (s[i] === s[i - 1]) return null;
+      }
+      return { cor: OPOSTO[s[0]] };
+    }
+  },
+  {
+    id: 'STREAK4', p: 92,
+    avaliar(dec) {
+      const s = sequencia(dec);
+      return s.tamanho === 4 || s.tamanho === 5
+        ? { cor: s.cor } : null;
+    }
+  },
+  {
+    id: 'STREAK6', p: 88,
+    avaliar(dec) {
+      const s = sequencia(dec);
+      return s.tamanho >= 6 && s.tamanho <= 8
+        ? { cor: s.cor } : null;
+    }
+  },
+  {
+    id: 'QUEBRA8', p: 74,
+    avaliar(dec) {
+      const s = sequencia(dec);
+      return s.tamanho >= 8 ? { cor: OPOSTO[s.cor] } : null;
+    }
+  },
+  {
+    id: 'MAIORIA12', p: 84,
+    avaliar(dec) {
+      const c = contar(dec, 12);
+      if (c.n < 12 || Math.abs(c.banca - c.jogador) < 5) return null;
+
+      const cor = c.banca > c.jogador ? 'Banca' : 'Jogador';
+      const s = sequencia(dec);
+
+      if (s.cor && s.cor !== cor && s.tamanho >= 2) return null;
+      return { cor };
+    }
+  },
+  {
+    id: 'PRESSAO5', p: 86,
+    avaliar(dec) {
+      if (dec.length < 5) return null;
+      const s = dec.slice(0, 5);
+      const b = s.filter(x => x === 'Banca').length;
+
+      if (b >= 4) return { cor: 'Banca' };
+      if (b <= 1) return { cor: 'Jogador' };
+      return null;
+    }
+  },
+  {
+    id: 'FLUXO50', p: 82,
+    avaliar(dec, mesa) {
+      if (!mesa.viesLongo || mesa.c50.n < 45) return null;
+      const s = sequencia(dec);
+
+      if (s.cor && s.cor !== mesa.viesLongo && s.tamanho >= 3) {
+        return null;
+      }
+      return { cor: mesa.viesLongo };
+    }
+  },
+  {
+    id: 'MOMENTUM8', p: 80,
+    avaliar(dec) {
+      const c = contar(dec, 8);
+      if (c.n < 8) return null;
+      if (c.banca >= 6) return { cor: 'Banca' };
+      if (c.jogador >= 6) return { cor: 'Jogador' };
+      return null;
+    }
+  },
+  {
+    id: 'SLOT_STREAK', p: 70, slotOnly: true,
+    avaliar(dec) {
+      const s = sequencia(dec);
+      return s.cor && s.tamanho >= 2 ? { cor: s.cor } : null;
+    }
+  },
+  {
+    id: 'SLOT_MAIORIA', p: 68, slotOnly: true,
+    avaliar(dec) {
+      const c = contar(dec, 6);
+      if (c.n < 4) return null;
+      return { cor: c.banca >= c.jogador ? 'Banca' : 'Jogador' };
+    }
+  }
+];
+
+function decidir(hist, opcoes = {}) {
+  const minP = Number(opcoes.minPrioridade) || CONFIG.minPrioridade;
+  const consensoMin = Math.max(
+    1, Number(opcoes.consensoMin) || CONFIG.consensoMin
+  );
+  const forcarSlot = Boolean(opcoes.forcarSlot);
+
+  const mesa = analisarMesa(hist);
+  const dec = mesa.dec;
+  if (dec.length < 3) return null;
+
+  const limiar = forcarSlot ? 55 : minP;
+  const cons = forcarSlot ? 1 : consensoMin;
+  const candidatos = [];
+
+  for (const L of LOGICAS) {
+    if (L.slotOnly && !forcarSlot) continue;
+
+    const r = L.avaliar(dec, mesa);
+    if (!r || !r.cor) continue;
+
+    const bonus = bonusMesa(r.cor, mesa);
+    const score = L.p + bonus;
+
+    if (score < limiar) continue;
+    candidatos.push({ id: L.id, cor: r.cor, score, bonus });
+  }
+
+  if (!candidatos.length) return null;
+
+  const peso = { Banca: 0, Jogador: 0 };
+  const votos = { Banca: 0, Jogador: 0 };
+
+  for (const c of candidatos) {
+    peso[c.cor] += c.score;
+    votos[c.cor]++;
+  }
+
+  let cor = null;
+  if (peso.Banca > peso.Jogador) cor = 'Banca';
+  else if (peso.Jogador > peso.Banca) cor = 'Jogador';
+  else return null;
+
+  if (votos[cor] < cons) return null;
+
+  const apoio = candidatos
+    .filter(c => c.cor === cor)
+    .sort((a, b) => b.score - a.score);
+
+  const top = apoio[0];
+
+  if (!forcarSlot && top.bonus < 3 && top.score < minP + 5) {
+    return null;
+  }
+
+  return {
+    cor,
+    confianca: Math.min(99, Math.round(top.score)),
+    forcarSlot,
+    votos: votos[cor],
+    _ids: apoio.map(c => c.id).join('+'),
+    mesa: {
+      modo: mesa.modo,
+      viesMedio: mesa.viesMedio,
+      viesLongo: mesa.viesLongo,
+      amostra: mesa.amostra
+    }
+  };
+}
+
+function forcarEntradaSlot(hist) {
+  const dec = decisivos(hist);
+  if (dec.length < 1) return null;
+
+  const s = sequencia(dec);
+
+  if (s.cor && s.tamanho >= 2) {
+    return {
+      cor: s.cor,
+      confianca: 58,
+      forcarSlot: true,
+      votos: 1,
+      _ids: 'FORCA_STREAK',
+      mesa: { modo: 'forcar', amostra: dec.length }
+    };
+  }
+
+  const c = contar(dec, 5);
+
+  if (c.n >= 3) {
+    const cor = c.banca >= c.jogador ? 'Banca' : 'Jogador';
+    return {
+      cor,
+      confianca: 55,
+      forcarSlot: true,
+      votos: 1,
+      _ids: 'FORCA_MAIORIA',
+      mesa: { modo: 'forcar', amostra: dec.length }
+    };
+  }
+
+  return {
+    cor: dec[0],
+    confianca: 52,
+    forcarSlot: true,
+    votos: 1,
+    _ids: 'FORCA_ULTIMA',
+    mesa: { modo: 'forcar', amostra: dec.length }
+  };
+}
+
+/* ================= APP / RUNTIME ================= */
+
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL)
+        ? false
+        : { rejectUnauthorized: false },
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 15000
+    })
+  : null;
+
+const runtime = {
+  iniciadoEm: new Date().toISOString(),
+  sincronizacaoEmCurso: false,
+  ultimaSincronizacao: null,
+  ultimaRodadaNova: null,
+  ultimoIdNovo: null,
+  ultimaHoraDaAPI: null,
+  quantidadeAPI: 0,
+  itensRecebidosAPI: 0,
+  duplicadosUltimoCiclo: 0,
+  novosUltimoCiclo: 0,
+  erroSincronizacao: null,
+  ultimoSinal: null,
+  ultimoSlotUsado: null,
+  ultimaMensagemTelegram: null,
+  ultimoErroTelegram: null,
+  ultimoHTTPAPI: null,
+  ultimoErroAPI: null,
+  ciclosSemNovos: 0,
+  motivoSemSinal: null,
+  ultimaAnalise: null,
+  rodadasDesdeSinal: 0,
+  publicUrl: CONFIG.keepAliveUrl || null,
+  ultimoKeepAlive: null,
+  ultimoSinalEm: null,
+  ultimoGaleMsgIds: []
+};
+
+let schemaPromise = null;
+let server = null;
+let syncTimer = null;
+let keepAliveTimer = null;
+
+function log(tag, data) {
+  console.log(
+    `[${tag}]`,
+    typeof data === 'string' ? data : JSON.stringify(data)
+  );
+}
+
+function normalizeOutcome(value) {
+  if (value && typeof value === 'object') {
+    value = value.outcome ?? value.resultado ??
+      value.winner ?? value.name;
+  }
+
+  const s = String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '');
+
+  if ([
+    'player', 'jogador', 'playerwin', 'playerwins',
+    'playerwon', 'playerwinner'
+  ].includes(s)) return 'Jogador';
+
+  if ([
+    'banker', 'banca', 'bankerwin', 'bankerwins',
+    'bankerwon', 'bankerwinner', 'red', 'vermelho'
+  ].includes(s)) return 'Banca';
+
+  if ([
+    'tie', 'draw', 'empate', 'equal', 'push', 'tied'
+  ].includes(s)) return 'Empate';
+
+  return null;
+}
+
+function validDate(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function extractItems(body) {
+  if (Array.isArray(body)) return body;
+  if (!body || typeof body !== 'object') return [];
+
+  const candidates = [
+    body.data,
+    body.results,
+    body.items,
+    body.resultados,
+    body.rounds,
+    body.events,
+    body.data?.results,
+    body.data?.items,
+    body.data?.resultados,
+    body.data?.rounds,
+    body.data?.events,
+    body.data?.data
+  ];
+
+  return candidates.find(Array.isArray) || [];
+}
+
+function normalizeRound(item) {
+  const d = item?.data || item?.round || item || {};
+  const r = d.result && typeof d.result === 'object'
+    ? d.result
+    : item?.result && typeof item.result === 'object'
+      ? item.result
+      : {};
+
+  const status = String(
+    d.status ?? d.estado ?? item?.status ?? item?.estado ?? ''
+  ).toLowerCase();
+
+  const inicio = validDate(
+    d.startedAt ?? d.startTime ?? d.started_at ?? d.inicio ??
+    item?.startedAt ?? item?.inicio
+  );
+
+  const fim = validDate(
+    d.settledAt ?? d.endTime ?? d.endedAt ?? d.finishedAt ??
+    d.fim ?? item?.settledAt ?? item?.fim
+  );
+
+  const rawOutcome =
+    r.outcome ?? r.resultado ?? r.winner ??
+    d.outcome ?? d.resultado ?? d.winner ??
+    item?.outcome ?? item?.resultado ?? item?.winner ??
+    (typeof d.result === 'string' ? d.result : null) ??
+    (typeof item?.result === 'string' ? item.result : null);
+
+  const resultado = normalizeOutcome(rawOutcome);
+
+  const resolvida = [
+    'resolved', 'settled', 'finished', 'complete',
+    'completed', 'resolvido', 'concluido', 'finalizado'
+  ].some(w => status.includes(w)) || Boolean(fim);
+
+  const id = String(
+    d.id ?? d.roundId ?? d.round_id ?? d.eventId ??
+    item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? ''
+  ).trim();
+
+  if (!id || !resultado || !resolvida || !fim) return null;
+
+  return {
+    id,
+    resultado,
+    estado: 'Resolved',
+    inicio: inicio || fim,
+    fim,
+    pontos_jogador: null,
+    pontos_banca: null,
+    multiplicador: null
+  };
+}
+
+/* ================= TELEGRAM ================= */
+
+async function telegramSend(texto) {
+  if (!BOT_TOKEN || !CHAT_ID) {
+    runtime.ultimoErroTelegram = 'BOT_TOKEN ou CHAT_ID em falta';
+    return null;
+  }
+
+  try {
+    const response = await axios.post(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: CHAT_ID,
+        text: texto,
+        disable_web_page_preview: true
+      },
+      { timeout: 15000 }
+    );
+
+    if (response.data?.ok === true) {
+      runtime.ultimaMensagemTelegram = new Date().toISOString();
+      runtime.ultimoErroTelegram = null;
+      return response.data.result?.message_id ?? true;
+    }
+
+    runtime.ultimoErroTelegram = JSON.stringify(response.data);
+    return null;
+  } catch (error) {
+    runtime.ultimoErroTelegram = error.response?.data
+      ? JSON.stringify(error.response.data)
+      : error.message;
+
+    console.error('[TELEGRAM]', runtime.ultimoErroTelegram);
+    return null;
+  }
+}
+
+async function telegramDelete(messageId) {
+  if (!BOT_TOKEN || !CHAT_ID || !messageId || messageId === true) {
+    return false;
+  }
+
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`,
+      { chat_id: CHAT_ID, message_id: messageId },
+      { timeout: 10000 }
+    );
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function limparGaleMsgs() {
+  const ids = [...runtime.ultimoGaleMsgIds];
+  runtime.ultimoGaleMsgIds = [];
+
+  for (const id of ids) {
+    await telegramDelete(id);
+  }
 }
