@@ -1,4 +1,3 @@
-
 'use strict';
 
 /**
@@ -41,12 +40,12 @@ const MAX_GALE = 2;
 
 const MIN_AMOSTRA = Math.max(
   100,
-  Number(process.env.MIN_AMOSTRA || 100)
+  Number(process.env.MIN_AMOSTRA || 500)
 );
 
 const MIN_ACERTO = Math.min(
   100,
-  Math.max(0, Number(process.env.MIN_ACERTO || 89))
+  Math.max(0, Number(process.env.MIN_ACERTO || 55))
 );
 
 const INTERVALO_SYNC_MS = Math.max(
@@ -205,11 +204,10 @@ async function obterUltimosResultados(limite = 12) {
 }
 
 /**
- * Estratégia inicial experimental:
- * exige pelo menos 11 resultados iguais nos últimos 12
- * resultados decisivos.
- *
- * Não representa probabilidade real nem garantia.
+ * Filtro experimental de desequilíbrio recente.
+ * Não é um modelo preditivo validado: resultados de Bac Bo podem ser
+ * independentes e padrões passados não garantem vantagem futura.
+ * Exige uma janela decisiva altamente desequilibrada; caso contrário abstém-se.
  */
 function gerarPrevisao(resultados) {
   const decisivos = resultados
@@ -220,11 +218,12 @@ function gerarPrevisao(resultados) {
 
   const janela = decisivos.slice(-12);
   const reds = janela.filter(item => item === 'RED').length;
-  const blues = janela.filter(item => item === 'BLUE').length;
+  const blues = janela.length - reds;
 
-  if (reds >= 11) return 'RED';
-  if (blues >= 11) return 'BLUE';
-
+  // Segue o lado mais frequente apenas como hipótese experimental.
+  // A alta seletividade reduz volume; não aumenta a certeza do próximo resultado.
+  if (reds >= 10) return 'RED';
+  if (blues >= 10) return 'BLUE';
   return null;
 }
 
@@ -438,15 +437,15 @@ async function tentarEnviarSinal(rodadaId, previsao) {
   ultimaTentativaSinal = Date.now();
 
   const enviado = await telegram(
-    `🎲 CAPUNGA DADOS — BAC BO\n\n` +
-    `📢 NOVO SINAL\n` +
+    `🎲 CAPUNGA DADOS — BAC BO | EXPERIMENTAL\n\n` +
+    `📢 HIPÓTESE DE SINAL (não é garantia)\n` +
     `Previsão: ${previsao}\n` +
     `Gale máximo: ${MAX_GALE}\n` +
     `Empate: protegido\n\n` +
     `📊 Testes resolvidos: ${stats.amostra}\n` +
-    `Taxa observada: ${stats.taxa}%\n` +
+    `Taxa histórica observada: ${stats.taxa}% (n=${stats.amostra})\n` +
     `Últimos 50 testes: ${stats.taxa50}%\n\n` +
-    `⚠️ O histórico não garante o próximo resultado.\n` +
+    `⚠️ Frequência histórica não é probabilidade nem garantia do próximo resultado.\n` +
     `ID do sinal: ${sinal.id}`
   );
 
@@ -510,7 +509,8 @@ function autenticarEntrada(req, res, next) {
 
 app.get('/', (_req, res) => {
   res.json({
-    nome: 'CAPUNGA DADOS — BAC BO',
+    nome: 'CAPUNGA DADOS — BAC BO | experimental',
+    aviso: 'Sem garantia de acerto; jogo aleatório envolve risco de perda.',
     estado: 'online',
     gale_maximo: MAX_GALE,
     garantia_100: false
@@ -551,6 +551,7 @@ app.get('/status', async (_req, res) => {
     res.json({
       ok: true,
       estrategia_autorizada: stats.autorizado,
+      aviso: 'Sinais experimentais; não representam probabilidade calibrada nem garantia de acerto.',
       criterios: {
         amostra_minima: MIN_AMOSTRA,
         taxa_minima: MIN_ACERTO,
@@ -705,7 +706,7 @@ async function iniciar() {
   } else {
     console.warn(
       '[FONTE] API_BACBO ausente. ' +
-      'Aguarda resultados em POST /resultado.'
+      'Aguarda resultados em POST /resultado. Sem fonte não há análise nem sinais.'
     );
   }
 
