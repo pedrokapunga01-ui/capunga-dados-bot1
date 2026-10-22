@@ -2,22 +2,13 @@ name: Keep Render Alive
 
 on:
   schedule:
-    # Roda a cada 5 minutos
-    - cron: '*/5 * * * *'
-  workflow_dispatch:  # Permite disparar manualmente
+    - cron: '*/4 * * * *'   # a cada 4 minutos
+  workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping do serviço
+      - name: Ping Render
         run: |
-          echo "Pingando o serviço..."
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" srv-dbaamee1egvs73a0h1q0.com/health)
-          echo "Status HTTP: $STATUS"
-          
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ Serviço respondeu com sucesso"
-          else
-            echo "⚠️ Serviço respondeu com status $STATUS"
-          fi
+          curl -s -o /dev/null -w "%{http_code}" https://srv-dbaamee1egvs73a0h1q0.com/health
