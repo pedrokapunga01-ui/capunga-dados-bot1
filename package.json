@@ -1,11 +1,10 @@
 {
-  "name": "capunga-dados-bacbo-monitor",
-  "version": "4.0.0",
-  "description": "Monitor de resultados Bac Bo (Evolution) — Node.js + Express + PostgreSQL + Telegram",
+  "name": "capunga-pressao-ciclo",
+  "version": "1.0.0",
+  "description": "Robô Bac Bo - Sinais por janela de 4 minutos (Pressão de Ciclo)",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=18"
@@ -15,13 +14,5 @@
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "pg": "^8.13.1"
-  },
-  "keywords": [
-    "bacbo",
-    "evolution",
-    "monitor",
-    "telegram",
-    "postgresql"
-  ],
-  "license": "MIT"
+  }
 }
