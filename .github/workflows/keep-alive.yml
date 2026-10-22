@@ -3,7 +3,7 @@ name: Keep Render Alive
 on:
   schedule:
     # Roda a cada 5 minutos
-    - cron: '*/4 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:  # Permite disparar manualmente
 
 jobs:
@@ -13,7 +13,7 @@ jobs:
       - name: Ping do serviço
         run: |
           echo "Pingando o serviço..."
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://SEU-APP.onrender.com/health)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" srv-dbaamee1egvs73a0h1q0.com/health)
           echo "Status HTTP: $STATUS"
           
           if [ "$STATUS" = "200" ]; then
