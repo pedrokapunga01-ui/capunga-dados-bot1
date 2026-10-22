@@ -4,12 +4,6 @@
  * CAPUNGA — PRESSÃO DE CICLO
  * Robô de sinais Bac Bo com disparo em minutos múltiplos de 4
  *
- * Ideia:
- * - Janelas de tempo: 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56
- * - Quando uma rodada termina perto dessas janelas, o robô avalia
- * - Estratégia original: Pressão de Ciclo
- * - Até Gale 2
- *
  * Variáveis obrigatórias:
  *   DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
  *
@@ -36,7 +30,7 @@ const API_BACBO = process.env.API_BACBO ||
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
 
 const INTERVALO_SYNC_MS = Math.max(5000, Math.min(Number(process.env.INTERVALO_SYNC_MS) || 7000, 20000));
-const JANELA_TOLERANCIA_SEG = Number(process.env.JANELA_TOLERANCIA_SEG) || 90; // segundos de tolerância após o minuto alvo
+const JANELA_TOLERANCIA_SEG = Number(process.env.JANELA_TOLERANCIA_SEG) || 90;
 const MAX_GALE = Math.min(2, Math.max(0, Number(process.env.MAX_GALE) || 2));
 
 const pool = DATABASE_URL
@@ -89,7 +83,7 @@ function agoraAngola() {
 
 function getMinutoAlvo(date = agoraAngola()) {
   const min = date.getMinutes();
-  return Math.floor(min / 4) * 4; // 0, 4, 8, 12...
+  return Math.floor(min / 4) * 4;
 }
 
 function estaNaJanelaDeSinal(date = agoraAngola()) {
@@ -97,13 +91,8 @@ function estaNaJanelaDeSinal(date = agoraAngola()) {
   const seg = date.getSeconds();
   const alvo = getMinutoAlvo(date);
 
-  // Estamos no minuto alvo ou nos próximos JANELA_TOLERANCIA_SEG segundos
   if (min === alvo) return true;
-
-  // Se já passou do minuto alvo, verifica se ainda está dentro da tolerância
-  const diffMin = min - alvo;
-  if (diffMin === 1 && seg <= JANELA_TOLERANCIA_SEG) return true;
-
+  if (min === alvo + 1 && seg <= JANELA_TOLERANCIA_SEG) return true;
   return false;
 }
 
@@ -172,7 +161,7 @@ function normalizeRound(item) {
   if (!id || !resultado || !resolvida || !fim) return null;
 
   const pj = Number(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
-  const pb = Number(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
+  const pb = Number(r.bankerDice inter?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
 
   return {
     id,
@@ -258,67 +247,69 @@ function corEmoji(cor) {
 }
 
 function msgNovoSinal(entry) {
+  const emoji = corEmoji(entry.entrada);
+  const entrada = String(entry.entrada || '').toUpperCase();
+  const confianca = entry.confianca || 0;
+  const janela = entry.janela || '—';
+
   return [
-    `🎯  SINAL • PRESSÃO DE CICLO`,
-    `━━━━━━━━━━━━━━━━`,
-    `\( {corEmoji(entry.entrada)}  Entrada: * \){entry.entrada.toUpperCase()}*`,
-    `📊  Confiança: ${entry.confianca}%`,
+    '🎯  SINAL • PRESSÃO DE CICLO',
+    '━━━━━━━━━━━━━━━━',
+    `${emoji}  Entrada: ${entrada}`,
+    `📊  Confiança: ${confianca}%`,
     `🔁  Gale máximo: ${MAX_GALE}`,
-    `🪟  Janela: ${entry.janela}`,
-    `━━━━━━━━━━━━━━━━`,
+    `🪟  Janela: ${janela}`,
+    '━━━━━━━━━━━━━━━━',
     `⏰  ${horaAngola()}`
   ].join('\n');
 }
 
 function msgGreen(entry, estado) {
+  const emoji = corEmoji(entry.entrada);
   const titulo = estado === 'GREEN' ? '✅ GREEN DIRETO' :
                  estado === 'G1' ? '⚡ GREEN NO GALE 1' : '🔥 GREEN NO GALE 2';
+
   return [
-    `${titulo}`,
-    `━━━━━━━━━━━━━━━━`,
-    `${corEmoji(entry.entrada)}  ${entry.entrada}`,
+    titulo,
+    '━━━━━━━━━━━━━━━━',
+    `${emoji}  ${entry.entrada}`,
     `🪟  ${entry.janela}`,
     `⏰  ${horaAngola()}`
   ].join('\n');
 }
 
 function msgGale(entry, gale) {
+  const emoji = corEmoji(entry.entrada);
+
   return [
     `🐓  GALE ${gale}`,
-    `━━━━━━━━━━━━━━━━`,
-    `\( {corEmoji(entry.entrada)}  Manter: * \){entry.entrada}*`,
+    '━━━━━━━━━━━━━━━━',
+    `${emoji}  Manter: ${entry.entrada}`,
     `🪟  ${entry.janela}`,
     `⏰  ${horaAngola()}`
   ].join('\n');
 }
 
 function msgRed(entry) {
+  const emoji = corEmoji(entry.entrada);
+
   return [
-    `❌  RED`,
-    `━━━━━━━━━━━━━━━━`,
-    `${corEmoji(entry.entrada)}  ${entry.entrada}`,
+    '❌  RED',
+    '━━━━━━━━━━━━━━━━',
+    `${emoji}  ${entry.entrada}`,
     `🪟  ${entry.janela}`,
     `⏰  ${horaAngola()}`
   ].join('\n');
 }
 
-/* ======================== ESTRATÉGIA ORIGINAL: PRESSÃO DE CICLO ======================== */
+/* ======================== ESTRATÉGIA: PRESSÃO DE CICLO ======================== */
 
-/**
- * Pressão de Ciclo:
- * - Calcula o "peso" recente de Banca vs Jogador
- * - Detecta ciclos de 2 e 3
- * - Usa diferença de pontos como confirmação
- * - Só gera sinal quando a pressão está desequilibrada + confirmação de ciclo
- */
 function calcularPressao(rows) {
   if (!rows || rows.length < 6) return null;
 
-  // Só considera Jogador e Banca
   const limpos = rows.filter(r => r.resultado === 'Jogador' || r.resultado === 'Banca');
   if (limpos.length < 6) return null;
 
-  // Peso das últimas 8 rodadas (mais recentes pesam mais)
   let pesoB = 0;
   let pesoJ = 0;
   const pesos = [1.8, 1.6, 1.4, 1.2, 1.0, 0.9, 0.8, 0.7];
@@ -333,12 +324,10 @@ function calcularPressao(rows) {
   const pctB = pesoB / total;
   const pctJ = pesoJ / total;
 
-  // Detecção de ciclo simples
-  const seq = limpos.slice(0, 6).map(r => r.resultado[0]); // B ou J
+  const seq = limpos.slice(0, 6).map(r => r.resultado[0]);
   const ciclo2 = seq[0] !== seq[1] && seq[0] === seq[2] && seq[1] === seq[3];
   const ciclo3 = seq[0] === seq[3] && seq[1] === seq[4] && seq[2] === seq[5] && seq[0] !== seq[1];
 
-  // Diferença média de pontos nas últimas 4
   let somaDiff = 0;
   let contDiff = 0;
   limpos.slice(0, 4).forEach(r => {
@@ -349,12 +338,10 @@ function calcularPressao(rows) {
   });
   const mediaDiff = contDiff ? somaDiff / contDiff : 0;
 
-  // Decisão
   let entrada = null;
   let confianca = 0;
   let motivo = '';
 
-  // Caso 1: Forte desequilíbrio + ciclo a favor da pressão
   if (pctB >= 0.62) {
     entrada = 'Banca';
     confianca = Math.round(58 + (pctB - 0.5) * 80);
@@ -367,15 +354,12 @@ function calcularPressao(rows) {
     if (ciclo2 || ciclo3) confianca += 8;
   }
 
-  // Caso 2: Ciclo claro mesmo com pressão mais equilibrada
   if (!entrada && (ciclo2 || ciclo3)) {
-    // Aposta na continuação do ciclo
     entrada = limpos[0].resultado === limpos[2].resultado ? limpos[0].resultado : limpos[1].resultado;
     confianca = ciclo3 ? 71 : 66;
     motivo = ciclo3 ? 'Ciclo de 3' : 'Ciclo de 2';
   }
 
-  // Confirmação por diferença de pontos
   if (entrada && mediaDiff >= 3.5) confianca += 5;
 
   confianca = Math.min(92, Math.max(55, confianca));
@@ -438,13 +422,9 @@ async function resolverSinal(rodada) {
   const aberto = await getAberto();
   if (!aberto) return;
 
-  // Não resolve com a mesma rodada que originou o sinal
   if (String(aberto.rodada_origem) === String(rodada.id)) return;
 
-  if (rodada.resultado === 'Empate') {
-    // Empate não conta nem como green nem red
-    return;
-  }
+  if (rodada.resultado === 'Empate') return;
 
   if (rodada.resultado === aberto.entrada) {
     const estado = aberto.gale === 0 ? 'GREEN' : aberto.gale === 1 ? 'G1' : 'G2';
@@ -459,7 +439,6 @@ async function resolverSinal(rodada) {
     return;
   }
 
-  // Errou
   const proximoGale = aberto.gale + 1;
   if (proximoGale <= MAX_GALE) {
     await pool.query(`UPDATE signal_entries SET gale = $1 WHERE id = $2`, [proximoGale, aberto.id]);
@@ -549,10 +528,7 @@ async function syncOnce() {
       novos++;
       runtime.ultimoIdNovo = round.id;
 
-      // Resolve sinal aberto (se houver)
       await resolverSinal(round);
-
-      // Tenta gerar novo sinal (só se estiver na janela de 4 min)
       await tentarGerarSinal(round);
     }
 
