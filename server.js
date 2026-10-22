@@ -161,7 +161,7 @@ function normalizeRound(item) {
   if (!id || !resultado || !resolvida || !fim) return null;
 
   const pj = Number(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
-  const pb = Number(r.bankerDice inter?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
+  const pb = Number(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
 
   return {
     id,
