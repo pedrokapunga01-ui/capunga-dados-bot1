@@ -1,33 +1,20 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v6 (reescrita limpa)
+ * CAPUNGA DADOS — BAC BO · v7
  *
- * O que mudou face à v5:
- *  - Estado em memória (rápido, sem corridas) + Postgres opcional só para persistir.
- *  - Fila de envio ao Telegram com retry/429 -> nenhuma mensagem se perde, ordem garantida.
- *  - Empate = GREEN (contado à parte no placar, de forma transparente).
- *  - Sinais até Gale 2.
- *  - Confiança (%) calculada por backtest real do histórico (não é número inventado).
- *  - 13 estratégias (7 de padrão + 6 numéricas com os pontos dos dados).
- *  - Cadência alvo ~3 min por sinal.
- *  - Novo layout das mensagens.
- *
- * Variáveis:
- *   BOT_TOKEN, CHAT_ID                (obrigatórias p/ enviar)
- *   DATABASE_URL                      (opcional; sem ela o robô funciona só em memória)
- *   ADMIN_TOKEN                       (opcional; protege as rotas /admin/*)
- *   INTERVALO_SINAL_MS (165000)       tempo mínimo entre a criação de dois sinais
- *   MIN_CONFIANCA (88)                confiança mínima (%) para emitir sinal
- *   SYNC_MS (5000)                    frequência de leitura da API
- *   SINAL_EXPIRA_MIN (8)              cancela sinal preso sem rodadas novas
- *   SINAL_INICIAL (1704)              numeração do 1º sinal numa base nova
- *   SINAIS_ATIVOS (true)
- *   API_BACBO
+ * Mudanças face à v6:
+ *  - API substituída por scraping direto do Tipminer (Puppeteer). Lê TODAS as rodadas.
+ *  - Confiança com Wilson Lower Bound + amostra mínima (não inflaciona com poucas amostras).
+ *  - "Alta confiança" agora é estatisticamente real: 90% exibido = taxa real ≥90% (IC 95%).
+ *  - BOT_INSTANCE: cada deploy novo (novo Render service) começa com histórico limpo.
+ *  - Sinal expirado REMOVIDO: sinal só fecha quando uma rodada decide.
+ *  - Mensagens mais simples e curtas.
  */
 
 const express = require('express');
 const axios = require('axios');
+const puppeteer = require('puppeteer');
 const { Pool } = require('pg');
 
 /* ============================ CONFIG ============================ */
@@ -44,20 +31,22 @@ const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
-const API_BACBO =
-  process.env.API_BACBO || 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
 
-const MAX_GALE = 2; // fixo: sinais vão até Gale 2
+// Identidade do bot: muda isto (ou cria novo serviço no Render) para começar com histórico limpo
+const BOT_INSTANCE = (process.env.BOT_INSTANCE || process.env.RENDER_INSTANCE_ID || 'default').trim();
+const TIPMINER_URL = process.env.TIPMINER_URL || 'https://www.tipminer.com/br/historico/evolution/bac-bo';
+
+const MAX_GALE = 2;
 const CFG = {
   ativos: bool(process.env.SINAIS_ATIVOS, true),
   intervaloSinalMs: num('INTERVALO_SINAL_MS', 165000, 0, 3600000),
-  minConf: num('MIN_CONFIANCA', 88, 0, 99),
-  syncMs: num('SYNC_MS', 5000, 2000, 30000),
-  expiraMin: num('SINAL_EXPIRA_MIN', 8, 3, 120),
+  minConf: num('MIN_CONFIANCA', 90, 0, 99),       // agora 90 (era 88)
+  minAmostra: num('MIN_AMOSTRA', 30, 5, 500),     // amostras mínimas para emitir sinal
+  syncMs: num('SYNC_MS', 3000, 1500, 30000),      // 3s = tempo real
   sinalInicial: num('SINAL_INICIAL', 1704, 1, 100000000),
   maxHist: 4000,
-  gapMs: 6 * 60 * 1000, // buraco entre rodadas que quebra a sequência
-  frescoMs: 5 * 60 * 1000 // rodada mais recente tem de ser "viva" para gerar sinal
+  gapMs: 6 * 60 * 1000,
+  frescoMs: 5 * 60 * 1000
 };
 
 const J = 'Jogador';
@@ -69,9 +58,9 @@ const opp = (c) => (c === J ? B : c === B ? J : null);
 /* ============================ ESTADO ============================ */
 
 const S = {
-  hist: [], // rodadas, ordem cronológica
+  hist: [],
   seen: new Set(),
-  signals: [], // sinais recentes, ordem cronológica
+  signals: [],
   nextId: CFG.sinalInicial,
   lastSignalAt: 0,
   stats: null,
@@ -80,11 +69,12 @@ const S = {
 
 const R = {
   iniciadoEm: new Date().toISOString(),
+  botInstance: BOT_INSTANCE,
   ultimaSync: null,
   ultimaRodadaNova: null,
   novosUltimoCiclo: 0,
   ciclosSemNovos: 0,
-  erroAPI: null,
+  erroScraper: null,
   erroDB: null,
   erroTelegram: null,
   ultimoMotivo: null,
@@ -98,6 +88,13 @@ let timer = null;
 let busy = false;
 let stopping = false;
 
+// Scraper state
+let scraperBrowser = null;
+let scraperPage = null;
+let lastSeq = [];
+let roundCounter = 0;
+let lastRoundSeenAt = 0;
+
 /* ============================ UTILS ============================ */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -109,140 +106,141 @@ function log(tag, data) {
 
 const fmtHora = new Intl.DateTimeFormat('pt-PT', {
   timeZone: 'Africa/Luanda',
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit',
-  hour12: false
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
 });
 const fmtDia = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Africa/Luanda',
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit'
+  year: 'numeric', month: '2-digit', day: '2-digit'
 });
 const hora = (ms = Date.now()) => fmtHora.format(new Date(ms));
 const dia = (ms = Date.now()) => fmtDia.format(new Date(ms));
-
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 const corTxt = (c) => (c === B ? '🔴 <b>BANCA</b>' : c === J ? '🔵 <b>JOGADOR</b>' : '🟡 <b>EMPATE</b>');
 const corCurta = (c) => (c === B ? '🔴 Banca' : c === J ? '🔵 Jogador' : '🟡 Empate');
-const barra = (c) => {
-  const f = Math.max(0, Math.min(10, Math.round(c / 10)));
-  return '▰'.repeat(f) + '▱'.repeat(10 - f);
-};
 
-/* ============================ API / NORMALIZAÇÃO ============================ */
+/* ============================ SCRAPER ============================ */
 
-function normalizeOutcome(v) {
-  if (v && typeof v === 'object') v = v.outcome ?? v.resultado ?? v.winner ?? v.name;
-  const s = String(v ?? '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_-]+/g, '');
-  if (['player', 'jogador', 'playerwin', 'playerwins', 'playerwon', 'playerwinner', 'blue'].includes(s)) return J;
-  if (['banker', 'banca', 'bankerwin', 'bankerwins', 'bankerwon', 'bankerwinner', 'red', 'vermelho'].includes(s)) return B;
-  if (['tie', 'draw', 'empate', 'equal', 'push', 'tied'].includes(s)) return E;
-  return null;
-}
-
-function validMs(v) {
-  if (!v) return null;
-  const t = new Date(v).getTime();
-  return Number.isNaN(t) ? null : t;
-}
-
-function extractItems(body) {
-  if (Array.isArray(body)) return body;
-  if (!body || typeof body !== 'object') return [];
-  const c = [
-    body.data, body.results, body.items, body.resultados, body.rounds, body.events,
-    body.data?.results, body.data?.items, body.data?.resultados, body.data?.rounds,
-    body.data?.events, body.data?.data
-  ];
-  return c.find(Array.isArray) || [];
-}
-
-function normalizeRound(item) {
-  const d = item?.data || item?.round || item || {};
-  const r = d.result && typeof d.result === 'object'
-    ? d.result
-    : item?.result && typeof item.result === 'object' ? item.result : {};
-
-  const status = String(d.status ?? d.estado ?? item?.status ?? item?.estado ?? '').toLowerCase();
-  const t = validMs(
-    d.settledAt ?? d.endTime ?? d.endedAt ?? d.finishedAt ?? d.fim ?? item?.settledAt ?? item?.fim
+async function scraperInit() {
+  scraperBrowser = await puppeteer.launch({
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled'
+    ]
+  });
+  scraperPage = await scraperBrowser.newPage();
+  await scraperPage.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   );
+  await scraperPage.setViewport({ width: 1280, height: 800 });
+  await scraperPage.setRequestInterception(true);
+  scraperPage.on('request', (req) => {
+    const type = req.resourceType();
+    if (['image', 'font', 'media'].includes(type)) req.abort();
+    else req.continue();
+  });
+  log('SCRAPER_READY', TIPMINER_URL);
+}
 
-  const raw =
-    r.outcome ?? r.resultado ?? r.winner ??
-    d.outcome ?? d.resultado ?? d.winner ??
-    item?.outcome ?? item?.resultado ?? item?.winner ??
-    (typeof d.result === 'string' ? d.result : null) ??
-    (typeof item?.result === 'string' ? item.result : null);
+async function scraperClose() {
+  if (scraperBrowser) {
+    try { await scraperBrowser.close(); } catch (_) {}
+    scraperBrowser = null;
+    scraperPage = null;
+  }
+}
 
-  const resultado = normalizeOutcome(raw);
-  const resolvida =
-    ['resolved', 'settled', 'finished', 'complete', 'completed', 'resolvido', 'concluido', 'finalizado']
-      .some((w) => status.includes(w)) || Boolean(t);
+async function ensureScraper() {
+  if (scraperPage) return true;
+  try { await scraperInit(); return true; }
+  catch (e) {
+    R.erroScraper = e.message;
+    log('SCRAPER_LAUNCH_ERRO', e.message);
+    return false;
+  }
+}
 
-  const id = String(
-    d.id ?? d.roundId ?? d.round_id ?? d.eventId ??
-    item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? ''
-  ).trim();
+async function scraperFetchSeq() {
+  if (!scraperPage) return [];
+  try {
+    await scraperPage.goto(TIPMINER_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+    await scraperPage.waitForSelector('.cell__result', { timeout: 15000 });
+    const seq = await scraperPage.evaluate(() => {
+      const out = [];
+      for (const cell of document.querySelectorAll('.cell__result')) {
+        const t = cell.textContent.trim().toUpperCase();
+        let v = null;
+        if (t === 'P' || t === 'PLAYER' || t === 'JOGADOR') v = 'J';
+        else if (t === 'B' || t === 'BANKER' || t === 'BANCA') v = 'B';
+        else if (t === 'T' || t === 'TIE' || t === 'EMPATE') v = 'E';
+        if (v) out.push(v);
+      }
+      return out;
+    });
+    R.erroScraper = null;
+    return seq;
+  } catch (e) {
+    R.erroScraper = e.message;
+    log('SCRAPER_FETCH_ERRO', e.message);
+    if (/Target closed|Session closed|detached/i.test(e.message)) await scraperClose();
+    return [];
+  }
+}
 
-  if (!id || !resultado || !resolvida || !t) return null;
-
-  const pj = Number(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
-  const pb = Number(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
-  const mult = r.multiplier ?? d.multiplier ?? d.multiplicador ?? null;
-
-  return {
-    id,
-    resultado,
-    t,
-    pj: Number.isFinite(pj) ? pj : null,
-    pb: Number.isFinite(pb) ? pb : null,
-    mult: mult == null ? null : String(mult)
-  };
+/** Descobre quantas rodadas novas há no topo da lista (newest-first) */
+function diffSeq(newSeq, oldSeq) {
+  if (!newSeq.length) return 0;
+  if (!oldSeq.length) return newSeq.length;
+  for (let overlap = Math.min(8, oldSeq.length); overlap >= 3; overlap--) {
+    const maxOff = Math.min(newSeq.length - overlap, 15);
+    for (let off = 1; off <= maxOff; off++) {
+      let ok = true;
+      for (let i = 0; i < overlap; i++) {
+        if (newSeq[off + i] !== oldSeq[i]) { ok = false; break; }
+      }
+      if (ok) return off;
+    }
+  }
+  return newSeq[0] === oldSeq[0] ? 0 : 1;
 }
 
 async function fetchRounds() {
-  let last = null;
-  for (let i = 1; i <= 3; i++) {
-    try {
-      const resp = await axios.get(API_BACBO, {
-        timeout: 15000,
-        headers: { Accept: 'application/json', 'User-Agent': 'CapungaDadosBot/6.0' }
-      });
-      const map = new Map();
-      for (const it of extractItems(resp.data)) {
-        const rd = normalizeRound(it);
-        if (rd) map.set(rd.id, rd);
-      }
-      R.erroAPI = null;
-      return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
-    } catch (e) {
-      last = e;
-      R.erroAPI = e.message;
-      if (i < 3) await sleep(600 * i);
-    }
+  if (!(await ensureScraper())) return [];
+  const newSeq = await scraperFetchSeq();
+  if (!newSeq.length) return [];
+
+  const nNew = diffSeq(newSeq, lastSeq);
+  const now = Date.now();
+  const gapDetected = lastRoundSeenAt > 0 && (now - lastRoundSeenAt) > CFG.gapMs;
+
+  const newRounds = [];
+  for (let i = nNew - 1; i >= 0; i--) {
+    roundCounter++;
+    newRounds.push({
+      id: `r${roundCounter}`,
+      resultado: newSeq[i] === 'J' ? J : newSeq[i] === 'B' ? B : E,
+      t: now - i * 20000,
+      pj: null, pb: null, mult: null,
+      gapBefore: i === nNew - 1 && gapDetected
+    });
   }
-  throw last || new Error('Falha na API');
+
+  lastSeq = newSeq;
+  if (nNew > 0) lastRoundSeenAt = now;
+  return newRounds;
 }
 
 /* ============================ ESTRATÉGIAS ============================ */
-/* Cada estratégia recebe `ctx` (rodadas mais recentes primeiro) e devolve
-   { cor, key, nome, emoji } ou null. `key` identifica o "setup" para o backtest. */
 
 function streak(seq) {
   if (!seq.length) return 0;
   let n = 0;
-  for (const r of seq) {
-    if (r.resultado === seq[0].resultado) n++;
-    else break;
-  }
+  for (const r of seq) { if (r.resultado === seq[0].resultado) n++; else break; }
   return n;
 }
 
@@ -251,7 +249,6 @@ const margem = (r) => Math.abs(r.pj - r.pb);
 const scoreVencedor = (r) => (r.resultado === J ? r.pj : r.pb);
 
 const STRATS = [
-  // ---------- padrões de cor ----------
   function repeticao({ seq }) {
     const n = streak(seq);
     if (n < 3 || n > 8) return null;
@@ -260,29 +257,25 @@ const STRATS = [
   function quebra({ seq }) {
     const n = streak(seq);
     if (n < 4 || n > 9) return null;
-    return { cor: opp(seq[0].resultado), key: `QUEBRA_${Math.min(n, 7)}`, nome: `Quebra de sequência x${n}`, emoji: '💥' };
+    return { cor: opp(seq[0].resultado), key: `QUEBRA_${Math.min(n, 7)}`, nome: `Quebra x${n}`, emoji: '💥' };
   },
   function surf({ seq }) {
     if (seq.length < 4) return null;
     let L = 1;
     while (L < seq.length && seq[L].resultado !== seq[L - 1].resultado) L++;
     if (L < 4) return null;
-    return { cor: opp(seq[0].resultado), key: `SURF_${Math.min(L, 6)}`, nome: `Surf (alternância ${L})`, emoji: '🌊' };
+    return { cor: opp(seq[0].resultado), key: `SURF_${Math.min(L, 6)}`, nome: `Surf ${L}`, emoji: '🌊' };
   },
   function doisDois({ seq }) {
     if (seq.length < 4) return null;
     const [a, b, c, d] = seq.map((x) => x.resultado);
-    if (a === b && c === d && a !== c) {
-      return { cor: c, key: 'DOIS_DOIS', nome: '2+2 (blocos de dois)', emoji: '♟️' };
-    }
+    if (a === b && c === d && a !== c) return { cor: c, key: 'DOIS_DOIS', nome: '2+2', emoji: '♟️' };
     return null;
   },
   function tresUm({ seq }) {
     if (seq.length < 4) return null;
     const [a, b, c, d] = seq.map((x) => x.resultado);
-    if (a !== b && b === c && c === d) {
-      return { cor: a, key: 'TRES_UM', nome: 'Quebra confirmada (3→1)', emoji: '🧩' };
-    }
+    if (a !== b && b === c && c === d) return { cor: a, key: 'TRES_UM', nome: 'Quebra 3→1', emoji: '🧩' };
     return null;
   },
   function forca({ seq }) {
@@ -294,7 +287,7 @@ const STRATS = [
     const pct = Math.max(pj, 1 - pj);
     if (pct < 0.67) return null;
     const bucket = pct >= 0.75 ? 75 : pct >= 0.7 ? 70 : 67;
-    return { cor: dom, key: `FORCA_${bucket}`, nome: `Força da mesa ${Math.round(pct * 100)}%`, emoji: '💪' };
+    return { cor: dom, key: `FORCA_${bucket}`, nome: `Força ${Math.round(pct * 100)}%`, emoji: '💪' };
   },
   function reversao({ seq }) {
     const s = seq.slice(0, 20);
@@ -304,21 +297,20 @@ const STRATS = [
     const pct = Math.max(pj, 1 - pj);
     if (pct < 0.65) return null;
     const dom = pj >= 0.5 ? J : B;
-    return { cor: opp(dom), key: 'REVERSAO_20', nome: `Retorno à média (${Math.round(pct * 100)}% ${dom})`, emoji: '⚖️' };
+    return { cor: opp(dom), key: 'REVERSAO_20', nome: `Retorno ${Math.round(pct * 100)}%`, emoji: '⚖️' };
   },
-
-  // ---------- numéricas (pontos dos dados) ----------
+  // Numéricas — precisam de scores; com Tipminer auto-desativam (sem pj/pb)
   function numMargem({ rows }) {
     const r = rows[0];
     if (!r || !isCol(r.resultado) || !hasScore(r)) return null;
     if (margem(r) < 5) return null;
-    return { cor: r.resultado, key: 'NUM_MARGEM_5', nome: `Numérica · margem ${r.pj}×${r.pb}`, emoji: '🔢' };
+    return { cor: r.resultado, key: 'NUM_MARGEM_5', nome: `Margem ${r.pj}×${r.pb}`, emoji: '🔢' };
   },
   function numMargem3({ seq }) {
     if (seq.length < 3) return null;
     const t = seq.slice(0, 3);
     if (!t.every((r) => hasScore(r) && margem(r) >= 3 && r.resultado === t[0].resultado)) return null;
-    return { cor: t[0].resultado, key: 'NUM_MARGEM_3X', nome: 'Numérica · 3 vitórias com margem ≥3', emoji: '📐' };
+    return { cor: t[0].resultado, key: 'NUM_MARGEM_3X', nome: '3 vit. margem ≥3', emoji: '📐' };
   },
   function numFraca({ seq }) {
     if (seq.length < 2) return null;
@@ -326,13 +318,13 @@ const STRATS = [
     if (!hasScore(a) || !hasScore(b)) return null;
     if (a.resultado !== b.resultado) return null;
     if (scoreVencedor(a) > 6 || scoreVencedor(b) > 6) return null;
-    return { cor: opp(a.resultado), key: 'NUM_FRACA', nome: 'Numérica · 2 vitórias fracas (≤6)', emoji: '📉' };
+    return { cor: opp(a.resultado), key: 'NUM_FRACA', nome: '2 fracas', emoji: '📉' };
   },
   function numAlta({ rows }) {
     const r = rows[0];
     if (!r || !isCol(r.resultado) || !hasScore(r)) return null;
     if (scoreVencedor(r) < 11 || margem(r) < 3) return null;
-    return { cor: r.resultado, key: 'NUM_ALTA_11', nome: `Numérica · vitória forte ${r.pj}×${r.pb}`, emoji: '🚀' };
+    return { cor: r.resultado, key: 'NUM_ALTA_11', nome: `Forte ${r.pj}×${r.pb}`, emoji: '🚀' };
   },
   function numTendencia({ rows }) {
     const s = rows.slice(0, 6).filter(hasScore);
@@ -341,16 +333,11 @@ const STRATS = [
     const mb = s.reduce((a, r) => a + r.pb, 0) / s.length;
     const diff = mj - mb;
     if (Math.abs(diff) < 1.3) return null;
-    return {
-      cor: diff > 0 ? J : B,
-      key: `NUM_TEND_${Math.abs(diff) >= 2 ? 2 : 1}`,
-      nome: `Numérica · média de pontos ${mj.toFixed(1)}×${mb.toFixed(1)}`,
-      emoji: '📊'
-    };
+    return { cor: diff > 0 ? J : B, key: `NUM_TEND_${Math.abs(diff) >= 2 ? 2 : 1}`, nome: `Média ${mj.toFixed(1)}×${mb.toFixed(1)}`, emoji: '📊' };
   },
   function numPosEmpate({ rows, seq }) {
     if (!rows[0] || rows[0].resultado !== E || !seq.length) return null;
-    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Numérica · pós-empate (cor anterior)', emoji: '🎯' };
+    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', emoji: '🎯' };
   }
 ];
 
@@ -361,52 +348,60 @@ function runStrategies(rows) {
     try {
       const c = fn(ctx);
       if (c && isCol(c.cor)) out.push(c);
-    } catch (_) { /* estratégia com dados em falta: ignora */ }
+    } catch (_) {}
   }
   return out;
 }
 
 /* ============================ BACKTEST / CONFIANÇA ============================ */
 
-/** janela de rodadas (mais recente primeiro) a terminar no índice i, sem atravessar buracos */
 function windowAt(H, i) {
   const rows = [];
   for (let j = i; j >= 0 && rows.length < 24; j--) {
-    if (rows.length && rows[rows.length - 1].t - H[j].t > CFG.gapMs) break;
+    if (j < i && H[j + 1].gapBefore) break;
     rows.push(H[j]);
   }
   return rows;
 }
 
-/** true = ganhou dentro de Gale 2 (empate conta como green) · false = red · null = sem dados */
 function evalEntry(H, i, cor) {
   for (let k = 0; k <= MAX_GALE; k++) {
     const idx = i + 1 + k;
     if (idx >= H.length) return null;
-    if (H[idx].t - H[idx - 1].t > CFG.gapMs) return null;
+    if (H[idx].gapBefore) return null;
     const r = H[idx].resultado;
     if (r === E || r === cor) return true;
   }
   return false;
 }
 
+/**
+ * Wilson Lower Bound a 95%.
+ * Reporta "quantos % de certeza o histórico nos dá de que a taxa real é ≥ X".
+ * Com poucas amostras, o valor cai agressivamente (ao contrário da média simples).
+ */
+function wilsonLower(w, n, z = 1.96) {
+  if (n === 0) return 0;
+  const p = w / n;
+  const denom = 1 + (z * z) / n;
+  const centre = (p + (z * z) / (2 * n)) / denom;
+  const margin = (z * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n))) / denom;
+  return Math.max(0, centre - margin);
+}
+
 function backtest() {
   const H = S.hist;
   const per = {};
-  let bw = 0;
-  let bn = 0;
-
+  let bw = 0, bn = 0;
   for (let i = 8; i < H.length - 1; i++) {
     const win = windowAt(H, i);
     if (win.length < 6) continue;
-
     for (const cor of [J, B]) {
       const v = evalEntry(H, i, cor);
       if (v === null) continue;
       bn++;
       if (v) bw++;
     }
-
     for (const c of runStrategies(win)) {
       const v = evalEntry(H, i, c.cor);
       if (v === null) continue;
@@ -415,9 +410,7 @@ function backtest() {
       if (v) p.w++;
     }
   }
-
-  // taxa-base (sem estratégia) suavizada: com pouco histórico não deixa o ruído inflar a confiança
-  const REF = 0.9; // ~ 1 - 0.455^3 (3 tentativas, empate = green)
+  const REF = 0.9;
   const prior = (bw + 200 * REF) / (bn + 200);
   return { per, prior, baseN: bn };
 }
@@ -430,12 +423,20 @@ function getStats() {
   return S.stats;
 }
 
-/** Confiança = taxa de acerto histórica do setup (até Gale 2), suavizada em direção à taxa-base */
+/**
+ * Confiança = Wilson lower bound da taxa histórica do setup
+ * (green em G0, G1, G2 ou empate, dentro do gale).
+ *
+ * Regra dura: se amostra < minAmostra → confiança = 0 (não emite).
+ *
+ * Efeito: "confiança 91%" significa, com 95% de confiança estatística,
+ * que a taxa real de green (em qualquer gale/empate) é ≥ 91%.
+ */
 function confOf(st, key) {
-  const K = 30;
   const e = st.per[key] || { n: 0, w: 0 };
-  const p = (e.w + K * st.prior) / (e.n + K);
-  return { conf: Math.min(99, Math.round(p * 100)), n: e.n };
+  if (e.n < CFG.minAmostra) return { conf: 0, n: e.n, insuficiente: true };
+  const conf = Math.round(wilsonLower(e.w, e.n, 1.96) * 100);
+  return { conf: Math.min(99, conf), n: e.n };
 }
 
 function pickEntry(rows) {
@@ -463,17 +464,14 @@ function pickEntry(rows) {
   return { ...arr[0], consenso: arr.length };
 }
 
-/* ============================ BASE DE DADOS (opcional) ============================ */
+/* ============================ BASE DE DADOS ============================ */
 
 let dbChain = Promise.resolve();
 function dbq(fn) {
   if (!pool) return;
   dbChain = dbChain
     .then(fn)
-    .catch((e) => {
-      R.erroDB = e.message;
-      log('DB_ERRO', e.message);
-    });
+    .catch((e) => { R.erroDB = e.message; log('DB_ERRO', e.message); });
 }
 
 async function ensureSchema() {
@@ -482,7 +480,8 @@ async function ensureSchema() {
       id TEXT PRIMARY KEY,
       resultado TEXT NOT NULL,
       fim TIMESTAMPTZ NOT NULL,
-      pj INTEGER, pb INTEGER, mult TEXT
+      pj INTEGER, pb INTEGER, mult TEXT,
+      gap_before BOOLEAN NOT NULL DEFAULT FALSE
     )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_bb_rodadas_fim ON bb_rodadas (fim DESC)`);
   await pool.query(`
@@ -500,16 +499,42 @@ async function ensureSchema() {
       base_id TEXT
     )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_bb_sinais_criado ON bb_sinais (criado_em DESC)`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bb_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )`);
+}
+
+/** Se o BOT_INSTANCE mudou (novo deploy/serviço), limpa o histórico */
+async function checkBotInstance() {
+  if (!pool) return;
+  const r = await pool.query(`SELECT value FROM bb_meta WHERE key = 'instance'`);
+  const stored = r.rows[0]?.value || '';
+  if (stored && stored !== BOT_INSTANCE) {
+    log('BOT_INSTANCE_MUDOU_LIMPANDO', { anterior: stored, atual: BOT_INSTANCE });
+    await pool.query('TRUNCATE bb_rodadas');
+    await pool.query('TRUNCATE bb_sinais');
+  }
+  await pool.query(
+    `INSERT INTO bb_meta (key, value) VALUES ('instance', $1)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [BOT_INSTANCE]
+  );
 }
 
 async function loadFromDB() {
   const rr = await pool.query(
-    `SELECT id, resultado, fim, pj, pb, mult FROM bb_rodadas ORDER BY fim DESC LIMIT $1`,
+    `SELECT id, resultado, fim, pj, pb, mult, gap_before FROM bb_rodadas ORDER BY fim DESC LIMIT $1`,
     [CFG.maxHist]
   );
-  S.hist = rr.rows
-    .map((x) => ({ id: x.id, resultado: x.resultado, t: new Date(x.fim).getTime(), pj: x.pj, pb: x.pb, mult: x.mult }))
-    .sort((a, b) => a.t - b.t);
+  S.hist = rr.rows.map((x) => ({
+    id: x.id,
+    resultado: x.resultado,
+    t: new Date(x.fim).getTime(),
+    pj: x.pj, pb: x.pb, mult: x.mult,
+    gapBefore: Boolean(x.gap_before)
+  })).sort((a, b) => a.t - b.t);
   S.seen = new Set(S.hist.map((x) => x.id));
 
   const sr = await pool.query(
@@ -518,13 +543,8 @@ async function loadFromDB() {
   S.signals = sr.rows.map((x) => ({
     id: Number(x.id),
     criadoMs: new Date(x.criado_em).getTime(),
-    cor: x.cor,
-    key: x.estrategia,
-    nome: x.nome,
-    confianca: x.confianca,
-    estado: x.estado,
-    gale: x.gale,
-    empate: x.empate,
+    cor: x.cor, key: x.estrategia, nome: x.nome, confianca: x.confianca,
+    estado: x.estado, gale: x.gale, empate: x.empate,
     resultadoFinal: x.resultado_final,
     resolvidoMs: x.resolvido_em ? new Date(x.resolvido_em).getTime() : null,
     baseId: x.base_id
@@ -534,14 +554,6 @@ async function loadFromDB() {
   const m = Number(mx.rows[0].m);
   S.nextId = m > 0 ? m + 1 : CFG.sinalInicial;
 
-  // sinais que ficaram abertos num reinício não podem ser resolvidos com rodadas antigas
-  for (const s of S.signals) {
-    if (s.estado === 'PENDENTE') {
-      s.estado = 'CANCELADO';
-      s.resolvidoMs = Date.now();
-      dbSaveSignal(s);
-    }
-  }
   const lastS = S.signals[S.signals.length - 1];
   if (lastS) S.lastSignalAt = lastS.criadoMs;
 }
@@ -549,8 +561,9 @@ async function loadFromDB() {
 function dbSaveRound(r) {
   dbq(() =>
     pool.query(
-      `INSERT INTO bb_rodadas (id, resultado, fim, pj, pb, mult) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING`,
-      [r.id, r.resultado, new Date(r.t), r.pj, r.pb, r.mult]
+      `INSERT INTO bb_rodadas (id, resultado, fim, pj, pb, mult, gap_before)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO NOTHING`,
+      [r.id, r.resultado, new Date(r.t), r.pj, r.pb, r.mult, Boolean(r.gapBefore)]
     )
   );
 }
@@ -571,13 +584,12 @@ function dbSaveSignal(s) {
   );
 }
 
-/* ============================ TELEGRAM (fila + retry) ============================ */
+/* ============================ TELEGRAM ============================ */
 
 const tgQueue = [];
 let tgRunning = false;
 
-const stripHtml = (t) =>
-  t.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+const stripHtml = (t) => t.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 
 async function tgPost(text, plain = false) {
   if (!BOT_TOKEN || !CHAT_ID) {
@@ -588,21 +600,14 @@ async function tgPost(text, plain = false) {
     const payload = { chat_id: CHAT_ID, text: plain ? stripHtml(text) : text, disable_web_page_preview: true };
     if (!plain) payload.parse_mode = 'HTML';
     const resp = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, payload, { timeout: 15000 });
-    if (resp.data?.ok === true) {
-      R.erroTelegram = null;
-      return { ok: true };
-    }
+    if (resp.data?.ok === true) { R.erroTelegram = null; return { ok: true }; }
     R.erroTelegram = JSON.stringify(resp.data);
     return { ok: false };
   } catch (e) {
     const data = e.response?.data;
     R.erroTelegram = data ? JSON.stringify(data) : e.message;
-    if (e.response?.status === 429) {
-      return { ok: false, retryAfter: Number(data?.parameters?.retry_after) || 5 };
-    }
-    if (e.response?.status === 400 && /parse entities/i.test(String(data?.description))) {
-      return { ok: false, parseError: true };
-    }
+    if (e.response?.status === 429) return { ok: false, retryAfter: Number(data?.parameters?.retry_after) || 5 };
+    if (e.response?.status === 400 && /parse entities/i.test(String(data?.description))) return { ok: false, parseError: true };
     return { ok: false };
   }
 }
@@ -612,27 +617,12 @@ async function tgRun() {
   while (tgQueue.length) {
     const m = tgQueue[0];
     const r = await tgPost(m.text, m.plain);
-    if (r.ok) {
-      tgQueue.shift();
-      R.telegramPendentes = tgQueue.length;
-      await sleep(450);
-      continue;
-    }
-    if (r.retryAfter) {
-      await sleep(r.retryAfter * 1000 + 300);
-      continue;
-    }
-    if (r.parseError) {
-      m.plain = true;
-      continue;
-    }
+    if (r.ok) { tgQueue.shift(); R.telegramPendentes = tgQueue.length; await sleep(450); continue; }
+    if (r.retryAfter) { await sleep(r.retryAfter * 1000 + 300); continue; }
+    if (r.parseError) { m.plain = true; continue; }
     m.tries = (m.tries || 0) + 1;
-    if (m.tries >= 6) {
-      log('TELEGRAM_DESCARTADA', { erro: R.erroTelegram });
-      tgQueue.shift();
-    } else {
-      await sleep(1500 * m.tries);
-    }
+    if (m.tries >= 6) { log('TELEGRAM_DESCARTADA', { erro: R.erroTelegram }); tgQueue.shift(); }
+    else await sleep(1500 * m.tries);
     R.telegramPendentes = tgQueue.length;
   }
   tgRunning = false;
@@ -646,101 +636,63 @@ function tgSend(text) {
 
 /* ============================ PLACAR / MENSAGENS ============================ */
 
-const FECHADOS = ['GREEN', 'G1', 'G2', 'EMPATE', 'LOSS'];
-
 function placar() {
   const hoje = dia();
   const L = S.signals.filter((s) => dia(s.criadoMs) === hoje);
   const c = (st) => L.filter((s) => s.estado === st).length;
-  const green = c('GREEN');
-  const g1 = c('G1');
-  const g2 = c('G2');
-  const emp = c('EMPATE');
-  const loss = c('LOSS');
+  const green = c('GREEN'), g1 = c('G1'), g2 = c('G2'), emp = c('EMPATE'), loss = c('LOSS');
   const wins = green + g1 + g2 + emp;
   const fechados = wins + loss;
   const taxa = fechados ? (wins / fechados) * 100 : 0;
-  const taxaSem = green + g1 + g2 + loss ? ((green + g1 + g2) / (green + g1 + g2 + loss)) * 100 : 0;
-
-  let seguidos = 0;
-  const fin = L.filter((s) => FECHADOS.includes(s.estado));
-  for (let i = fin.length - 1; i >= 0; i--) {
-    if (fin[i].estado === 'LOSS') break;
-    seguidos++;
-  }
-  return { total: fechados + c('PENDENTE'), green, g1, g2, emp, loss, wins, fechados, taxa, taxaSem, seguidos, pendentes: c('PENDENTE'), cancelados: c('CANCELADO') };
+  return { green, g1, g2, emp, loss, wins, fechados, taxa, pendentes: c('PENDENTE') };
 }
 
-function msgPlacar(p) {
-  return [
-    '',
-    '📊 <b>PLACAR · HOJE</b>',
-    `✅ <b>${p.wins}</b> Greens  (G0 ${p.green} · G1 ${p.g1} · G2 ${p.g2} · 🟡 ${p.emp})`,
-    `🟥 <b>${p.loss}</b> Reds`,
-    `📈 Acerto: <b>${p.taxa.toFixed(1)}%</b>  <i>(${p.taxaSem.toFixed(1)}% sem empates)</i>`,
-    `🔥 Sequência de Greens: <b>${p.seguidos}</b>`
-  ].join('\n');
+function placarLinha() {
+  const p = placar();
+  if (!p.fechados) return '📊 Hoje: —';
+  return `📊 Hoje: <b>${p.wins}G</b> · ${p.loss}R · <b>${p.taxa.toFixed(0)}%</b>`;
 }
 
 function msgEntrada(s) {
-  const d = s.confianca - (s.base ?? 90); // vs. taxa-base real do histórico
-  const nivel = d >= 2 ? '💎 Alta' : d >= 0 ? '🟢 Boa' : '🟡 Média';
   return [
-    '🎰 <b>CAPUNGA DADOS</b> │ BAC BO',
-    '▬▬▬▬▬▬▬▬▬▬▬▬▬▬',
-    `🔔 <b>ENTRADA CONFIRMADA</b>  ·  #${s.id}`,
+    `🎯 <b>SINAL #${s.id}</b>`,
     '',
-    `🎯 Aposte em: ${corTxt(s.cor)}`,
-    '🟡 Empate = Green  ·  🔁 até Gale 2',
+    `🎲 <b>Apostar:</b> ${corTxt(s.cor)}`,
+    `📊 <b>Confiança:</b> ${s.confianca}%`,
+    `🧠 ${esc(s.nome)}`,
     '',
-    `📈 Confiança: <b>${s.confianca}%</b>  ${nivel}`,
-    barra(s.confianca),
-    `${s.emoji || '🧠'} Padrão: ${esc(s.nome)}`,
-    s.consenso > 1 ? `🤝 ${s.consenso} estratégias apontam a mesma cor` : null,
-    '',
-    `🕒 ${hora(s.criadoMs)} (Angola)`,
-    '▬▬▬▬▬▬▬▬▬▬▬▬▬▬',
-    '<i>Estimativa estatística, não garantia de resultado.</i>'
-  ].filter((x) => x !== null).join('\n');
-}
-
-function placarDados(r) {
-  return hasScore(r) ? `  <i>(J ${r.pj} × ${r.pb} B)</i>` : '';
+    `⏱ ${hora(s.criadoMs)} · Gale ${MAX_GALE} · 🟡 = Green`
+  ].join('\n');
 }
 
 function msgGale(s, r) {
   return [
-    `🔁 <b>GALE ${s.gale}</b>  ·  #${s.id}`,
-    `Saiu ${corCurta(r.resultado)}${placarDados(r)}`,
-    `➡️ Mantenha ${corTxt(s.cor)}`,
-    `📈 Confiança do sinal: ${s.confianca}%`,
-    `🕒 ${hora()}`
+    `🔁 <b>GALE ${s.gale}</b> · #${s.id}`,
+    `Saiu ${corCurta(r.resultado)}`,
+    `➡️ Continua ${corCurta(s.cor)}`
   ].join('\n');
 }
 
 function msgGreen(s, r) {
   const titulo =
-    s.estado === 'EMPATE' ? '🟡✅ <b>GREEN POR EMPATE</b>'
-      : s.estado === 'GREEN' ? '✅ <b>GREEN DIRETO</b>'
-        : s.estado === 'G1' ? '⚡✅ <b>GREEN NO GALE 1</b>'
-          : '🔥✅ <b>GREEN NO GALE 2</b>';
+    s.estado === 'EMPATE' ? '🟡 <b>GREEN (EMPATE)</b>'
+      : s.estado === 'GREEN' ? '✅ <b>GREEN</b>'
+        : s.estado === 'G1' ? '⚡ <b>GREEN G1</b>'
+          : '🔥 <b>GREEN G2</b>';
   return [
-    titulo + `  ·  #${s.id}`,
-    `🎯 Entrada: ${corCurta(s.cor)}  │  Saiu ${corCurta(r.resultado)}${placarDados(r)}`,
-    `${s.emoji || '🧠'} ${esc(s.nome)}  ·  ${s.confianca}%`,
-    `🕒 ${hora()}`,
-    msgPlacar(placar())
+    `${titulo} · #${s.id}`,
+    `${corCurta(s.cor)} → ${corCurta(r.resultado)}`,
+    '',
+    placarLinha()
   ].join('\n');
 }
 
 function msgRed(s, r) {
   return [
-    `🟥 <b>RED</b>  ·  #${s.id}`,
-    `🎯 Entrada: ${corCurta(s.cor)}  │  Saiu ${corCurta(r.resultado)}${placarDados(r)}`,
-    `${s.emoji || '🧠'} ${esc(s.nome)}  ·  ${s.confianca}%`,
-    `🔁 Gales usados: ${MAX_GALE}/${MAX_GALE}`,
-    `🕒 ${hora()}`,
-    msgPlacar(placar())
+    `🟥 <b>RED</b> · #${s.id}`,
+    `${corCurta(s.cor)} → ${corCurta(r.resultado)}`,
+    '',
+    placarLinha()
   ].join('\n');
 }
 
@@ -748,30 +700,13 @@ function msgRed(s, r) {
 
 const pendente = () => S.signals.find((s) => s.estado === 'PENDENTE') || null;
 
-function cancelarSeExpirado() {
-  const s = pendente();
-  if (!s) return false;
-  if (Date.now() - s.criadoMs < CFG.expiraMin * 60000) return false;
-  s.estado = 'CANCELADO';
-  s.resolvidoMs = Date.now();
-  dbSaveSignal(s);
-  tgSend(`⏰ <b>SINAL #${s.id} CANCELADO</b>\nSem rodadas novas da mesa. Não conta no placar.\n🕒 ${hora()}`);
-  log('SINAL_EXPIRADO', { id: s.id });
-  return true;
-}
-
 function resolver(r) {
   const s = pendente();
   if (!s) return;
-  if (r.t <= s.baseT || r.id === s.baseId) return; // só rodadas posteriores ao sinal
+  if (r.t <= s.baseT || r.id === s.baseId) return;
 
-  // EMPATE = GREEN (no nível de gale em que estamos)
-  if (r.resultado === E) {
-    return fechar(s, r, 'EMPATE', true);
-  }
-  if (r.resultado === s.cor) {
-    return fechar(s, r, s.gale === 0 ? 'GREEN' : s.gale === 1 ? 'G1' : 'G2', false);
-  }
+  if (r.resultado === E) return fechar(s, r, 'EMPATE', true);
+  if (r.resultado === s.cor) return fechar(s, r, s.gale === 0 ? 'GREEN' : s.gale === 1 ? 'G1' : 'G2', false);
   if (s.gale < MAX_GALE) {
     s.gale += 1;
     dbSaveSignal(s);
@@ -807,24 +742,16 @@ function criarSinal(ultima) {
   if (rows.length < 6) return (R.ultimoMotivo = 'historico_curto');
 
   const e = pickEntry(rows);
-  if (!e) return (R.ultimoMotivo = 'sem_setup_com_confianca');
+  if (!e) return (R.ultimoMotivo = 'sem_setup_confiavel');
   if (e.conflito) return (R.ultimoMotivo = 'estrategias_em_conflito');
 
   const s = {
     id: S.nextId++,
     criadoMs: Date.now(),
-    cor: e.cor,
-    key: e.key,
-    nome: e.nome,
-    emoji: e.emoji,
-    confianca: e.confianca,
-    base: e.base,
-    consenso: e.consenso,
-    estado: 'PENDENTE',
-    gale: 0,
-    empate: false,
-    baseId: ultima.id,
-    baseT: ultima.t
+    cor: e.cor, key: e.key, nome: e.nome, emoji: e.emoji,
+    confianca: e.confianca, base: e.base, consenso: e.consenso,
+    estado: 'PENDENTE', gale: 0, empate: false,
+    baseId: ultima.id, baseT: ultima.t
   };
   S.signals.push(s);
   if (S.signals.length > 1500) S.signals.splice(0, S.signals.length - 1500);
@@ -843,13 +770,11 @@ async function syncOnce() {
   busy = true;
   try {
     const rounds = await fetchRounds();
-    const warm = S.hist.length === 0; // 1ª carga: importa histórico sem emitir nada
+    const warm = S.hist.length === 0;
     let lastT = S.hist.length ? S.hist[S.hist.length - 1].t : 0;
 
     const fresh = rounds.filter((r) => !S.seen.has(r.id));
-    let live = 0;
-    let ultimaViva = null;
-    let desordem = false;
+    let live = 0, ultimaViva = null, desordem = false;
 
     for (const r of fresh) {
       S.seen.add(r.id);
@@ -868,15 +793,9 @@ async function syncOnce() {
     if (desordem) S.hist.sort((a, b) => a.t - b.t);
     if (S.hist.length > CFG.maxHist) S.hist.splice(0, S.hist.length - CFG.maxHist);
 
-    if (fresh.length) {
-      R.ultimaRodadaNova = new Date().toISOString();
-      R.ciclosSemNovos = 0;
-    } else {
-      R.ciclosSemNovos++;
-    }
+    if (fresh.length) { R.ultimaRodadaNova = new Date().toISOString(); R.ciclosSemNovos = 0; }
+    else R.ciclosSemNovos++;
     R.novosUltimoCiclo = fresh.length;
-
-    cancelarSeExpirado();
 
     if (warm && fresh.length) {
       R.ultimoMotivo = 'base_historica_inicializada';
@@ -897,10 +816,7 @@ async function syncOnce() {
 
 function agendar() {
   if (stopping) return;
-  timer = setTimeout(async () => {
-    await syncOnce();
-    agendar();
-  }, CFG.syncMs);
+  timer = setTimeout(async () => { await syncOnce(); agendar(); }, CFG.syncMs);
 }
 
 /* ============================ ROTAS ============================ */
@@ -915,41 +831,40 @@ function admin(req, res, next) {
   next();
 }
 
-app.get('/', (_req, res) =>
-  res.json({
-    nome: 'Capunga Dados — Bac Bo v6',
-    estado: 'online',
-    horaAngola: hora(),
-    estrategias: STRATS.length,
-    rotas: ['/health', '/diagnostico', '/sinais', '/estatisticas']
-  })
-);
+app.get('/', (_req, res) => res.json({
+  nome: 'Capunga Dados — Bac Bo v7',
+  estado: 'online',
+  horaAngola: hora(),
+  botInstance: BOT_INSTANCE,
+  estrategias: STRATS.length,
+  fonte: 'tipminer (scraper)'
+}));
 
-app.get('/health', (_req, res) =>
-  res.json({
-    sucesso: true,
-    horaAngola: hora(),
-    iniciadoEm: R.iniciadoEm,
-    ultimaSync: R.ultimaSync,
-    ultimaRodadaNova: R.ultimaRodadaNova,
-    ciclosSemNovos: R.ciclosSemNovos,
-    motivoSemSinal: R.ultimoMotivo,
-    erroAPI: R.erroAPI,
-    erroTelegram: R.erroTelegram,
-    erroDB: R.erroDB,
-    telegramPendentes: R.telegramPendentes
-  })
-);
+app.get('/health', (_req, res) => res.json({
+  sucesso: true,
+  horaAngola: hora(),
+  botInstance: BOT_INSTANCE,
+  iniciadoEm: R.iniciadoEm,
+  ultimaSync: R.ultimaSync,
+  ultimaRodadaNova: R.ultimaRodadaNova,
+  ciclosSemNovos: R.ciclosSemNovos,
+  motivoSemSinal: R.ultimoMotivo,
+  erroScraper: R.erroScraper,
+  erroTelegram: R.erroTelegram,
+  erroDB: R.erroDB,
+  telegramPendentes: R.telegramPendentes
+}));
 
 app.get('/diagnostico', (_req, res) => {
   const st = S.stats || { per: {}, prior: null, baseN: 0 };
   res.json({
     sucesso: true,
     horaAngola: hora(),
+    botInstance: BOT_INSTANCE,
     telegramConfigurado: Boolean(BOT_TOKEN && CHAT_ID),
     dbConfigurada: Boolean(pool),
     rodadasEmMemoria: S.hist.length,
-    ultimasRodadas: S.hist.slice(-12).reverse().map((r) => ({ r: r.resultado, pj: r.pj, pb: r.pb, hora: hora(r.t) })),
+    ultimasRodadas: S.hist.slice(-12).reverse().map((r) => ({ r: r.resultado, hora: hora(r.t), gap: r.gapBefore })),
     sinalPendente: pendente(),
     ultimoSinal: R.ultimoSinal,
     motivoSemSinal: R.ultimoMotivo,
@@ -975,35 +890,30 @@ app.get('/estatisticas', (_req, res) => {
     if (s.estado === 'LOSS') { e.reds++; e.sinais++; }
     else if (['GREEN', 'G1', 'G2', 'EMPATE'].includes(s.estado)) { e.greens++; e.sinais++; }
   }
-  const backtest = Object.entries(st.per)
-    .map(([key, v]) => ({ key, amostras: v.n, acertoPercent: Number(((v.w / v.n) * 100).toFixed(1)), confiancaExibida: confOf(st, key).conf }))
-    .sort((a, b) => b.confiancaExibida - a.confiancaExibida);
+  const backtest = Object.entries(st.per).map(([key, v]) => ({
+    key, amostras: v.n,
+    acertoPercent: Number(((v.w / v.n) * 100).toFixed(1)),
+    confiancaExibida: confOf(st, key).conf
+  })).sort((a, b) => b.confiancaExibida - a.confiancaExibida);
   res.json({ sucesso: true, placarDia: placar(), taxaBasePercent: Number((st.prior * 100).toFixed(1)), backtest, ao_vivo_por_estrategia: porEstrategia });
 });
 
 app.post('/admin/sincronizar', admin, async (_req, res) => res.json(await syncOnce()));
 
 app.post('/admin/telegram-teste', admin, async (_req, res) => {
-  const r = await tgPost(`🎰 <b>CAPUNGA DADOS</b> │ BAC BO\n✅ Ligação Telegram OK\n🕒 ${hora()}`);
+  const r = await tgPost(`🎰 <b>CAPUNGA DADOS</b>\n✅ Ligação OK\n⏱ ${hora()}`);
   res.status(r.ok ? 200 : 502).json({ sucesso: r.ok, erro: R.erroTelegram });
 });
 
-/** Apaga tudo e recomeça. Body: { "confirmar": "APAGAR", "legado": true|false } */
 app.post('/admin/reset', admin, async (req, res) => {
   if (req.body?.confirmar !== 'APAGAR') return res.status(400).json({ sucesso: false, erro: 'Envie {"confirmar":"APAGAR"}' });
   try {
     S.hist = []; S.seen = new Set(); S.signals = []; S.stats = null; S.statsAtLen = -1; S.lastSignalAt = 0;
     S.nextId = CFG.sinalInicial;
-    if (pool) {
-      await dbChain;
-      await pool.query('DROP TABLE IF EXISTS bb_sinais, bb_rodadas');
-      if (req.body?.legado) await pool.query('DROP TABLE IF EXISTS sinais, bacbo_resultados');
-      await ensureSchema();
-    }
-    res.json({ sucesso: true, mensagem: 'Base apagada. O robô vai reimportar o histórico sem emitir sinais antigos.' });
-  } catch (e) {
-    res.status(500).json({ sucesso: false, erro: e.message });
-  }
+    lastSeq = []; roundCounter = 0; lastRoundSeenAt = 0;
+    if (pool) { await dbChain; await pool.query('TRUNCATE bb_rodadas'); await pool.query('TRUNCATE bb_sinais'); }
+    res.json({ sucesso: true, mensagem: 'Base apagada.' });
+  } catch (e) { res.status(500).json({ sucesso: false, erro: e.message }); }
 });
 
 app.use((req, res) => res.status(404).json({ sucesso: false, erro: 'Rota não encontrada', caminho: req.path }));
@@ -1015,15 +925,14 @@ async function start() {
     pool = new Pool({
       connectionString: DATABASE_URL,
       ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL) ? false : { rejectUnauthorized: false },
-      max: 4,
-      idleTimeoutMillis: 20000,
-      connectionTimeoutMillis: 12000
+      max: 4, idleTimeoutMillis: 20000, connectionTimeoutMillis: 12000
     });
     pool.on('error', (e) => { R.erroDB = e.message; log('POOL_ERRO', e.message); });
     try {
       await ensureSchema();
+      await checkBotInstance();
       await loadFromDB();
-      log('DB', { rodadas: S.hist.length, sinaisRecentes: S.signals.length, proximoId: S.nextId });
+      log('DB', { botInstance: BOT_INSTANCE, rodadas: S.hist.length, sinaisRecentes: S.signals.length, proximoId: S.nextId });
     } catch (e) {
       R.erroDB = e.message;
       log('DB_INDISPONIVEL_SEGUE_EM_MEMORIA', e.message);
@@ -1033,9 +942,13 @@ async function start() {
     log('DB', 'DATABASE_URL ausente: a funcionar apenas em memória');
   }
 
-  server = app.listen(PORT, '0.0.0.0', () =>
-    log('START', { porta: PORT, estrategias: STRATS.length, maxGale: MAX_GALE, cadenciaMs: CFG.intervaloSinalMs, minConfianca: CFG.minConf })
-  );
+  await ensureScraper();
+
+  server = app.listen(PORT, '0.0.0.0', () => log('START', {
+    porta: PORT, botInstance: BOT_INSTANCE, estrategias: STRATS.length, maxGale: MAX_GALE,
+    cadenciaMs: CFG.intervaloSinalMs, minConfianca: CFG.minConf, minAmostra: CFG.minAmostra,
+    syncMs: CFG.syncMs, fonte: 'tipminer-scraper'
+  }));
 
   const first = await syncOnce();
   log('PRIMEIRA_SYNC', first);
@@ -1047,6 +960,7 @@ async function shutdown() {
   stopping = true;
   if (timer) clearTimeout(timer);
   try { await dbChain; } catch (_) {}
+  await scraperClose();
   if (server) await new Promise((r) => server.close(r));
   if (pool) await pool.end().catch(() => {});
   process.exit(0);
@@ -1057,7 +971,4 @@ process.on('uncaughtException', (e) => log('UNCAUGHT_EXCEPTION', e.message || St
 process.on('SIGTERM', () => shutdown().catch(() => process.exit(1)));
 process.on('SIGINT', () => shutdown().catch(() => process.exit(1)));
 
-start().catch((e) => {
-  console.error('[FATAL]', e);
-  process.exit(1);
-});
+start().catch((e) => { console.error('[FATAL]', e); process.exit(1); });
