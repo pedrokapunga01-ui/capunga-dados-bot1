@@ -5,7 +5,12 @@
  * Atualização incremental resiliente; não executa apostas.
  * Resultados são aleatórios: estratégias são heurísticas, sem garantia de acerto.
  */
-require('dotenv').config();
+try {
+  require('dotenv').config();
+} catch (error) {
+  // Render injeta variáveis pelo ambiente; dotenv só é necessário para ficheiros .env locais.
+  if (error.code !== 'MODULE_NOT_FOUND' || !/Cannot find module ['"]dotenv['"]/.test(error.message)) throw error;
+}
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -706,6 +711,11 @@ async function resolvePending(round) {
   }
 }
 
+function buildSyncSummary({ roundCount, inserted, duplicates, evaluated, motivoSemSinal, fonte, latenciaAPIMs, ciclosSemNovos, hora }) {
+  return { recebidos: roundCount, novosGuardados: inserted, duplicados: duplicates,
+    sinaisAvaliados: evaluated, motivoSemSinal, fonte, latenciaAPIMs, ciclosSemNovos, horaAngola: hora };
+}
+
 async function syncOnce() {
   if (!pool) throw new Error('DATABASE_URL não configurada');
   if (runtime.sincronizacaoEmCurso) return { sucesso: false, ignorada: true, motivo: 'sync_em_curso' };
@@ -744,12 +754,9 @@ async function syncOnce() {
       runtime.ultimoIdNovo = lastNew.id;
       runtime.ciclosSemNovos = 0;
     } else runtime.ciclosSemNovos++;
-    const summary = {
-      recebidos: rounds.length, novosGuardados: inserted, duplicados,
-      sinaisAvaliados: evaluated, motivoSemSinal: runtime.motivoSemSinal,
-      fonte: runtime.fonteAtual, latenciaAPIMs: runtime.latenciaAPIMs,
-      ciclosSemNovos: runtime.ciclosSemNovos, horaAngola: horaAngola()
-    };
+    const summary = buildSyncSummary({ roundCount: rounds.length, inserted, duplicates, evaluated,
+      motivoSemSinal: runtime.motivoSemSinal, fonte: runtime.fonteAtual,
+      latenciaAPIMs: runtime.latenciaAPIMs, ciclosSemNovos: runtime.ciclosSemNovos, hora: horaAngola() });
     if (inserted > 0 || runtime.ciclosSemNovos % 8 === 0) log('SINCRONIZACAO', summary);
     return { sucesso: true, ...summary };
   } catch (error) {
@@ -900,5 +907,5 @@ process.on('uncaughtException', error => { console.error('[UNCAUGHT]', error); s
 if (require.main === module) start().catch(error => { console.error('[FATAL]', error); process.exit(1); });
 module.exports = { app, normalizeOutcome, extractItems, normalizeRound, parseNextLink, withPage, coversWatermark,
   streakLen, stratModelo, detectBestEntry, settlementForRound, wilsonLowerBound, backtestConfidence,
-  scoreSinal, fallbackCadencia, formatPlacar, msgNovoSinal, msgResultadoGreen,
+  scoreSinal, fallbackCadencia, buildSyncSummary, formatPlacar, msgNovoSinal, msgResultadoGreen,
   msgResultadoLoss, msgGale, CONFIG };
