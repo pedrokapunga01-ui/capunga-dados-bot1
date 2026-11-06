@@ -211,36 +211,17 @@ async function ensureSchema() {
   if (!pool) throw new Error('DATABASE_URL não configurada');
   if (schemaPromise) return schemaPromise;
   schemaPromise = (async () => {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS bacbo_resultados (
-        id TEXT PRIMARY KEY,
-        resultado TEXT NOT NULL,
-        estado TEXT NOT NULL DEFAULT 'Resolved',
-        inicio TIMESTAMPTZ,
-        fim TIMESTAMPTZ,
-        pontos_jogador INTEGER,
-        pontos_banca INTEGER,
-        multiplicador TEXT,
-        guardado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        seq BIGSERIAL
-      )
-    `);
+    await pool.query(`CREATE TABLE IF NOT EXISTS bacbo_resultados (
+      id TEXT PRIMARY KEY, resultado TEXT NOT NULL, estado TEXT NOT NULL DEFAULT 'Resolved',
+      inicio TIMESTAMPTZ, fim TIMESTAMPTZ, pontos_jogador INTEGER, pontos_banca INTEGER,
+      multiplicador TEXT, guardado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(), seq BIGSERIAL)`);
+    await pool.query(`ALTER TABLE bacbo_resultados ADD COLUMN IF NOT EXISTS seq BIGSERIAL`);
     await pool.query(`ALTER TABLE bacbo_resultados ADD COLUMN IF NOT EXISTS guardado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_bacbo_fim ON bacbo_resultados (fim DESC)`);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS sinais (
-        id BIGSERIAL PRIMARY KEY,
-        criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        cor TEXT NOT NULL,
-        estado TEXT NOT NULL DEFAULT 'PENDENTE',
-        gale INTEGER NOT NULL DEFAULT 0,
-        resultado_id TEXT,
-        resultado_final TEXT,
-        empates INTEGER NOT NULL DEFAULT 0,
-        estrategia TEXT
-      )
-    `);
+    await pool.query(`CREATE TABLE IF NOT EXISTS sinais (
+      id BIGSERIAL PRIMARY KEY, criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(), cor TEXT NOT NULL,
+      estado TEXT NOT NULL DEFAULT 'PENDENTE', gale INTEGER NOT NULL DEFAULT 0, resultado_id TEXT,
+      resultado_final TEXT, empates INTEGER NOT NULL DEFAULT 0, estrategia TEXT)`);
     await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS estrategia TEXT`);
     await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS resultado_final TEXT`);
     await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS empates INTEGER NOT NULL DEFAULT 0`);
@@ -595,11 +576,11 @@ async function getPlacarDia() {
     loss: s.loss || 0, percent, greensSeguidos };
 }
 function formatPlacar(p) {
-  const greens = (p.gs || 0) + (p.g1 || 0) + (p.g2 || 0) + (p.ge || 0);
+  const greens = p.gs + p.g1 + p.g2 + p.ge;
   const percentagem = p.total ? `${(greens / p.total * 100).toFixed(1)}%` : '0.0%';
-  return ['✨🎲 CAPUNGA DADOS 🎲✨', '📊 HISTÓRICO', `🔢 Total de Sinais: ${p.total || 0}`,
-    `✅ Greens: ${greens}`, `🟢 GS — Sem Gale: ${p.gs || 0}`, `⚡ G1 — Gale 1: ${p.g1 || 0}`,
-    `🔥 G2 — Gale 2: ${p.g2 || 0}`, `🟡 Empates: ${p.ge || 0}`, `❌ Loss: ${p.loss || 0}`,
+  return ['✨🎲 CAPUNGA DADOS 🎲✨', '📊 HISTÓRICO', `🔢 Total de Sinais: ${p.total}`,
+    `✅ Greens: ${greens}`, `🟢 GS — Sem Gale: ${p.gs}`, `⚡ G1 — Gale 1: ${p.g1}`,
+    `🔥 G2 — Gale 2: ${p.g2}`, `🟡 Empates: ${p.ge}`, `❌ Loss: ${p.loss}`,
     `📈 Percentagem: ${percentagem}`, `🔥 Estamos com ${p.greensSeguidos || 0} Greens seguidos`].join('\n');
 }
 async function getHistoricoSinais() {
@@ -626,30 +607,16 @@ async function getPendingSignal() {
 
 function msgNovoSinal(entry) {
   const confidence = Number.isFinite(entry.confidenceScore) ? `📊 Confiança: ${entry.confidenceScore}%` : null;
-  const estrategia = entry.nome || entry.estrategia || null;
-  return [
-    '✨🎲 CAPUNGA DADOS 🎲✨',
-    '🚨✅ ENTRADA CONFIRMADA ✅🚨',
-    '',
-    `🎯 Cor: ${corDisplay(entry.cor)}`,
-    '🛡️ Proteção: 🟡 EMPATE',
-    `🐓 Gale: ${CONFIG.maxGale}`,
-    estrategia ? `🧠 Estratégia: ${estrategia}` : null,
-    confidence
-  ].filter(line => line !== null).join('\n');
+  return ['✨🎲 CAPUNGA DADOS 🎲✨', '🚨✅ ENTRADA CONFIRMADA ✅🚨', '',
+    `🎯 Cor: ${corDisplay(entry.cor)}`, '🛡️ Proteção: 🟡 EMPATE',
+    `🐓 Gale: ${CONFIG.maxGale}`, confidence].filter(line => line !== null).join('\n');
 }
-
 function msgResultadoGreen(signal, state, empate = false) {
-  if (empate) return '✅ GREEN (Empate protegido)';
-  if (state === 'G1') return '✅ GREEN — G1';
-  if (state === 'G2') return '✅ GREEN — G2';
   return '✅ GREEN';
 }
-
 function msgResultadoLoss(signal) {
   return ['❌ LOSS', '😔 Infelizmente a mesa não obedeceu, tropa.'].join('\n');
 }
-
 function msgGale(signal, nextGale) {
   return [`🐓 GALE ${nextGale}`, `🎯 Mantém ${corDisplay(signal.cor)}`].join('\n');
 }
