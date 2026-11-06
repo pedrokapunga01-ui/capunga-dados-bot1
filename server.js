@@ -584,11 +584,20 @@ function formatPlacar(p) {
   const greens = p.gs + p.g1 + p.g2 + p.ge;
   const percentagem = p.total ? `${(greens / p.total * 100).toFixed(1)}%` : '0.0%';
   return ['✨🎲 CAPUNGA DADOS 🎲✨', '📊 HISTÓRICO', `🔢 Total de Sinais: ${p.total}`,
-    `✅ Greens: ${greens}`, `🟢 GS — Sem Gale: ${p.gs}`, `⚡ G1 — Gale 1: ${p.g1}`,
-    `🔥 G2 — Gale 2: ${p.g2}`, `🟡 Empates: ${p.ge}`, `❌ Loss: ${p.loss}`,
+    `✅ Greens: ${greens}`, `🟢 GS: ${p.gs}`, `⚡ G1: ${p.g1}`,
+    `🔥 G2: ${p.g2}`, `🟡 Empates: ${p.ge}`, `❌ Loss: ${p.loss}`,
     `📈 Percentagem: ${percentagem}`, `🔥 Estamos com ${p.greensSeguidos || 0} Greens seguidos`].join('\n');
 }
+function historyStartSql() {
+  return `GREATEST(${LOCAL_DAY_START_SQL}, $1::timestamptz)`;
+}
+function historySignalWindowSql() {
+  return `criado_em >= ${historyStartSql()}`;
+}
 async function getHistoricoSinais() {
+  const historyFilter = historySignalWindowSql();
+  // runtime.iniciadoEm muda em cada processo/deploy; a janela também reinicia diariamente em Luanda.
+  const params = [runtime.iniciadoEm];
   const result = await pool.query(`SELECT
     COUNT(*) FILTER (WHERE estado IN ('GREEN','G1','G2','LOSS'))::int AS total,
     COUNT(*) FILTER (WHERE estado='GREEN' AND COALESCE(empates,0)=0)::int AS gs,
@@ -596,12 +605,13 @@ async function getHistoricoSinais() {
     COUNT(*) FILTER (WHERE estado='G2')::int AS g2,
     COUNT(*) FILTER (WHERE estado='GREEN' AND COALESCE(empates,0)>0)::int AS ge,
     COUNT(*) FILTER (WHERE estado='LOSS')::int AS loss
-    FROM sinais`);
+    FROM sinais WHERE ${historyFilter}
+      AND estado IN ('GREEN','G1','G2','LOSS')`, params);
   const streak = await pool.query(`WITH resultados AS (
     SELECT estado, SUM(CASE WHEN estado='LOSS' THEN 1 ELSE 0 END) OVER
       (ORDER BY criado_em DESC, id DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS losses_seen
-    FROM sinais WHERE estado IN ('GREEN','G1','G2','LOSS')
-  ) SELECT COUNT(*) FILTER (WHERE losses_seen=0)::int AS total FROM resultados`);
+    FROM sinais WHERE ${historyFilter} AND estado IN ('GREEN','G1','G2','LOSS')
+  ) SELECT COUNT(*) FILTER (WHERE losses_seen=0 AND estado IN ('GREEN','G1','G2'))::int AS total FROM resultados`, params);
   return { ...(result.rows[0] || { total: 0, gs: 0, g1: 0, g2: 0, ge: 0, loss: 0 }),
     greensSeguidos: streak.rows[0]?.total || 0 };
 }
@@ -907,5 +917,6 @@ process.on('uncaughtException', error => { console.error('[UNCAUGHT]', error); s
 if (require.main === module) start().catch(error => { console.error('[FATAL]', error); process.exit(1); });
 module.exports = { app, normalizeOutcome, extractItems, normalizeRound, parseNextLink, withPage, coversWatermark,
   streakLen, stratModelo, detectBestEntry, settlementForRound, wilsonLowerBound, backtestConfidence,
-  scoreSinal, fallbackCadencia, buildSyncSummary, formatPlacar, msgNovoSinal, msgResultadoGreen,
+  scoreSinal, fallbackCadencia, buildSyncSummary, historyStartSql, historySignalWindowSql,
+  formatPlacar, msgNovoSinal, msgResultadoGreen,
   msgResultadoLoss, msgGale, CONFIG };
