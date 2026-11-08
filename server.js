@@ -1,11 +1,15 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — UNIFICADO (v3.8)
+ * CAPUNGA DADOS — UNIFICADO (v3.10)
  *
  * Variáveis obrigatórias: DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
  * Opcional: RENDER_EXTERNAL_URL (Render define sozinho) -> auto-ping anti-sleep
  *
+ * v3.10: mensagens simples; confiança = taxa de acerto MEDIDA no histórico (backtest fiel ao bot),
+ *        sinais abaixo de MIN_CONFIANCA (80) não são enviados; teto 95.
+ * v3.9: fila de mensagens (outbox) em ordem e sem perdas, nº do sinal na entrada,
+ *       rodapé com ID da instância (DEBUG_INSTANCIA=false remove), /auditoria.
  * v3.8: núcleo reescrito. Sinais resolvidos a partir da base (não dependem de quem gravou a rodada),
  *       liderança por lease (sem advisory lock), reset só quando o deploy (commit) muda.
  * v3.7: liderança por lock no Postgres (impede 2 instâncias), alerta de instância estranha,
@@ -41,6 +45,9 @@ const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
 const INSTANCIA = crypto.randomBytes(3).toString('hex');
+const VERSAO = 'v3.10';
+// Rodapé com a instância em cada mensagem (ajuda a ver se há 2 processos a enviar). Desligue com DEBUG_INSTANCIA=false
+const DEBUG_INSTANCIA = String(process.env.DEBUG_INSTANCIA || 'true').toLowerCase() !== 'false';
 // RESET_RODADAS=true na Render também apaga o histórico de rodadas no deploy (o bot recarrega 50 da API)
 const RESET_RODADAS = String(process.env.RESET_RODADAS || '').toLowerCase() === 'true';
 
@@ -53,6 +60,7 @@ const CONFIG = {
   maxGale: 2,
   empateProtegido: true,
   sinalVelhoMs: 10 * 60 * 1000,
+  confMin: Number(process.env.MIN_CONFIANCA || 80),
   intervaloSyncMs: 6000
 };
 
@@ -119,9 +127,17 @@ function agoraAngola() {
 }
 
 function corDisplay(cor) {
-  if (cor === 'Banca') return '🔴 VERMELHO 🔴';
-  if (cor === 'Jogador') return '🔵 AZUL 🔵';
+  if (cor === 'Banca') return '🔴 VERMELHO';
+  if (cor === 'Jogador') return '🔵 AZUL';
   return String(cor || '');
+}
+
+function horaCurta() {
+  return new Intl.DateTimeFormat('pt-PT', {
+    timeZone: 'Africa/Luanda',
+    timeStyle: 'medium',
+    hour12: false
+  }).format(new Date());
 }
 
 function oposta(cor) {
@@ -184,14 +200,15 @@ function resultSignature(r) {
 }
 
 // ====================== TELEGRAM ======================
-async function telegramSend(texto) {
+async function telegramSend(texto, opts = {}) {
   if (!BOT_TOKEN || !CHAT_ID) {
     runtime.ultimoErroTelegram = 'BOT_TOKEN ou CHAT_ID não configurado';
     log('TELEGRAM FALHA', runtime.ultimoErroTelegram);
     return false;
   }
 
-  for (let tentativa = 1; tentativa <= 3; tentativa++) {
+  const maxTent = opts.tentativas || 3;
+  for (let tentativa = 1; tentativa <= maxTent; tentativa++) {
     try {
       const response = await axios.post(
         `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
@@ -218,7 +235,7 @@ async function telegramSend(texto) {
         continue;
       }
     }
-    if (tentativa < 3) await sleep(1500 * tentativa);
+    if (tentativa < maxTent) await sleep(1500 * tentativa);
   }
 
   log('TELEGRAM FALHA', runtime.ultimoErroTelegram);
@@ -271,6 +288,17 @@ async function ensureSchema() {
 
     await pool.query(`CREATE TABLE IF NOT EXISTS lider (id INTEGER PRIMARY KEY, instancia TEXT, batimento TIMESTAMPTZ)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS meta (chave TEXT PRIMARY KEY, valor TEXT)`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS outbox (
+        id BIGSERIAL PRIMARY KEY,
+        criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        sinal_id BIGINT,
+        texto TEXT NOT NULL,
+        enviado_em TIMESTAMPTZ,
+        tentativas INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_outbox_pend ON outbox (id) WHERE enviado_em IS NULL`);
 
     // Garante, ao nível da base de dados, no máximo 1 sinal PENDENTE
     try {
@@ -374,7 +402,7 @@ async function fetchRounds() {
       timeout: 15000,
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'CapungaDados/3.8',
+        'User-Agent': 'CapungaDados/3.10',
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache'
       }
@@ -577,131 +605,80 @@ function detectBestEntry(rows) {
 }
 
 // ====================== CONFIANÇA ======================
-const ESTRATEGIAS = {
-  REPETICAO: stratRepeticao,
-  QUEBRA: stratQuebra,
-  DOIS_DOIS: stratDoisDois,
-  SURF: stratSurf,
-  FORCA: stratForca,
-  NUMERICA: stratNumerica
-};
-
-const CONF_MIN = 80;
+// Confiança = taxa de acerto (fechar GREEN em até G2, empate protegido) que este MESMO tipo de sinal
+// realmente teve no histórico guardado. Não é promessa: nenhum padrão garante vitória.
+// Maior confiança = esse tipo de sinal acertou mais vezes no histórico (com amostra suficiente).
+const PRIOR = 0.875;       // 3 tentativas a ~50% => ~87,5% (ponto de partida quando há poucos dados)
+const K_ESTRATEGIA = 20;   // força do prior sobre a taxa da estratégia
+const K_BUCKET = 20;       // força da taxa da estratégia sobre a taxa do tipo específico
 const CONF_MAX = 95;
-const PESOS = {
-  padrao: 0.15,
-  tendencia: 0.10,
-  momento: 0.10,
-  coerencia: 0.05,
-  historico: 0.30,
-  confluencia: 0.10,
-  empates: 0.05,
-  fase: 0.15
-};
 
-function clamp(x, a = 0, b = 1) {
-  return Math.min(b, Math.max(a, x));
-}
-
-// Parcela decrescente (mais recente pesa mais) da cor nas últimas N rodadas
-function shareDecay(rows, cor, n = 8) {
-  let num = 0, den = 0;
-  rows.slice(0, n).forEach((r, i) => {
-    const w = Math.pow(0.85, i);
-    den += w;
-    if (r.resultado === cor) num += w;
-  });
-  return den ? num / den : 0.5;
-}
-
-function shareSimple(rows, cor, n = 12) {
-  const s = rows.slice(0, n);
-  if (!s.length) return 0.5;
-  return s.filter(r => r.resultado === cor).length / s.length;
-}
-
-// Taxa de trocas de cor (0 = sem trocas, 1 = alternância total) nas últimas N rodadas
-function switchRate(rows, n = 10) {
-  const s = rows.slice(0, n);
-  if (s.length < 3) return 0.5;
-  let sw = 0;
-  for (let i = 0; i < s.length - 1; i++) if (s[i].resultado !== s[i + 1].resultado) sw++;
-  return sw / (s.length - 1);
-}
-
-// Backtest: com que frequência esta estratégia acertou (até G2) no histórico guardado
-function backtestEstrategia(chave, hist) {
-  const fn = ESTRATEGIAS[chave];
-  if (!fn || !hist || hist.length < 20) return { n: 0, rate: null };
-  let n = 0, hits = 0;
-  // hist está em ordem decrescente (0 = mais recente); o "futuro" de k é hist[k-1], hist[k-2], hist[k-3]
-  for (let k = 3; k < hist.length - 4; k++) {
-    const entry = fn(hist.slice(k, k + 40));
-    if (!entry) continue;
-    n++;
-    const futuro = [hist[k - 1], hist[k - 2], hist[k - 3]];
-    if (futuro.some(r => r.resultado === entry.cor)) hits++;
+// Tipo específico do sinal (ex.: Repetição x4 é diferente de Repetição x3)
+function bucketKey(entry) {
+  const nome = entry.nome || '';
+  switch (entry.estrategia) {
+    case 'REPETICAO':
+    case 'QUEBRA': {
+      const m = nome.match(/x(\d+)/);
+      const n = m ? Math.min(Number(m[1]), 6) : 0;
+      return `${entry.estrategia}:${n}`;
+    }
+    case 'DOIS_DOIS':
+      return `DOIS_DOIS:${nome.includes('bloco') ? 'bloco' : 'completa'}`;
+    default:
+      return entry.estrategia;
   }
-  return { n, rate: n ? hits / n : null };
 }
 
-function computeConfidence(entry, rows, hist, empatesRecentes, fase) {
-  const cor = entry.cor;
-  const chave = entry.estrategia;
-
-  // 1) Força do padrão (prioridade 81..92)
-  const fPadrao = clamp((entry.prioridade - 80) / 12);
-
-  // 2) Tendência e 3) Momento
-  let fTendencia, fMomento;
-  if (chave === 'QUEBRA') {
-    const n = streakLen(rows);
-    fTendencia = clamp((n - 3) / 4); // exaustão da sequência
-    const corSeq = rows[0]?.resultado;
-    fMomento = clamp((shareDecay(rows, corSeq, 8) - 0.6) / 0.4); // mesa muito unilateral = esticada
-  } else {
-    fTendencia = clamp((shareSimple(rows, cor, 12) - 0.4) / 0.3);
-    fMomento = clamp((shareDecay(rows, cor, 8) - 0.4) / 0.5);
-  }
-
-  // 4) Coerência do padrão com o ritmo da mesa
-  const sr = switchRate(rows, 10);
-  let fCoerencia;
-  if (chave === 'SURF') fCoerencia = sr;
-  else if (chave === 'DOIS_DOIS') fCoerencia = 1 - Math.abs(sr - 0.5) * 2;
-  else fCoerencia = 1 - sr;
-
-  // 5) Desempenho histórico (backtest, com suavização para amostras pequenas)
-  const bt = backtestEstrategia(chave, hist);
-  const prior = 0.875, pw = 8;
-  const rateSuave = bt.rate === null ? prior : (bt.rate * bt.n + prior * pw) / (bt.n + pw);
-  const fHistorico = clamp((rateSuave - 0.8) / 0.15);
-
-  // 6) Confluência com outras estratégias
-  const fConfluencia = clamp((entry.confluencia || 0) / 2);
-
-  // 7) Empates recentes (perturbam o padrão)
-  const fEmpates = 1 - clamp(empatesRecentes / 4);
-
-  // 8) Fase do bot (últimos sinais fechados)
-  const fFase = fase === null ? 0.5 : fase;
-
-  const fatores = {
-    padrao: fPadrao, tendencia: fTendencia, momento: fMomento, coerencia: fCoerencia,
-    historico: fHistorico, confluencia: fConfluencia, empates: fEmpates, fase: fFase
+// Repete no passado o que o bot faria: 1 sinal de cada vez, até G2, empate ignorado.
+// hist: do mais recente (0) para o mais antigo.
+function backtestGeral(hist) {
+  const bucket = {};
+  const estrategia = {};
+  const somar = (obj, key, ganhou) => {
+    const o = obj[key] || (obj[key] = { n: 0, h: 0 });
+    o.n++;
+    if (ganhou) o.h++;
   };
 
-  let raw = 0;
-  for (const k of Object.keys(PESOS)) raw += PESOS[k] * fatores[k];
+  let k = hist.length - 6;
+  while (k >= 3) {
+    const entry = detectBestEntry(hist.slice(k, k + 40));
+    if (!entry) { k--; continue; }
 
-  const confianca = Math.round(clamp(CONF_MIN + raw * (CONF_MAX - CONF_MIN), CONF_MIN, CONF_MAX));
+    let ganhou = false;
+    let usadas = 3;
+    for (let i = 1; i <= 3; i++) {
+      if (hist[k - i].resultado === entry.cor) { ganhou = true; usadas = i; break; }
+    }
+    somar(bucket, bucketKey(entry), ganhou);
+    somar(estrategia, entry.estrategia, ganhou);
+    k -= usadas; // o próximo sinal só pode nascer quando este fecha
+  }
+  return { bucket, estrategia };
+}
+
+function computeConfidence(entry, hist) {
+  const bt = backtestGeral(hist || []);
+  const kb = bucketKey(entry);
+  const b = bt.bucket[kb] || { n: 0, h: 0 };
+  const e = bt.estrategia[entry.estrategia] || { n: 0, h: 0 };
+
+  // Suavização: poucos dados => aproxima-se da média; muitos dados => vale a taxa medida
+  const pEstrategia = (e.h + K_ESTRATEGIA * PRIOR) / (e.n + K_ESTRATEGIA);
+  const pTipo = (b.h + K_BUCKET * pEstrategia) / (b.n + K_BUCKET);
+
+  const confianca = Math.min(CONF_MAX, Math.round(pTipo * 100));
 
   return {
     confianca,
     detalhe: {
-      raw: Number(raw.toFixed(3)),
-      backtest: { amostra: bt.n, acerto: bt.rate === null ? null : Number(bt.rate.toFixed(3)) },
-      fatores: Object.fromEntries(Object.entries(fatores).map(([k, v]) => [k, Number(v.toFixed(2))]))
+      tipo: kb,
+      amostraTipo: b.n,
+      taxaTipo: b.n ? Number((b.h / b.n).toFixed(3)) : null,
+      amostraEstrategia: e.n,
+      taxaEstrategia: e.n ? Number((e.h / e.n).toFixed(3)) : null,
+      estimativa: Number(pTipo.toFixed(3))
     }
   };
 }
@@ -727,17 +704,8 @@ async function getPlacarDia() {
 }
 
 function formatPlacar(p) {
-  return [
-    '',
-    '════════════════════',
-    '🏆 CAPUNGA PLACAR 🏆',
-    '════════════════════',
-    `✅ GREEN: ${p.green}   |  ⚡ G1: ${p.g1}`,
-    `🔥 G2: ${p.g2}      |  🟡 Empates: ${p.empates}`,
-    `❌ LOSS: ${p.loss}`,
-    `📊 Assertividade: ${p.percent}%`,
-    '════════════════════'
-  ].join('\n');
+  const acertos = (p.green || 0) + (p.g1 || 0) + (p.g2 || 0);
+  return `\n📊 Hoje: ✅ ${acertos} · ❌ ${p.loss || 0} · 🟡 ${p.empates || 0} · ${p.percent}%`;
 }
 
 async function getPendingSignal() {
@@ -745,68 +713,80 @@ async function getPendingSignal() {
   return r.rows[0] || null;
 }
 
-function msgNovoSinal(entry) {
+function msgNovoSinal(entry, signal) {
   return [
-    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
-    '━━━━━━━━━━━━━━━━━━━━',
-    '🚨⚡ ENTRADA CONFIRMADA ⚡🚨',
-    '━━━━━━━━━━━━━━━━━━━━',
-    `🎯 Cor: ${corDisplay(entry.cor)}`,
-    `${entry.emoji} Estratégia: ${entry.nome}`,
-    `📈 Confiança: ${entry.confianca}%`,
-    '🛡️ Proteção: 🟡 EMPATE',
-    `🐓 Gale máximo: ${CONFIG.maxGale}`,
-    '💎 Gestão de banca obrigatória',
-    `🕒 ${horaAngola()}`,
-    '━━━━━━━━━━━━━━━━━━━━'
-  ].join('\n');
-}
-
-function msgResultadoGreen(signal, state) {
-  const titulo =
-    state === 'GREEN' ? '✅🏆 GREEENNN 🏆✅\n✨ Sem Gale ✨' :
-    state === 'G1'    ? '⚡🏆 GREEN G1 🏆⚡\n🐓 Gale 1' :
-                        '🔥🏆 GREEN G2 🏆🔥\n🐓 Gale 2';
-  return [
-    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
-    '📋 RESULTADO DO SINAL',
-    titulo,
-    `🎯 Entrada: ${corDisplay(signal.cor)}`,
-    `🔢 Sinal #${signal.id}`,
-    `🕒 ${horaAngola()}`
-  ].join('\n');
-}
-
-function msgResultadoLoss(signal) {
-  return [
-    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
-    '📋 RESULTADO DO SINAL',
-    '❌💔 LOSS FINAL 💔❌',
-    `🎯 Entrada: ${corDisplay(signal.cor)}`,
-    `🐓 Gale: ${signal.gale || 0}/${CONFIG.maxGale}`,
-    `🔢 Sinal #${signal.id}`,
-    `🕒 ${horaAngola()}`
+    `🎲 SINAL #${signal.id}`,
+    `Entrar: ${corDisplay(entry.cor)}`,
+    `📊 ${entry.nome} · confiança ${entry.confianca}%`,
+    `🛡️ Empate protegido · até G${CONFIG.maxGale}`,
+    `🕒 ${horaCurta()}`
   ].join('\n');
 }
 
 function msgGale(signal, nextGale) {
   return [
-    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
-    `🐓⚡ GALE ${nextGale} ⚡🐓`,
-    `🎯 Mantém: ${corDisplay(signal.cor)}`,
-    `🔢 Sinal #${signal.id}`,
-    `🕒 ${horaAngola()}`
+    `🐓 SINAL #${signal.id} · GALE ${nextGale}`,
+    `Mantém: ${corDisplay(signal.cor)}`
   ].join('\n');
 }
 
 function msgEmpate(signal) {
   return [
-    '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
-    '🟡🤝 EMPATE PROTEGIDO 🤝🟡',
-    `🔢 Sinal #${signal.id} segue pendente`,
-    `🎯 ${corDisplay(signal.cor)}`,
-    `🕒 ${horaAngola()}`
+    `🟡 SINAL #${signal.id} · EMPATE`,
+    `Segue pendente: ${corDisplay(signal.cor)}`
   ].join('\n');
+}
+
+function msgResultadoGreen(signal, state) {
+  const quando = state === 'GREEN' ? 'sem gale' : state === 'G1' ? 'no Gale 1' : 'no Gale 2';
+  return [
+    `✅ SINAL #${signal.id} · GREEN`,
+    `${corDisplay(signal.cor)} · ${quando}`
+  ].join('\n');
+}
+
+function msgResultadoLoss(signal) {
+  return [
+    `❌ SINAL #${signal.id} · LOSS`,
+    `${corDisplay(signal.cor)} · Gale ${signal.gale || 0}/${CONFIG.maxGale}`
+  ].join('\n');
+}
+
+// ====================== FILA DE MENSAGENS (OUTBOX) ======================
+// Toda mensagem é gravada na base ANTES de ir ao Telegram. Se o Telegram falhar, repete no ciclo seguinte.
+// A ordem das mensagens no Telegram é sempre a ordem em que os eventos aconteceram.
+let enviandoOutbox = false;
+
+async function enfileirar(texto, sinalId = null) {
+  const rodape = DEBUG_INSTANCIA ? `\n⚙️ ${VERSAO} · ${INSTANCIA}` : '';
+  await pool.query(`INSERT INTO outbox (sinal_id, texto) VALUES ($1, $2)`, [sinalId, texto + rodape]);
+}
+
+async function enviarOutbox() {
+  if (enviandoOutbox) return;
+  enviandoOutbox = true;
+  try {
+    const r = await pool.query(`SELECT id, texto, criado_em FROM outbox WHERE enviado_em IS NULL ORDER BY id ASC LIMIT 6`);
+    for (const m of r.rows) {
+      const claim = await pool.query(`UPDATE outbox SET enviado_em = NOW() WHERE id = $1 AND enviado_em IS NULL RETURNING id`, [m.id]);
+      if (!claim.rows.length) continue; // outro processo já pegou esta mensagem
+
+      if (Date.now() - new Date(m.criado_em).getTime() > 20 * 60 * 1000) {
+        log('OUTBOX', { id: m.id, msg: 'descartada: com mais de 20 min' });
+        continue;
+      }
+
+      const ok = await telegramSend(m.texto, { tentativas: 2 });
+      if (!ok) {
+        await pool.query(`UPDATE outbox SET enviado_em = NULL, tentativas = tentativas + 1 WHERE id = $1`, [m.id]);
+        log('OUTBOX', { id: m.id, msg: 'falhou, repete no próximo ciclo', erro: runtime.ultimoErroTelegram });
+        return;
+      }
+      await sleep(1100); // Telegram aceita ~1 mensagem por segundo por chat
+    }
+  } finally {
+    enviandoOutbox = false;
+  }
 }
 
 async function maybeCreateSignal(round) {
@@ -826,7 +806,7 @@ async function maybeCreateSignal(round) {
     return;
   }
 
-  const hist = await getRecentOutcomes(300);
+  const hist = await getRecentOutcomes(1500);
   const rows = hist.slice(0, 30);
   const entry = detectBestEntry(rows);
 
@@ -835,22 +815,15 @@ async function maybeCreateSignal(round) {
     return;
   }
 
-  // Dados extras para o cálculo da confiança
-  const empatesRecentes = (await pool.query(
-    `SELECT COUNT(*)::int AS c FROM (
-       SELECT resultado FROM mesa_resultados ORDER BY settled_at DESC NULLS LAST, observado_em DESC LIMIT 12
-     ) t WHERE resultado = 'Empate'`
-  )).rows[0].c;
-
-  const ultimos = (await pool.query(
-    `SELECT estado FROM sinais WHERE estado IN ('GREEN','G1','G2','LOSS') ORDER BY criado_em DESC LIMIT 5`
-  )).rows;
-  const fase = ultimos.length >= 3
-    ? ultimos.filter(x => x.estado !== 'LOSS').length / ultimos.length
-    : null;
-
-  const conf = computeConfidence(entry, rows, hist, empatesRecentes, fase);
+  const conf = computeConfidence(entry, hist);
   entry.confianca = conf.confianca;
+
+  // Filtro de qualidade: tipos de sinal que historicamente acertam menos que o mínimo não são enviados
+  if (conf.confianca < CONFIG.confMin) {
+    runtime.motivoSemSinal = `confianca_baixa_${conf.confianca}`;
+    log('FILTRADO', { estrategia: entry.nome, confianca: conf.confianca, minimo: CONFIG.confMin, calculo: conf.detalhe });
+    return;
+  }
 
   const refId = round.source_id || round.source_key;
   const jaUsada = await pool.query(`SELECT 1 FROM sinais WHERE resultado_id = $1 LIMIT 1`, [refId]);
@@ -879,7 +852,7 @@ async function maybeCreateSignal(round) {
   runtime.ultimaEstrategia = entry;
   runtime.motivoSemSinal = null;
 
-  await telegramSend(msgNovoSinal(entry));
+  await enfileirar(msgNovoSinal(entry, signal), signal.id);
   log('SINAL', { id: signal.id, cor: entry.cor, estrategia: entry.estrategia, instancia: INSTANCIA, confianca: entry.confianca, calculo: conf.detalhe });
 }
 
@@ -903,35 +876,55 @@ async function updateSinal(signal, round, campos) {
 
 // Aplica UMA rodada ao sinal. Devolve o sinal atualizado (ou null se outro processo já o alterou).
 async function aplicarRodada(signal, round) {
-  if (round.resultado === 'Empate' && CONFIG.empateProtegido) {
-    const upd = await updateSinal(signal, round, { empates: Number(signal.empates || 0) + 1 });
-    if (upd) await telegramSend(msgEmpate(signal));
-    return upd;
-  }
+  let upd = null;
+  let texto = null;
+  let fechou = false;
 
-  if (round.resultado === signal.cor) {
+  if (round.resultado === 'Empate' && CONFIG.empateProtegido) {
+    upd = await updateSinal(signal, round, { empates: Number(signal.empates || 0) + 1 });
+    if (upd) texto = msgEmpate(signal);
+  } else if (round.resultado === signal.cor) {
     const galeNum = Number(signal.gale || 0);
     const state = galeNum === 0 ? 'GREEN' : galeNum === 1 ? 'G1' : 'G2';
-    const upd = await updateSinal(signal, round, { estado: state, resultado_final: round.resultado });
+    upd = await updateSinal(signal, round, { estado: state, resultado_final: round.resultado });
     if (upd) {
-      const placar = await getPlacarDia();
-      await telegramSend(msgResultadoGreen(signal, state) + formatPlacar(placar));
+      fechou = true;
+      texto = msgResultadoGreen(signal, state);
     }
-    return upd;
+  } else {
+    const nextGale = Number(signal.gale || 0) + 1;
+    if (nextGale <= CONFIG.maxGale) {
+      upd = await updateSinal(signal, round, { gale: nextGale });
+      if (upd) texto = msgGale(signal, nextGale);
+    } else {
+      upd = await updateSinal(signal, round, { estado: 'LOSS', resultado_final: round.resultado });
+      if (upd) {
+        fechou = true;
+        texto = msgResultadoLoss(signal);
+      }
+    }
   }
 
-  const nextGale = Number(signal.gale || 0) + 1;
-  if (nextGale <= CONFIG.maxGale) {
-    const upd = await updateSinal(signal, round, { gale: nextGale });
-    if (upd) await telegramSend(msgGale(signal, nextGale));
-    return upd;
+  if (!upd) return null;
+
+  // O placar nunca pode impedir o resultado de ser anunciado
+  if (fechou) {
+    try {
+      texto += formatPlacar(await getPlacarDia());
+    } catch (e) {
+      log('PLACAR ERRO', e.message);
+    }
   }
 
-  const upd = await updateSinal(signal, round, { estado: 'LOSS', resultado_final: round.resultado });
-  if (upd) {
-    const placar = await getPlacarDia();
-    await telegramSend(msgResultadoLoss(signal) + formatPlacar(placar));
-  }
+  await enfileirar(texto, signal.id);
+  log('APLICADO', {
+    sinal: signal.id,
+    rodada: round.source_key,
+    resultado: round.resultado,
+    estado: upd.estado,
+    gale: upd.gale,
+    empates: upd.empates
+  });
   return upd;
 }
 
@@ -1023,6 +1016,7 @@ async function largarLideranca() {
 
 async function limparSinais() {
   await pool.query(`TRUNCATE TABLE sinais RESTART IDENTITY`);
+  await pool.query(`DELETE FROM outbox WHERE enviado_em IS NULL`);
   runtime.ultimoSinal = null;
   runtime.ultimaEstrategia = null;
   runtime.motivoSemSinal = null;
@@ -1076,9 +1070,10 @@ async function verificarResetDiario() {
   if (hora >= '00:00' && hora <= '00:04' && ultimoResetDia !== data) {
     // Nunca apaga sinal em andamento
     await pool.query(`DELETE FROM sinais WHERE estado <> 'PENDENTE'`);
+    await pool.query(`DELETE FROM outbox WHERE enviado_em IS NOT NULL AND enviado_em < NOW() - INTERVAL '2 days'`);
     ultimoResetDia = data;
     log('RESET', `Histórico limpo às 00h Angola (${data})`);
-    await telegramSend(`🧹 Histórico de sinais resetado\n🕛 00:00 Angola\n📅 ${data}`);
+    await telegramSend(`🧹 Novo dia · placar zerado (${data})`);
   }
 }
 
@@ -1144,7 +1139,7 @@ function requireAdmin(req, res, next) {
 
 app.get('/', (req, res) => {
   res.json({
-    nome: 'Capunga Dados — Unificado v3.8',
+    nome: 'Capunga Dados — Unificado v3.10',
     estado: 'online',
     horaAngola: horaAngola(),
     estrategias: ['REPETICAO', 'QUEBRA', 'DOIS_DOIS', 'SURF', 'FORCA', 'NUMERICA']
@@ -1218,6 +1213,24 @@ app.get('/sinais', async (req, res) => {
   }
 });
 
+app.get('/auditoria', async (req, res) => {
+  try {
+    await ensureSchema();
+    const sinais = (await pool.query(
+      `SELECT id, criado_em, cor, estado, gale, empates, estrategia, confianca, instancia, ultima_fim, passo
+       FROM sinais ORDER BY id DESC LIMIT 25`
+    )).rows;
+    const mensagens = (await pool.query(
+      `SELECT id, criado_em, sinal_id, enviado_em, tentativas, LEFT(REPLACE(texto, E'\n', ' | '), 110) AS inicio
+       FROM outbox ORDER BY id DESC LIMIT 25`
+    )).rows;
+    const lider = (await pool.query(`SELECT instancia, batimento FROM lider WHERE id = 1`)).rows[0] || null;
+    res.json({ sucesso: true, versao: VERSAO, estaInstancia: INSTANCIA, lider, alertaOutraInstancia: runtime.alertaOutraInstancia, sinais, mensagens });
+  } catch (e) {
+    res.status(500).json({ sucesso: false, erro: e.message });
+  }
+});
+
 app.post('/admin/sync', requireAdmin, async (req, res) => {
   await cicloPrincipal();
   res.json({ sucesso: true, lider: runtime.lider, instancia: INSTANCIA, motivoSemSinal: runtime.motivoSemSinal });
@@ -1234,7 +1247,7 @@ app.post('/admin/reset', requireAdmin, async (req, res) => {
 });
 
 app.post('/telegram/teste', requireAdmin, async (req, res) => {
-  const ok = await telegramSend(`🎲 CAPUNGA DADOS — Teste de conexão OK\n🕒 ${horaAngola()}`);
+  const ok = await telegramSend(`✅ Teste de conexão OK · ${horaCurta()}`);
   res.status(ok ? 200 : 502).json({ sucesso: ok, erro: runtime.ultimoErroTelegram });
 });
 
@@ -1281,6 +1294,7 @@ async function cicloPrincipal() {
     if (runtime.baselineFeito) await avaliarNovoSinal();
     else await fazerBaseline();
 
+    await enviarOutbox();
     await verificarOutraInstancia();
     await verificarResetDiario();
   } catch (err) {
@@ -1298,7 +1312,7 @@ async function start() {
 
   server = app.listen(PORT, '0.0.0.0', () => {
     console.log('==============================================');
-    console.log('   CAPUNGA DADOS — UNIFICADO v3.8');
+    console.log('   CAPUNGA DADOS — UNIFICADO v3.10');
     console.log(`   Instância: ${INSTANCIA}`);
     console.log(`   Porta: ${PORT}`);
     console.log(`   Angola: ${horaAngola()}`);
@@ -1340,5 +1354,5 @@ if (require.main === module) {
     process.exit(1);
   });
 } else {
-  module.exports = { aplicarRodada, updateSinal, processarPendente, avaliarNovoSinal, computeConfidence, telegramSend, runtime };
+  module.exports = { aplicarRodada, updateSinal, processarPendente, avaliarNovoSinal, enviarOutbox, enfileirar, computeConfidence, telegramSend, runtime };
 }
