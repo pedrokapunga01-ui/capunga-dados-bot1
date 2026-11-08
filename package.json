@@ -2,20 +2,20 @@
   "name": "capunga-bacbo-server-repaired",
   "version": "2.0.0",
   "private": true,
-  "description": "API Bac Bo com sincronização resiliente e liquidação explícita de empates",
+  "description": "Scraper headless de mesa Bac Bo com histórico persistente e detecção de lacunas",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "axios": "^1.7.9",
     "cors": "^2.8.5",
     "dotenv": "^18.0.9",
     "express": "^4.21.2",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "puppeteer": "^24.43.1"
   }
 }
