@@ -1,11 +1,13 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — UNIFICADO (v3.7)
+ * CAPUNGA DADOS — UNIFICADO (v3.8)
  *
  * Variáveis obrigatórias: DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
  * Opcional: RENDER_EXTERNAL_URL (Render define sozinho) -> auto-ping anti-sleep
  *
+ * v3.8: núcleo reescrito. Sinais resolvidos a partir da base (não dependem de quem gravou a rodada),
+ *       liderança por lease (sem advisory lock), reset só quando o deploy (commit) muda.
  * v3.7: liderança por lock no Postgres (impede 2 instâncias), alerta de instância estranha,
  *       resolução de sinais atômica e em ordem, só 1 PENDENTE (índice único), Telegram com retry.
  * v3.6: confiança do sinal (80-95%) na mensagem, índice multifatorial (computeConfidence).
@@ -24,7 +26,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('node:crypto');
-const { Pool, Client } = require('pg');
+const { Pool } = require('pg');
 
 const app = express();
 app.disable('x-powered-by');
@@ -39,7 +41,6 @@ const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
 const INSTANCIA = crypto.randomBytes(3).toString('hex');
-const LOCK_KEY = 727255;
 // RESET_RODADAS=true na Render também apaga o histórico de rodadas no deploy (o bot recarrega 50 da API)
 const RESET_RODADAS = String(process.env.RESET_RODADAS || '').toLowerCase() === 'true';
 
@@ -51,7 +52,7 @@ const CONFIG = {
   streakMin: 3,
   maxGale: 2,
   empateProtegido: true,
-  intervaloMinimoMs: 35000,
+  sinalVelhoMs: 10 * 60 * 1000,
   intervaloSyncMs: 6000
 };
 
@@ -268,6 +269,9 @@ async function ensureSchema() {
     await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS ultima_fim TIMESTAMPTZ`);
     await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS passo INTEGER NOT NULL DEFAULT 0`);
 
+    await pool.query(`CREATE TABLE IF NOT EXISTS lider (id INTEGER PRIMARY KEY, instancia TEXT, batimento TIMESTAMPTZ)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS meta (chave TEXT PRIMARY KEY, valor TEXT)`);
+
     // Garante, ao nível da base de dados, no máximo 1 sinal PENDENTE
     try {
       await pool.query(`
@@ -370,7 +374,7 @@ async function fetchRounds() {
       timeout: 15000,
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'CapungaDados/3.7',
+        'User-Agent': 'CapungaDados/3.8',
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache'
       }
@@ -815,16 +819,10 @@ async function maybeCreateSignal(round) {
     return;
   }
 
-  // Sinal em andamento: só um de cada vez. Nunca expira, resolve sempre por rodadas.
+  // Um sinal de cada vez. Nunca expira: fecha sempre com GREEN/G1/G2/LOSS.
   const pending = await getPendingSignal();
   if (pending) {
     runtime.motivoSemSinal = `em_andamento_#${pending.id}`;
-    return;
-  }
-
-  const last = (await pool.query(`SELECT criado_em FROM sinais ORDER BY criado_em DESC LIMIT 1`)).rows[0];
-  if (last?.criado_em && Date.now() - new Date(last.criado_em).getTime() < CONFIG.intervaloMinimoMs) {
-    runtime.motivoSemSinal = 'intervalo_minimo';
     return;
   }
 
@@ -903,19 +901,12 @@ async function updateSinal(signal, round, campos) {
   return r.rows[0] || null;
 }
 
-async function resolvePending(round) {
-  const signal = await getPendingSignal();
-  if (!signal) return;
-
-  // Só aceita rodadas ESTRITAMENTE posteriores à última aplicada (ou à rodada de entrada)
-  const base = new Date(signal.ultima_fim || signal.criado_em).getTime();
-  if (new Date(round.fim).getTime() <= base) return;
-
-  if (round.resultado === 'Empate') {
-    if (!CONFIG.empateProtegido) return;
+// Aplica UMA rodada ao sinal. Devolve o sinal atualizado (ou null se outro processo já o alterou).
+async function aplicarRodada(signal, round) {
+  if (round.resultado === 'Empate' && CONFIG.empateProtegido) {
     const upd = await updateSinal(signal, round, { empates: Number(signal.empates || 0) + 1 });
     if (upd) await telegramSend(msgEmpate(signal));
-    return;
+    return upd;
   }
 
   if (round.resultado === signal.cor) {
@@ -926,14 +917,14 @@ async function resolvePending(round) {
       const placar = await getPlacarDia();
       await telegramSend(msgResultadoGreen(signal, state) + formatPlacar(placar));
     }
-    return;
+    return upd;
   }
 
   const nextGale = Number(signal.gale || 0) + 1;
   if (nextGale <= CONFIG.maxGale) {
     const upd = await updateSinal(signal, round, { gale: nextGale });
     if (upd) await telegramSend(msgGale(signal, nextGale));
-    return;
+    return upd;
   }
 
   const upd = await updateSinal(signal, round, { estado: 'LOSS', resultado_final: round.resultado });
@@ -941,45 +932,133 @@ async function resolvePending(round) {
     const placar = await getPlacarDia();
     await telegramSend(msgResultadoLoss(signal) + formatPlacar(placar));
   }
+  return upd;
+}
+
+async function getLatestRound() {
+  const r = await pool.query(
+    `SELECT source_key, source_id, resultado, settled_at AS fim
+     FROM mesa_resultados
+     ORDER BY settled_at DESC NULLS LAST, observado_em DESC
+     LIMIT 1`
+  );
+  return r.rows[0] || null;
+}
+
+async function getRoundsAfter(fim, limit = 30) {
+  const r = await pool.query(
+    `SELECT source_key, source_id, resultado, settled_at AS fim
+     FROM mesa_resultados
+     WHERE settled_at > $1
+     ORDER BY settled_at ASC
+     LIMIT $2`,
+    [fim, limit]
+  );
+  return r.rows;
+}
+
+let limpezaInicialFeita = false;
+let ultimaRodadaAvaliada = null;
+
+// Resolve o sinal pendente usando as rodadas que estão na BASE, em ordem.
+// Não depende de quem gravou a rodada nem de quando ela chegou.
+async function processarPendente() {
+  let signal = await getPendingSignal();
+  if (!signal) {
+    limpezaInicialFeita = true;
+    return;
+  }
+
+  const base = new Date(signal.ultima_fim || signal.criado_em);
+
+  // Só no primeiro ciclo após um reinício: sinal esquecido de há muito tempo é descartado
+  if (!limpezaInicialFeita) {
+    limpezaInicialFeita = true;
+    if (Date.now() - base.getTime() > CONFIG.sinalVelhoMs) {
+      await pool.query(`UPDATE sinais SET estado = 'CANCELADO' WHERE id = $1 AND estado = 'PENDENTE'`, [signal.id]);
+      log('SINAL VELHO', { id: signal.id, msg: 'Pendente de antes do reinício, descartado sem contar no placar' });
+      return;
+    }
+  }
+
+  const rounds = await getRoundsAfter(base);
+  for (const round of rounds) {
+    const upd = await aplicarRodada(signal, round);
+    if (!upd) return;                    // outro processo alterou: tenta no próximo ciclo
+    if (upd.estado !== 'PENDENTE') return; // fechou
+    signal = upd;
+  }
+}
+
+// Avalia a rodada mais recente UMA vez (e só depois do baseline)
+async function avaliarNovoSinal() {
+  const latest = await getLatestRound();
+  if (!latest) return;
+  if (ultimaRodadaAvaliada === latest.source_key) return;
+  ultimaRodadaAvaliada = latest.source_key;
+  await maybeCreateSignal(latest);
 }
 
 // ====================== LIDERANÇA / OUTRA INSTÂNCIA ======================
-let lockClient = null;
-let resetInicialFeito = false;
+let lideradoDesde = null;
+let resetVerificado = false;
 let ultimoAvisoStandby = 0;
 let ultimoAvisoEstranha = 0;
 
-async function tryAcquireLeadership() {
-  const client = new Client({
-    connectionString: DATABASE_URL,
-    ssl: isLocalDb ? false : { rejectUnauthorized: false },
-    keepAlive: true
-  });
-  client.on('error', err => {
-    log('LOCK ERRO', err.message);
-    runtime.lider = false;
-    lockClient = null;
-  });
-  await client.connect();
-  const r = await client.query('SELECT pg_try_advisory_lock($1) AS ok', [LOCK_KEY]);
-  if (r.rows[0].ok) {
-    lockClient = client;
-    runtime.lider = true;
-    return true;
-  }
-  await client.end().catch(() => {});
-  return false;
+// Lease: quem renova o batimento é o líder. Se parar de renovar por 60s, outro assume.
+async function renovarLideranca() {
+  const r = await pool.query(
+    `INSERT INTO lider (id, instancia, batimento) VALUES (1, $1, NOW())
+     ON CONFLICT (id) DO UPDATE SET instancia = EXCLUDED.instancia, batimento = NOW()
+     WHERE lider.instancia = EXCLUDED.instancia OR lider.batimento < NOW() - INTERVAL '60 seconds'
+     RETURNING instancia`,
+    [INSTANCIA]
+  );
+  return r.rows.length > 0;
 }
 
-// Depois do reset inicial, qualquer sinal que não foi criado por esta instância vem de outro processo
+async function largarLideranca() {
+  await pool.query(`UPDATE lider SET batimento = to_timestamp(0) WHERE id = 1 AND instancia = $1`, [INSTANCIA]);
+}
+
+async function limparSinais() {
+  await pool.query(`TRUNCATE TABLE sinais RESTART IDENTITY`);
+  runtime.ultimoSinal = null;
+  runtime.ultimaEstrategia = null;
+  runtime.motivoSemSinal = null;
+}
+
+// Deploy novo (commit diferente) => começo limpo. Reinício do mesmo deploy => mantém tudo.
+async function resetarSeNovoDeploy() {
+  const deployAtual = process.env.RENDER_GIT_COMMIT || INSTANCIA;
+  const r = await pool.query(`SELECT valor FROM meta WHERE chave = 'deploy'`);
+  const anterior = r.rows[0]?.valor || null;
+
+  if (anterior !== deployAtual) {
+    await limparSinais();
+    if (RESET_RODADAS) await pool.query(`TRUNCATE TABLE mesa_resultados`);
+    await pool.query(
+      `INSERT INTO meta (chave, valor) VALUES ('deploy', $1)
+       ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor`,
+      [deployAtual]
+    );
+    log('RESET', { motivo: 'novo deploy', sinais: 'apagados', numeracao: 'reiniciada', rodadas: RESET_RODADAS ? 'apagadas' : 'mantidas' });
+  } else {
+    log('RETOMADA', 'Mesmo deploy: sinais e placar mantidos');
+  }
+}
+
+// Sinais criados DEPOIS de esta instância assumir, mas por outro processo => há uma instância estranha
 async function verificarOutraInstancia() {
   const r = await pool.query(
-    `SELECT id, instancia, criado_em FROM sinais WHERE instancia IS DISTINCT FROM $1 ORDER BY id DESC LIMIT 3`,
-    [INSTANCIA]
+    `SELECT id, instancia, criado_em FROM sinais
+     WHERE criado_em >= $2 AND instancia IS DISTINCT FROM $1
+     ORDER BY id DESC LIMIT 3`,
+    [INSTANCIA, lideradoDesde || new Date()]
   );
   if (r.rows.length) {
     runtime.alertaOutraInstancia = {
-      msg: 'Existem sinais criados por OUTRA instância usando a mesma base de dados',
+      msg: 'Há sinais criados por OUTRO processo usando a mesma base de dados. Suspenda o outro serviço.',
       exemplos: r.rows.map(x => ({ id: x.id, instancia: x.instancia || 'versao-antiga', criado_em: x.criado_em }))
     };
     if (Date.now() - ultimoAvisoEstranha > 60000) {
@@ -1004,6 +1083,7 @@ async function verificarResetDiario() {
 }
 
 // ====================== SYNC ======================
+// Só busca na API e grava as rodadas. Sinais são tratados depois, a partir da base.
 async function syncOnce() {
   if (!pool) throw new Error('DATABASE_URL não configurada');
   if (runtime.sincronizacaoEmCurso) return { sucesso: false, ignorada: true };
@@ -1016,31 +1096,11 @@ async function syncOnce() {
 
     let inserted = 0;
     let duplicates = 0;
-    let ultimaNova = null;
 
     for (const round of rounds) {
       const saved = await insertRound(round);
-      if (!saved) {
-        duplicates++;
-        continue;
-      }
-      inserted++;
-      ultimaNova = round;
-
-      // Só resolve sinais depois do baseline (evita processar histórico antigo)
-      if (runtime.baselineFeito) {
-        await resolvePending(round);
-      }
-    }
-
-    // Um único sinal por ciclo, com base na rodada mais recente
-    if (runtime.baselineFeito && ultimaNova) {
-      await maybeCreateSignal(ultimaNova);
-    }
-
-    if (!runtime.baselineFeito && rounds.length > 0) {
-      runtime.baselineFeito = true;
-      log('BASELINE', { guardadas: inserted, msg: 'Histórico carregado. Sinais ativos a partir de agora.' });
+      if (saved) inserted++;
+      else duplicates++;
     }
 
     runtime.ultimaSincronizacao = new Date().toISOString();
@@ -1051,10 +1111,9 @@ async function syncOnce() {
     if (inserted > 0) {
       runtime.ultimaRodadaNova = new Date().toISOString();
       runtime.ciclosSemNovos = 0;
-      log('NOVAS RODADAS', { quantidade: inserted, ultima: ultimaNova?.resultado, motivo: runtime.motivoSemSinal });
+      log('NOVAS RODADAS', { quantidade: inserted, motivo: runtime.motivoSemSinal });
     } else {
       runtime.ciclosSemNovos = (runtime.ciclosSemNovos || 0) + 1;
-      // evita spam: loga a cada 10 ciclos sem novidades
       if (runtime.ciclosSemNovos % 10 === 1) {
         log('SYNC', {
           novos: 0,
@@ -1085,7 +1144,7 @@ function requireAdmin(req, res, next) {
 
 app.get('/', (req, res) => {
   res.json({
-    nome: 'Capunga Dados — Unificado v3.7',
+    nome: 'Capunga Dados — Unificado v3.8',
     estado: 'online',
     horaAngola: horaAngola(),
     estrategias: ['REPETICAO', 'QUEBRA', 'DOIS_DOIS', 'SURF', 'FORCA', 'NUMERICA']
@@ -1160,13 +1219,14 @@ app.get('/sinais', async (req, res) => {
 });
 
 app.post('/admin/sync', requireAdmin, async (req, res) => {
-  const result = await syncOnce();
-  res.status(result.sucesso ? 200 : 500).json(result);
+  await cicloPrincipal();
+  res.json({ sucesso: true, lider: runtime.lider, instancia: INSTANCIA, motivoSemSinal: runtime.motivoSemSinal });
 });
 
-app.post('/admin/limpar-sinais', requireAdmin, async (req, res) => {
+app.post('/admin/reset', requireAdmin, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM sinais`);
+    await limparSinais();
+    log('RESET', { motivo: 'manual (/admin/reset)' });
     res.json({ sucesso: true });
   } catch (e) {
     res.status(500).json({ sucesso: false, erro: e.message });
@@ -1181,40 +1241,46 @@ app.post('/telegram/teste', requireAdmin, async (req, res) => {
 // ====================== START ======================
 let cicloEmCurso = false;
 
+async function fazerBaseline() {
+  const latest = await getLatestRound();
+  if (!latest) return;
+  ultimaRodadaAvaliada = latest.source_key;
+  runtime.baselineFeito = true;
+  log('BASELINE', { msg: 'Histórico carregado. Sinais ativos a partir da próxima rodada.' });
+}
+
 async function cicloPrincipal() {
   if (cicloEmCurso) return;
   cicloEmCurso = true;
   try {
+    await ensureSchema();
+
+    const lider = await renovarLideranca();
+    if (!lider) {
+      runtime.lider = false;
+      if (Date.now() - ultimoAvisoStandby > 60000) {
+        ultimoAvisoStandby = Date.now();
+        log('STANDBY', `Instância ${INSTANCIA} em espera: outra instância é a líder`);
+      }
+      return;
+    }
+
     if (!runtime.lider) {
-      let ok = false;
-      try {
-        ok = await tryAcquireLeadership();
-      } catch (e) {
-        log('LOCK ERRO', e.message);
-      }
-      if (!ok) {
-        if (Date.now() - ultimoAvisoStandby > 60000) {
-          ultimoAvisoStandby = Date.now();
-          log('STANDBY', `Instância ${INSTANCIA} em espera: outra instância é a líder (lock ocupado)`);
-        }
-        return;
-      }
+      runtime.lider = true;
       log('LIDER', `Instância ${INSTANCIA} assumiu a liderança`);
-      if (!resetInicialFeito) {
-        // Deploy = começo limpo: apaga todos os sinais e reinicia a numeração (#1, #2...)
-        await pool.query(`TRUNCATE TABLE sinais RESTART IDENTITY`);
-        if (RESET_RODADAS) {
-          await pool.query(`TRUNCATE TABLE mesa_resultados`);
-        }
-        resetInicialFeito = true;
-        runtime.ultimoSinal = null;
-        runtime.ultimaEstrategia = null;
-        runtime.motivoSemSinal = null;
-        log('RESET', { sinais: 'apagados', numeracao: 'reiniciada', rodadas: RESET_RODADAS ? 'apagadas' : 'mantidas' });
+      if (!resetVerificado) {
+        await resetarSeNovoDeploy();
+        resetVerificado = true;
       }
+      lideradoDesde = new Date();
     }
 
     await syncOnce();
+    await processarPendente();
+
+    if (runtime.baselineFeito) await avaliarNovoSinal();
+    else await fazerBaseline();
+
     await verificarOutraInstancia();
     await verificarResetDiario();
   } catch (err) {
@@ -1232,7 +1298,7 @@ async function start() {
 
   server = app.listen(PORT, '0.0.0.0', () => {
     console.log('==============================================');
-    console.log('   CAPUNGA DADOS — UNIFICADO v3.7');
+    console.log('   CAPUNGA DADOS — UNIFICADO v3.8');
     console.log(`   Instância: ${INSTANCIA}`);
     console.log(`   Porta: ${PORT}`);
     console.log(`   Angola: ${horaAngola()}`);
@@ -1255,8 +1321,10 @@ async function start() {
 async function shutdown() {
   if (syncTimer) clearInterval(syncTimer);
   if (pingTimer) clearInterval(pingTimer);
+  try {
+    if (pool && runtime.lider) await largarLideranca();
+  } catch (_) {}
   if (server) server.close();
-  if (lockClient) await lockClient.end().catch(() => {});
   if (pool) await pool.end();
   process.exit(0);
 }
@@ -1272,5 +1340,5 @@ if (require.main === module) {
     process.exit(1);
   });
 } else {
-  module.exports = { resolvePending, updateSinal, computeConfidence, telegramSend, runtime };
+  module.exports = { aplicarRodada, updateSinal, processarPendente, avaliarNovoSinal, computeConfidence, telegramSend, runtime };
 }
