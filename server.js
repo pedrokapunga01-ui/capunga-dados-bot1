@@ -1,13 +1,15 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — UNIFICADO (Versão Final)
+ * CAPUNGA DADOS — UNIFICADO (v3.3 Final)
  * 
- * - Usa a API robusta do coletor (api-cs.casino.org com parâmetros completos)
- * - Multi-estratégia + Confiança mínima 80%
- * - Telegram com confiança em texto
- * - Apenas 4 variáveis obrigatórias
- * - Reset só às 00h Angola ou no deploy
+ * Apenas 4 variáveis obrigatórias:
+ * DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
+ * 
+ * - Sem limite de reds
+ * - Sem confiança
+ * - Sinais 24h
+ * - Reset automático no start + 00h Angola
  */
 
 const express = require('express');
@@ -22,31 +24,25 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
 // ====================== CONFIGURAÇÃO ======================
-// Apenas estas 4 são obrigatórias:
 const PORT = Number(process.env.PORT || 10000);
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// API robusta (mesma do segundo server / coletor)
 const API_BACBO = 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
 
-// Configurações internas (não precisa de env)
 const CONFIG = {
   sinaisAtivos: true,
   streakMin: 3,
   maxGale: 2,
   empateProtegido: true,
-  maxRedsDia: 12,
   intervaloMinimoMs: 35000,
   sinalExpiraMin: 8,
-  intervaloSyncMs: 6000,          // verifica a cada 6 segundos
-  confiancaMinima: 80,            // mínimo 80%
-  resetSinaisOnStart: false       // true só quando quiser limpar no deploy
+  intervaloSyncMs: 6000
 };
 
-// ====================== BANCO DE DADOS ======================
+// ====================== BANCO ======================
 const isLocalDb = /localhost|127\.0\.0\.1/i.test(DATABASE_URL);
 const pool = DATABASE_URL
   ? new Pool({
@@ -71,7 +67,8 @@ const runtime = {
   motivoSemSinal: null,
   ciclosSemNovos: 0,
   ultimaMensagemTelegram: null,
-  ultimoErroTelegram: null
+  ultimoErroTelegram: null,
+  ultimoLogAPI: null
 };
 
 let schemaPromise = null;
@@ -131,12 +128,16 @@ function validDate(value) {
 function extractItems(body) {
   if (Array.isArray(body)) return body;
   if (!body || typeof body !== 'object') return [];
+  
   const candidates = [
-    body.data, body.results, body.items, body.resultados, body.rounds, body.events,
-    body.data?.results, body.data?.items, body.data?.resultados, body.data?.rounds,
-    body.data?.events, body.data?.data
+    body, body.data, body.results, body.items, body.resultados, body.rounds, body.events, body.content,
+    body.data?.results, body.data?.items, body.data?.resultados, body.data?.rounds, body.data?.events, body.data?.data, body.data?.content
   ];
-  return candidates.find(Array.isArray) || [];
+  
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length > 0) return c;
+  }
+  return [];
 }
 
 function resultSignature(r) {
@@ -206,11 +207,9 @@ async function ensureSchema() {
         resultado_final TEXT,
         empates INTEGER NOT NULL DEFAULT 0,
         estrategia TEXT,
-        confianca INTEGER,
         nome_estrategia TEXT
       )
     `);
-    await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS confianca INTEGER`);
     await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS nome_estrategia TEXT`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_estado ON sinais (estado)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_criado ON sinais (criado_em DESC)`);
@@ -221,79 +220,152 @@ async function ensureSchema() {
   try { await schemaPromise; } catch (e) { schemaPromise = null; throw e; }
 }
 
-// ====================== COLETA (API robusta) ======================
+// ====================== COLETA ======================
 function normalizeRound(item) {
-  const d = item?.data || item?.round || item || {};
-  const r = (d.result && typeof d.result === 'object') ? d.result : (item?.result && typeof item.result === 'object' ? item.result : {});
-  
-  const fim = validDate(d.settledAt ?? d.endTime ?? d.endedAt ?? d.finishedAt ?? d.fim ?? item?.settledAt ?? item?.fim);
-  const rawOutcome = r.outcome ?? r.resultado ?? r.winner ?? d.outcome ?? d.resultado ?? d.winner ?? item?.outcome ?? item?.resultado ?? (typeof d.result === 'string' ? d.result : null);
-  const resultado = normalizeOutcome(rawOutcome);
-  
-  const id = String(d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? item?.id ?? item?.roundId ?? item?.eventId ?? '').trim();
-  
-  if (!resultado) return null;
+  try {
+    const d = item?.data || item?.round || item || {};
+    const r = (d.result && typeof d.result === 'object') ? d.result :
+              (item?.result && typeof item.result === 'object') ? item.result : {};
 
-  const scoreJogador = Number(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
-  const scoreBanca = Number(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
+    const rawOutcome =
+      r.outcome ?? r.resultado ?? r.winner ??
+      d.outcome ?? d.resultado ?? d.winner ??
+      item?.outcome ?? item?.resultado ?? item?.winner ??
+      (typeof d.result === 'string' ? d.result : null) ??
+      (typeof item?.result === 'string' ? item.result : null);
 
-  const round = {
-    source_id: id || null,
-    resultado,
-    fim: fim || new Date().toISOString(),
-    pontos_jogador: Number.isFinite(scoreJogador) ? scoreJogador : null,
-    pontos_banca: Number.isFinite(scoreBanca) ? scoreBanca : null,
-    multiplicador: r.multiplier ?? d.multiplier ?? null
-  };
+    const resultado = normalizeOutcome(rawOutcome);
+    if (!resultado) return null;
 
-  round.source_key = id ? `id:\( {id}` : `hash: \){resultSignature(round)}`;
-  return round;
+    const id = String(
+      d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? d.gameId ??
+      item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? ''
+    ).trim() || null;
+
+    const fim = validDate(
+      d.settledAt ?? d.settled_at ?? d.endTime ?? d.endedAt ?? d.finishedAt ??
+      d.fim ?? item?.settledAt ?? item?.settled_at ?? item?.finishedAt ?? item?.fim
+    ) || new Date().toISOString();
+
+    const scoreJogador = Number(
+      r.playerDice?.score ?? d.playerDice?.score ??
+      d.playerScore ?? d.player_score ?? d.pontos_jogador ??
+      r.player?.score ?? d.player?.score
+    );
+
+    const scoreBanca = Number(
+      r.bankerDice?.score ?? d.bankerDice?.score ??
+      d.bankerScore ?? d.banker_score ?? d.pontos_banca ??
+      r.banker?.score ?? d.banker?.score
+    );
+
+    const round = {
+      source_id: id,
+      resultado,
+      fim,
+      pontos_jogador: Number.isFinite(scoreJogador) ? scoreJogador : null,
+      pontos_banca: Number.isFinite(scoreBanca) ? scoreBanca : null,
+      multiplicador: r.multiplier ?? d.multiplier ?? null
+    };
+
+    round.source_key = id ? `id:\( {id}` : `hash: \){resultSignature(round)}`;
+    return round;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function fetchRounds() {
-  const response = await axios.get(API_BACBO, {
-    timeout: 15000,
-    headers: { 
-      Accept: 'application/json', 
-      'User-Agent': 'CapungaDados/3.0',
-      'Cache-Control': 'no-cache'
+  try {
+    const response = await axios.get(API_BACBO, {
+      timeout: 15000,
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'CapungaDados/3.3',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache'
+      }
+    });
+
+    const items = extractItems(response.data);
+
+    if (!items.length) {
+      runtime.ultimoLogAPI = { recebidos: 0, msg: 'API retornou lista vazia' };
+      log('API', 'Lista vazia');
+      return [];
     }
-  });
-  
-  const items = extractItems(response.data);
-  const unique = new Map();
-  
-  for (const item of items) {
-    const round = normalizeRound(item);
-    if (round) unique.set(round.source_key, round);
+
+    const unique = new Map();
+    let normalizados = 0;
+
+    for (const item of items) {
+      const round = normalizeRound(item);
+      if (round) {
+        unique.set(round.source_key, round);
+        normalizados++;
+      }
+    }
+
+    const rounds = [...unique.values()].sort(
+      (a, b) => new Date(a.fim) - new Date(b.fim)
+    );
+
+    const maisRecente = rounds.length ? rounds[rounds.length - 1].fim : null;
+
+    runtime.ultimoLogAPI = {
+      recebidos: items.length,
+      normalizados,
+      unicos: rounds.length,
+      maisRecente
+    };
+
+    log('API', runtime.ultimoLogAPI);
+
+    return rounds;
+  } catch (error) {
+    runtime.ultimoLogAPI = { erro: error.message };
+    log('API ERRO', error.message);
+    throw error;
   }
-  
-  // Ordena do mais antigo para o mais recente
-  return [...unique.values()].sort((a, b) => new Date(a.fim) - new Date(b.fim));
 }
 
 async function insertRound(round) {
   const result = await pool.query(
-    `INSERT INTO mesa_resultados (source_key, source_id, resultado, settled_at, player_score, banker_score, multiplier, id_reliable, source)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-     ON CONFLICT (source_key) DO NOTHING RETURNING source_key`,
-    [round.source_key, round.source_id, round.resultado, round.fim, round.pontos_jogador, round.pontos_banca, round.multiplicador, Boolean(round.source_id), 'api']
+    `INSERT INTO mesa_resultados (
+      source_key, source_id, resultado, settled_at,
+      player_score, banker_score, multiplier, id_reliable, source
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    ON CONFLICT (source_key) DO NOTHING
+    RETURNING source_key`,
+    [
+      round.source_key,
+      round.source_id,
+      round.resultado,
+      round.fim,
+      round.pontos_jogador,
+      round.pontos_banca,
+      round.multiplicador,
+      Boolean(round.source_id),
+      'api'
+    ]
   );
   return result.rows.length > 0;
 }
 
 async function getRecentOutcomes(limit = 40) {
   const result = await pool.query(
-    `SELECT source_id as id, resultado, settled_at as fim, player_score as pontos_jogador, banker_score as pontos_banca
+    `SELECT source_id as id, resultado, settled_at as fim,
+            player_score as pontos_jogador, banker_score as pontos_banca
      FROM mesa_resultados
      WHERE resultado IN ('Jogador', 'Banca')
      ORDER BY settled_at DESC NULLS LAST, observado_em DESC
-     LIMIT $1`, [limit]
+     LIMIT $1`,
+    [limit]
   );
   return result.rows;
 }
 
-// ====================== ESTRATÉGIAS + CONFIANÇA ======================
+// ====================== ESTRATÉGIAS ======================
 function streakLen(rows) {
   if (!rows.length) return 0;
   const c = rows[0].resultado;
@@ -306,22 +378,12 @@ function streakLen(rows) {
   return n;
 }
 
-function calcConfianca(prioridade) {
-  const conf = Math.min(98, Math.max(80, Math.round(prioridade * 1.05)));
-  let nivel = 'Alta';
-  if (conf >= 92) nivel = 'Muito Alta';
-  else if (conf >= 86) nivel = 'Alta';
-  else nivel = 'Boa';
-  return { confianca: conf, nivel };
-}
-
 function stratRepeticao(rows) {
   const n = streakLen(rows);
   if (n < CONFIG.streakMin) return null;
   const cor = rows[0].resultado;
   const prioridade = Math.min(92, 60 + n * 8);
-  const { confianca, nivel } = calcConfianca(prioridade);
-  return { cor, estrategia: 'REPETICAO', nome: `Repetição x${n}`, emoji: '🔁', prioridade, confianca, nivel };
+  return { cor, estrategia: 'REPETICAO', nome: `Repetição x${n}`, emoji: '🔁', prioridade };
 }
 
 function stratQuebra(rows) {
@@ -330,22 +392,19 @@ function stratQuebra(rows) {
   const cor = oposta(rows[0].resultado);
   if (!cor) return null;
   const prioridade = Math.min(90, 62 + n * 7);
-  const { confianca, nivel } = calcConfianca(prioridade);
-  return { cor, estrategia: 'QUEBRA', nome: `Quebra x${n}`, emoji: '💥', prioridade, confianca, nivel };
+  return { cor, estrategia: 'QUEBRA', nome: `Quebra x${n}`, emoji: '💥', prioridade };
 }
 
 function stratDoisDois(rows) {
   if (rows.length < 4) return null;
   const r = rows.map(x => x.resultado);
-  
+
   if (r[0] === r[1] && r[2] === r[3] && r[0] !== r[2]) {
-    const { confianca, nivel } = calcConfianca(86);
-    return { cor: r[0], estrategia: 'DOIS_DOIS', nome: '2+2 (bloco)', emoji: '♟️', prioridade: 86, confianca, nivel };
+    return { cor: r[0], estrategia: 'DOIS_DOIS', nome: '2+2 (bloco)', emoji: '♟️', prioridade: 86 };
   }
-  
-  if (rows.length >= 3 && r[0] !== r[1] && r[1] === r[2] && ['Jogador','Banca'].includes(r[0])) {
-    const { confianca, nivel } = calcConfianca(83);
-    return { cor: r[0], estrategia: 'DOIS_DOIS', nome: '2+2 (completa)', emoji: '♟️', prioridade: 83, confianca, nivel };
+
+  if (rows.length >= 3 && r[0] !== r[1] && r[1] === r[2] && ['Jogador', 'Banca'].includes(r[0])) {
+    return { cor: r[0], estrategia: 'DOIS_DOIS', nome: '2+2 (completa)', emoji: '♟️', prioridade: 83 };
   }
   return null;
 }
@@ -354,33 +413,30 @@ function stratSurf(rows) {
   if (rows.length < 4) return null;
   const a = rows[0].resultado;
   const b = rows[1].resultado;
-  if (!['Jogador','Banca'].includes(a) || !['Jogador','Banca'].includes(b) || a === b) return null;
-  
+  if (!['Jogador', 'Banca'].includes(a) || !['Jogador', 'Banca'].includes(b) || a === b) return null;
+
   for (let i = 0; i < 4; i++) {
     if (rows[i]?.resultado !== (i % 2 === 0 ? a : b)) return null;
   }
-  
-  const { confianca, nivel } = calcConfianca(84);
-  return { cor: b, estrategia: 'SURF', nome: 'Surf (alternado)', emoji: '🌊', prioridade: 84, confianca, nivel };
+
+  return { cor: b, estrategia: 'SURF', nome: 'Surf (alternado)', emoji: '🌊', prioridade: 84 };
 }
 
 function stratForca(rows) {
-  const sample = rows.slice(0, 12).filter(r => ['Jogador','Banca'].includes(r.resultado));
+  const sample = rows.slice(0, 12).filter(r => ['Jogador', 'Banca'].includes(r.resultado));
   if (sample.length < 9) return null;
-  
+
   let j = 0, b = 0;
   for (const r of sample) r.resultado === 'Jogador' ? j++ : b++;
   const total = j + b;
   const pctB = b / total;
   const pctJ = j / total;
-  
+
   if (pctB >= 0.68) {
-    const { confianca, nivel } = calcConfianca(82);
-    return { cor: 'Banca', estrategia: 'FORCA', nome: `Força Banca ${Math.round(pctB*100)}%`, emoji: '💪', prioridade: 82, confianca, nivel };
+    return { cor: 'Banca', estrategia: 'FORCA', nome: `Força Banca ${Math.round(pctB * 100)}%`, emoji: '💪', prioridade: 82 };
   }
   if (pctJ >= 0.68) {
-    const { confianca, nivel } = calcConfianca(82);
-    return { cor: 'Jogador', estrategia: 'FORCA', nome: `Força Jogador ${Math.round(pctJ*100)}%`, emoji: '💪', prioridade: 82, confianca, nivel };
+    return { cor: 'Jogador', estrategia: 'FORCA', nome: `Força Jogador ${Math.round(pctJ * 100)}%`, emoji: '💪', prioridade: 82 };
   }
   return null;
 }
@@ -393,12 +449,10 @@ function stratNumerica(rows) {
   if (!Number.isFinite(pj) || !Number.isFinite(pb)) return null;
 
   if (last.resultado === 'Jogador' && pj >= 10 && pj > pb) {
-    const { confianca, nivel } = calcConfianca(81);
-    return { cor: 'Jogador', estrategia: 'NUMERICA', nome: `Numérica Alta J(${pj})`, emoji: '🔢', prioridade: 81, confianca, nivel };
+    return { cor: 'Jogador', estrategia: 'NUMERICA', nome: `Numérica Alta J(${pj})`, emoji: '🔢', prioridade: 81 };
   }
   if (last.resultado === 'Banca' && pb >= 10 && pb > pj) {
-    const { confianca, nivel } = calcConfianca(81);
-    return { cor: 'Banca', estrategia: 'NUMERICA', nome: `Numérica Alta B(${pb})`, emoji: '🔢', prioridade: 81, confianca, nivel };
+    return { cor: 'Banca', estrategia: 'NUMERICA', nome: `Numérica Alta B(${pb})`, emoji: '🔢', prioridade: 81 };
   }
   return null;
 }
@@ -415,31 +469,19 @@ function detectBestEntry(rows) {
     stratNumerica(rows)
   ].filter(Boolean);
 
-  // Só aceita ≥ 80%
-  const validos = candidatos.filter(c => c.confianca >= CONFIG.confiancaMinima);
-  if (!validos.length) return null;
+  if (!candidatos.length) return null;
 
   const ordem = { REPETICAO: 6, QUEBRA: 5, DOIS_DOIS: 4, SURF: 3, FORCA: 2, NUMERICA: 1 };
-  
-  validos.sort((a, b) => {
-    if (b.confianca !== a.confianca) return b.confianca - a.confianca;
+
+  candidatos.sort((a, b) => {
     if (b.prioridade !== a.prioridade) return b.prioridade - a.prioridade;
     return (ordem[b.estrategia] || 0) - (ordem[a.estrategia] || 0);
   });
 
-  return validos[0];
+  return candidatos[0];
 }
 
-// ====================== GESTÃO DE SINAIS ======================
-async function redsToday() {
-  const r = await pool.query(`
-    SELECT COUNT(*)::int AS total FROM sinais
-    WHERE estado = 'LOSS'
-      AND criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
-  `);
-  return r.rows[0]?.total || 0;
-}
-
+// ====================== SINAIS ======================
 async function getPlacarDia() {
   const r = await pool.query(`
     SELECT
@@ -452,9 +494,9 @@ async function getPlacarDia() {
     WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
       AND estado IN ('GREEN','G1','G2','LOSS')
   `);
-  const s = r.rows[0] || { green:0, g1:0, g2:0, loss:0, empates:0 };
-  const acertos = (s.green||0) + (s.g1||0) + (s.g2||0);
-  const finalizados = acertos + (s.loss||0);
+  const s = r.rows[0] || { green: 0, g1: 0, g2: 0, loss: 0, empates: 0 };
+  const acertos = (s.green || 0) + (s.g1 || 0) + (s.g2 || 0);
+  const finalizados = acertos + (s.loss || 0);
   const percent = finalizados > 0 ? Number(((acertos / finalizados) * 100).toFixed(1)) : 100;
   return { ...s, percent };
 }
@@ -482,7 +524,7 @@ async function expirePendingSignal(signal) {
   if (!signal) return false;
   const age = Date.now() - new Date(signal.criado_em).getTime();
   if (age < CONFIG.sinalExpiraMin * 60000) return false;
-  
+
   await pool.query(`UPDATE sinais SET estado = 'CANCELADO' WHERE id = $1 AND estado = 'PENDENTE'`, [signal.id]);
   await telegramSend(`⏰ Sinal #${signal.id} expirado\n🕒 ${horaAngola()}`);
   return true;
@@ -496,7 +538,6 @@ function msgNovoSinal(entry) {
     '━━━━━━━━━━━━━━━━━━━━',
     `🎯 Cor: ${corDisplay(entry.cor)}`,
     `${entry.emoji} Estratégia: ${entry.nome}`,
-    `📈 Confiança: \( {entry.confianca}% ( \){entry.nivel})`,
     '🛡️ Proteção: 🟡 EMPATE',
     `🐓 Gale máximo: ${CONFIG.maxGale}`,
     '💎 Gestão de banca obrigatória',
@@ -514,7 +555,6 @@ function msgResultadoGreen(signal, state) {
     '📋 RESULTADO DO SINAL',
     titulo,
     `🎯 Entrada: ${corDisplay(signal.cor)}`,
-    `📈 Confiança: ${signal.confianca || '?'}%`,
     `🔢 Sinal #${signal.id}`,
     `🕒 ${horaAngola()}`
   ].join('\n');
@@ -570,12 +610,6 @@ async function maybeCreateSignal(round) {
     }
   }
 
-  const reds = await redsToday();
-  if (reds >= CONFIG.maxRedsDia) {
-    runtime.motivoSemSinal = `limite_reds_${reds}`;
-    return;
-  }
-
   const last = (await pool.query(`SELECT criado_em FROM sinais ORDER BY criado_em DESC LIMIT 1`)).rows[0];
   if (last?.criado_em && Date.now() - new Date(last.criado_em).getTime() < CONFIG.intervaloMinimoMs) {
     runtime.motivoSemSinal = 'intervalo_minimo';
@@ -584,9 +618,9 @@ async function maybeCreateSignal(round) {
 
   const rows = await getRecentOutcomes(30);
   const entry = detectBestEntry(rows);
-  
+
   if (!entry) {
-    runtime.motivoSemSinal = 'sem_setup_80%';
+    runtime.motivoSemSinal = 'sem_setup';
     return;
   }
 
@@ -597,9 +631,9 @@ async function maybeCreateSignal(round) {
   }
 
   const result = await pool.query(
-    `INSERT INTO sinais (cor, estado, gale, resultado_id, empates, estrategia, confianca, nome_estrategia)
-     VALUES ($1, 'PENDENTE', 0, $2, 0, $3, $4, $5) RETURNING *`,
-    [entry.cor, round.source_id || round.source_key, entry.estrategia, entry.confianca, entry.nome]
+    `INSERT INTO sinais (cor, estado, gale, resultado_id, empates, estrategia, nome_estrategia)
+     VALUES ($1, 'PENDENTE', 0, $2, 0, $3, $4) RETURNING *`,
+    [entry.cor, round.source_id || round.source_key, entry.estrategia, entry.nome]
   );
 
   const signal = result.rows[0];
@@ -608,7 +642,7 @@ async function maybeCreateSignal(round) {
   runtime.motivoSemSinal = null;
 
   await telegramSend(msgNovoSinal(entry));
-  log('SINAL', { id: signal.id, cor: entry.cor, estrategia: entry.estrategia, confianca: entry.confianca + '%' });
+  log('SINAL', { id: signal.id, cor: entry.cor, estrategia: entry.estrategia });
 }
 
 async function resolvePending(round) {
@@ -645,7 +679,7 @@ async function resolvePending(round) {
   await telegramSend(msgResultadoLoss(signal) + formatPlacar(placar));
 }
 
-// ====================== RESET DIÁRIO ======================
+// ====================== RESET ======================
 async function verificarResetDiario() {
   const agora = new Date().toLocaleString('en-CA', { timeZone: 'Africa/Luanda', hour12: false });
   const [dataAtual, horaCompleta] = agora.split(' ');
@@ -667,11 +701,11 @@ async function syncOnce() {
   if (runtime.sincronizacaoEmCurso) return { sucesso: false, ignorada: true };
 
   runtime.sincronizacaoEmCurso = true;
-  
+
   try {
     await ensureSchema();
     const rounds = await fetchRounds();
-    
+
     let inserted = 0;
     let duplicates = 0;
 
@@ -682,7 +716,7 @@ async function syncOnce() {
         continue;
       }
       inserted++;
-      
+
       await resolvePending(round);
       await maybeCreateSignal(round);
     }
@@ -695,16 +729,18 @@ async function syncOnce() {
     if (inserted > 0) {
       runtime.ultimaRodadaNova = new Date().toISOString();
       runtime.ciclosSemNovos = 0;
+      log('NOVAS RODADAS', { quantidade: inserted });
     } else {
       runtime.ciclosSemNovos = (runtime.ciclosSemNovos || 0) + 1;
     }
 
-    if (inserted > 0 || runtime.ciclosSemNovos % 15 === 0) {
-      log('SYNC', { 
-        novos: inserted, 
-        duplicados: duplicates, 
+    if (inserted === 0) {
+      log('SYNC', {
+        novos: 0,
+        duplicados: duplicates,
+        ciclosSemNovos: runtime.ciclosSemNovos,
         motivo: runtime.motivoSemSinal,
-        ciclosSemNovos: runtime.ciclosSemNovos
+        api: runtime.ultimoLogAPI
       });
     }
 
@@ -727,11 +763,10 @@ function requireAdmin(req, res, next) {
 
 app.get('/', (req, res) => {
   res.json({
-    nome: 'Capunga Dados — Unificado',
+    nome: 'Capunga Dados — Unificado v3.3',
     estado: 'online',
     horaAngola: horaAngola(),
-    confiancaMinima: CONFIG.confiancaMinima + '%',
-    api: 'api-cs.casino.org (versão robusta)',
+    api: 'api-cs.casino.org (robusta)',
     estrategias: ['REPETICAO', 'QUEBRA', 'DOIS_DOIS', 'SURF', 'FORCA', 'NUMERICA']
   });
 });
@@ -745,10 +780,10 @@ app.get('/health', (req, res) => {
     novosUltimoCiclo: runtime.novosUltimoCiclo,
     ciclosSemNovos: runtime.ciclosSemNovos,
     motivoSemSinal: runtime.motivoSemSinal,
+    ultimoLogAPI: runtime.ultimoLogAPI,
     ultimoSinal: runtime.ultimoSinal ? {
       id: runtime.ultimoSinal.id,
-      cor: runtime.ultimoSinal.cor,
-      confianca: runtime.ultimoSinal.confianca
+      cor: runtime.ultimoSinal.cor
     } : null
   });
 });
@@ -761,8 +796,8 @@ app.get('/diagnostico', async (req, res) => {
     totalSinais = (await pool.query('SELECT COUNT(*)::int AS t FROM sinais')).rows[0].t;
     pendentes = (await pool.query(`SELECT COUNT(*)::int AS t FROM sinais WHERE estado = 'PENDENTE'`)).rows[0].t;
     recentes = (await pool.query(`
-      SELECT resultado, player_score, banker_score, settled_at 
-      FROM mesa_resultados 
+      SELECT resultado, player_score, banker_score, settled_at
+      FROM mesa_resultados
       ORDER BY settled_at DESC NULLS LAST LIMIT 15
     `)).rows;
   } catch (_) {}
@@ -811,24 +846,21 @@ app.post('/telegram/teste', requireAdmin, async (req, res) => {
 // ====================== START ======================
 async function start() {
   if (!DATABASE_URL) throw new Error('DATABASE_URL não configurada');
-  if (!BOT_TOKEN || !CHAT_ID) console.warn('⚠️  BOT_TOKEN ou CHAT_ID não configurado — Telegram desativado');
+  if (!BOT_TOKEN || !CHAT_ID) console.warn('⚠️  BOT_TOKEN ou CHAT_ID não configurado');
 
   await ensureSchema();
 
-  // Reset apenas se você colocar RESET_SINAIS_ON_START=true no deploy
-  if (CONFIG.resetSinaisOnStart) {
-    await pool.query(`DELETE FROM sinais`);
-    log('RESET', 'Histórico limpo por RESET_SINAIS_ON_START');
-  }
+  // Reset automático no start (novo deploy)
+  await pool.query(`DELETE FROM sinais`);
+  log('RESET', 'Histórico de sinais limpo no start do servidor');
 
   server = app.listen(PORT, '0.0.0.0', () => {
     console.log('==============================================');
-    console.log('   CAPUNGA DADOS — UNIFICADO (Final)');
+    console.log('   CAPUNGA DADOS — UNIFICADO v3.3');
     console.log(`   Porta: ${PORT}`);
     console.log(`   Angola: ${horaAngola()}`);
-    console.log(`   Confiança mínima: ${CONFIG.confiancaMinima}%`);
-    console.log(`   API: api-cs.casino.org (robusta)`);
     console.log(`   Sync a cada: ${CONFIG.intervaloSyncMs / 1000}s`);
+    console.log('   Sem limite de reds | Sinais 24h');
     console.log('==============================================');
   });
 
