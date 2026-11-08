@@ -1,15 +1,18 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — UNIFICADO (v3.3 Final)
- * 
- * Apenas 4 variáveis obrigatórias:
- * DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
- * 
- * - Sem limite de reds
- * - Sem confiança
- * - Sinais 24h
- * - Reset automático no start + 00h Angola
+ * CAPUNGA DADOS — UNIFICADO (v3.4)
+ *
+ * Variáveis obrigatórias: DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
+ * Opcional: RENDER_EXTERNAL_URL (Render define sozinho) -> auto-ping anti-sleep
+ *
+ * Correções v3.4:
+ * - Chave de deduplicação corrigida (template literal)
+ * - Limpeza de chaves corrompidas no start
+ * - Baseline: no 1º sync só guarda histórico, não gera sinais com rodadas antigas
+ * - Sinal gerado 1x por ciclo, com base na rodada mais recente
+ * - Reset diário às 00h Angola corrigido
+ * - Diagnóstico de atraso da API (atrasoMin)
  */
 
 const express = require('express');
@@ -29,8 +32,10 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
 
-const API_BACBO = 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
+const API_BACBO =
+  'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
 
 const CONFIG = {
   sinaisAtivos: true,
@@ -57,6 +62,7 @@ const pool = DATABASE_URL
 const runtime = {
   iniciadoEm: new Date().toISOString(),
   sincronizacaoEmCurso: false,
+  baselineFeito: false,
   ultimaSincronizacao: null,
   ultimaRodadaNova: null,
   novosUltimoCiclo: 0,
@@ -73,6 +79,7 @@ const runtime = {
 
 let schemaPromise = null;
 let syncTimer = null;
+let pingTimer = null;
 let server = null;
 let ultimoResetDia = null;
 
@@ -88,6 +95,13 @@ function horaAngola() {
     timeStyle: 'medium',
     hour12: false
   }).format(new Date());
+}
+
+// Retorna { data: 'YYYY-MM-DD', hora: 'HH:MM' } no fuso de Angola
+function agoraAngola() {
+  const s = new Date().toLocaleString('sv-SE', { timeZone: 'Africa/Luanda' }); // "2026-11-08 12:34:16"
+  const [data, h] = s.split(' ');
+  return { data, hora: h.slice(0, 5) };
 }
 
 function corDisplay(cor) {
@@ -128,12 +142,13 @@ function validDate(value) {
 function extractItems(body) {
   if (Array.isArray(body)) return body;
   if (!body || typeof body !== 'object') return [];
-  
+
   const candidates = [
     body, body.data, body.results, body.items, body.resultados, body.rounds, body.events, body.content,
-    body.data?.results, body.data?.items, body.data?.resultados, body.data?.rounds, body.data?.events, body.data?.data, body.data?.content
+    body.data?.results, body.data?.items, body.data?.resultados, body.data?.rounds,
+    body.data?.events, body.data?.data, body.data?.content
   ];
-  
+
   for (const c of candidates) {
     if (Array.isArray(c) && c.length > 0) return c;
   }
@@ -141,12 +156,17 @@ function extractItems(body) {
 }
 
 function resultSignature(r) {
-  return crypto.createHash('sha256').update(JSON.stringify({
-    outcome: r.resultado,
-    settledAt: r.fim,
-    playerScore: r.pontos_jogador,
-    bankerScore: r.pontos_banca
-  })).digest('hex');
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        outcome: r.resultado,
+        settledAt: r.fim,
+        playerScore: r.pontos_jogador,
+        bankerScore: r.pontos_banca
+      })
+    )
+    .digest('hex');
 }
 
 // ====================== TELEGRAM ======================
@@ -169,7 +189,9 @@ async function telegramSend(texto) {
     runtime.ultimoErroTelegram = JSON.stringify(response.data);
     return false;
   } catch (error) {
-    runtime.ultimoErroTelegram = error.message;
+    runtime.ultimoErroTelegram = error.response?.data
+      ? JSON.stringify(error.response.data)
+      : error.message;
     return false;
   }
 }
@@ -194,7 +216,9 @@ async function ensureSchema() {
         observado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mesa_settled ON mesa_resultados (settled_at DESC NULLS LAST, observado_em DESC)`);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_mesa_settled ON mesa_resultados (settled_at DESC NULLS LAST, observado_em DESC)`
+    );
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sinais (
@@ -214,18 +238,36 @@ async function ensureSchema() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_estado ON sinais (estado)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_criado ON sinais (criado_em DESC)`);
 
+    // Limpa chaves corrompidas pelo bug antigo (v3.3)
+    const del = await pool.query(
+      `DELETE FROM mesa_resultados
+       WHERE source_key NOT LIKE 'id:%' AND source_key NOT LIKE 'hash:%'
+          OR source_key LIKE 'id:(%'
+          OR source_key LIKE 'hash: )%'`
+    );
+    if (del.rowCount > 0) log('DB', `Removidas ${del.rowCount} chaves corrompidas`);
+
     log('DB', 'Schema pronto');
   })();
 
-  try { await schemaPromise; } catch (e) { schemaPromise = null; throw e; }
+  try {
+    await schemaPromise;
+  } catch (e) {
+    schemaPromise = null;
+    throw e;
+  }
 }
 
 // ====================== COLETA ======================
 function normalizeRound(item) {
   try {
     const d = item?.data || item?.round || item || {};
-    const r = (d.result && typeof d.result === 'object') ? d.result :
-              (item?.result && typeof item.result === 'object') ? item.result : {};
+    const r =
+      d.result && typeof d.result === 'object'
+        ? d.result
+        : item?.result && typeof item.result === 'object'
+        ? item.result
+        : {};
 
     const rawOutcome =
       r.outcome ?? r.resultado ?? r.winner ??
@@ -237,15 +279,17 @@ function normalizeRound(item) {
     const resultado = normalizeOutcome(rawOutcome);
     if (!resultado) return null;
 
-    const id = String(
-      d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? d.gameId ??
-      item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? ''
-    ).trim() || null;
+    const id =
+      String(
+        d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? d.gameId ??
+        item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? ''
+      ).trim() || null;
 
-    const fim = validDate(
-      d.settledAt ?? d.settled_at ?? d.endTime ?? d.endedAt ?? d.finishedAt ??
-      d.fim ?? item?.settledAt ?? item?.settled_at ?? item?.finishedAt ?? item?.fim
-    ) || new Date().toISOString();
+    const fim =
+      validDate(
+        d.settledAt ?? d.settled_at ?? d.endTime ?? d.endedAt ?? d.finishedAt ??
+        d.fim ?? item?.settledAt ?? item?.settled_at ?? item?.finishedAt ?? item?.fim
+      ) || new Date().toISOString();
 
     const scoreJogador = Number(
       r.playerDice?.score ?? d.playerDice?.score ??
@@ -268,7 +312,8 @@ function normalizeRound(item) {
       multiplicador: r.multiplier ?? d.multiplier ?? null
     };
 
-    round.source_key = id ? `id:\( {id}` : `hash: \){resultSignature(round)}`;
+    // CORRIGIDO: interpolação correta
+    round.source_key = id ? `id:${id}` : `hash:${resultSignature(round)}`;
     return round;
   } catch (e) {
     return null;
@@ -281,7 +326,7 @@ async function fetchRounds() {
       timeout: 15000,
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'CapungaDados/3.3',
+        'User-Agent': 'CapungaDados/3.4',
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache'
       }
@@ -306,21 +351,21 @@ async function fetchRounds() {
       }
     }
 
-    const rounds = [...unique.values()].sort(
-      (a, b) => new Date(a.fim) - new Date(b.fim)
-    );
-
+    const rounds = [...unique.values()].sort((a, b) => new Date(a.fim) - new Date(b.fim));
     const maisRecente = rounds.length ? rounds[rounds.length - 1].fim : null;
+    const atrasoMin = maisRecente
+      ? Number(((Date.now() - new Date(maisRecente).getTime()) / 60000).toFixed(1))
+      : null;
 
     runtime.ultimoLogAPI = {
       recebidos: items.length,
       normalizados,
       unicos: rounds.length,
-      maisRecente
+      maisRecente,
+      atrasoMin
     };
 
     log('API', runtime.ultimoLogAPI);
-
     return rounds;
   } catch (error) {
     runtime.ultimoLogAPI = { erro: error.message };
@@ -354,8 +399,8 @@ async function insertRound(round) {
 
 async function getRecentOutcomes(limit = 40) {
   const result = await pool.query(
-    `SELECT source_id as id, resultado, settled_at as fim,
-            player_score as pontos_jogador, banker_score as pontos_banca
+    `SELECT source_id AS id, resultado, settled_at AS fim,
+            player_score AS pontos_jogador, banker_score AS pontos_banca
      FROM mesa_resultados
      WHERE resultado IN ('Jogador', 'Banca')
      ORDER BY settled_at DESC NULLS LAST, observado_em DESC
@@ -418,7 +463,6 @@ function stratSurf(rows) {
   for (let i = 0; i < 4; i++) {
     if (rows[i]?.resultado !== (i % 2 === 0 ? a : b)) return null;
   }
-
   return { cor: b, estrategia: 'SURF', nome: 'Surf (alternado)', emoji: '🌊', prioridade: 84 };
 }
 
@@ -427,7 +471,7 @@ function stratForca(rows) {
   if (sample.length < 9) return null;
 
   let j = 0, b = 0;
-  for (const r of sample) r.resultado === 'Jogador' ? j++ : b++;
+  for (const r of sample) (r.resultado === 'Jogador' ? j++ : b++);
   const total = j + b;
   const pctB = b / total;
   const pctJ = j / total;
@@ -491,7 +535,7 @@ async function getPlacarDia() {
       COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS loss,
       COALESCE(SUM(empates),0)::int AS empates
     FROM sinais
-    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda') AT TIME ZONE 'Africa/Luanda'
       AND estado IN ('GREEN','G1','G2','LOSS')
   `);
   const s = r.rows[0] || { green: 0, g1: 0, g2: 0, loss: 0, empates: 0 };
@@ -547,9 +591,10 @@ function msgNovoSinal(entry) {
 }
 
 function msgResultadoGreen(signal, state) {
-  const titulo = state === 'GREEN' ? '✅🏆 GREEENNN 🏆✅\n✨ Sem Gale ✨' :
-                 state === 'G1'   ? '⚡🏆 GREEN G1 🏆⚡\n🐓 Gale 1' :
-                                   '🔥🏆 GREEN G2 🏆🔥\n🐓 Gale 2';
+  const titulo =
+    state === 'GREEN' ? '✅🏆 GREEENNN 🏆✅\n✨ Sem Gale ✨' :
+    state === 'G1'    ? '⚡🏆 GREEN G1 🏆⚡\n🐓 Gale 1' :
+                        '🔥🏆 GREEN G2 🏆🔥\n🐓 Gale 2';
   return [
     '🎲🇺🇸 CAPUNGA DADOS 🇺🇸🎲',
     '📋 RESULTADO DO SINAL',
@@ -566,7 +611,7 @@ function msgResultadoLoss(signal) {
     '📋 RESULTADO DO SINAL',
     '❌💔 LOSS FINAL 💔❌',
     `🎯 Entrada: ${corDisplay(signal.cor)}`,
-    `🐓 Gale: \( {signal.gale || 0}/ \){CONFIG.maxGale}`,
+    `🐓 Gale: ${signal.gale || 0}/${CONFIG.maxGale}`,
     `🔢 Sinal #${signal.id}`,
     `🕒 ${horaAngola()}`
   ].join('\n');
@@ -624,7 +669,8 @@ async function maybeCreateSignal(round) {
     return;
   }
 
-  const jaUsada = await pool.query(`SELECT 1 FROM sinais WHERE resultado_id = $1 LIMIT 1`, [round.source_id || round.source_key]);
+  const refId = round.source_id || round.source_key;
+  const jaUsada = await pool.query(`SELECT 1 FROM sinais WHERE resultado_id = $1 LIMIT 1`, [refId]);
   if (jaUsada.rows.length > 0) {
     runtime.motivoSemSinal = 'rodada_ja_usada';
     return;
@@ -633,7 +679,7 @@ async function maybeCreateSignal(round) {
   const result = await pool.query(
     `INSERT INTO sinais (cor, estado, gale, resultado_id, empates, estrategia, nome_estrategia)
      VALUES ($1, 'PENDENTE', 0, $2, 0, $3, $4) RETURNING *`,
-    [entry.cor, round.source_id || round.source_key, entry.estrategia, entry.nome]
+    [entry.cor, refId, entry.estrategia, entry.nome]
   );
 
   const signal = result.rows[0];
@@ -651,6 +697,9 @@ async function resolvePending(round) {
   if (String(signal.resultado_id) === String(round.source_id || round.source_key)) return;
   if (await expirePendingSignal(signal)) return;
 
+  // Ignora rodadas anteriores à criação do sinal
+  if (new Date(round.fim).getTime() < new Date(signal.criado_em).getTime() - 60000) return;
+
   if (round.resultado === 'Empate') {
     if (!CONFIG.empateProtegido) return;
     await pool.query(`UPDATE sinais SET empates = COALESCE(empates,0) + 1 WHERE id = $1 AND estado = 'PENDENTE'`, [signal.id]);
@@ -661,7 +710,10 @@ async function resolvePending(round) {
   if (round.resultado === signal.cor) {
     const galeNum = Number(signal.gale || 0);
     const state = galeNum === 0 ? 'GREEN' : galeNum === 1 ? 'G1' : 'G2';
-    await pool.query(`UPDATE sinais SET estado = $1, resultado_final = $2 WHERE id = $3 AND estado = 'PENDENTE'`, [state, round.resultado, signal.id]);
+    await pool.query(
+      `UPDATE sinais SET estado = $1, resultado_final = $2 WHERE id = $3 AND estado = 'PENDENTE'`,
+      [state, round.resultado, signal.id]
+    );
     const placar = await getPlacarDia();
     await telegramSend(msgResultadoGreen(signal, state) + formatPlacar(placar));
     return;
@@ -674,24 +726,22 @@ async function resolvePending(round) {
     return;
   }
 
-  await pool.query(`UPDATE sinais SET estado = 'LOSS', resultado_final = $1 WHERE id = $2 AND estado = 'PENDENTE'`, [round.resultado, signal.id]);
+  await pool.query(
+    `UPDATE sinais SET estado = 'LOSS', resultado_final = $1 WHERE id = $2 AND estado = 'PENDENTE'`,
+    [round.resultado, signal.id]
+  );
   const placar = await getPlacarDia();
   await telegramSend(msgResultadoLoss(signal) + formatPlacar(placar));
 }
 
 // ====================== RESET ======================
 async function verificarResetDiario() {
-  const agora = new Date().toLocaleString('en-CA', { timeZone: 'Africa/Luanda', hour12: false });
-  const [dataAtual, horaCompleta] = agora.split(' ');
-  const hora = horaCompleta.slice(0, 5);
-
-  if (hora >= '00:00' && hora <= '00:04') {
-    if (ultimoResetDia !== dataAtual) {
-      await pool.query(`DELETE FROM sinais`);
-      ultimoResetDia = dataAtual;
-      log('RESET', `Histórico limpo às 00h Angola (${dataAtual})`);
-      await telegramSend(`🧹 Histórico de sinais resetado\n🕛 00:00 Angola\n📅 ${dataAtual}`);
-    }
+  const { data, hora } = agoraAngola();
+  if (hora >= '00:00' && hora <= '00:04' && ultimoResetDia !== data) {
+    await pool.query(`DELETE FROM sinais`);
+    ultimoResetDia = data;
+    log('RESET', `Histórico limpo às 00h Angola (${data})`);
+    await telegramSend(`🧹 Histórico de sinais resetado\n🕛 00:00 Angola\n📅 ${data}`);
   }
 }
 
@@ -704,10 +754,11 @@ async function syncOnce() {
 
   try {
     await ensureSchema();
-    const rounds = await fetchRounds();
+    const rounds = await fetchRounds(); // ordem cronológica (antiga -> recente)
 
     let inserted = 0;
     let duplicates = 0;
+    let ultimaNova = null;
 
     for (const round of rounds) {
       const saved = await insertRound(round);
@@ -716,9 +767,22 @@ async function syncOnce() {
         continue;
       }
       inserted++;
+      ultimaNova = round;
 
-      await resolvePending(round);
-      await maybeCreateSignal(round);
+      // Só resolve sinais depois do baseline (evita processar histórico antigo)
+      if (runtime.baselineFeito) {
+        await resolvePending(round);
+      }
+    }
+
+    // Um único sinal por ciclo, com base na rodada mais recente
+    if (runtime.baselineFeito && ultimaNova) {
+      await maybeCreateSignal(ultimaNova);
+    }
+
+    if (!runtime.baselineFeito && rounds.length > 0) {
+      runtime.baselineFeito = true;
+      log('BASELINE', { guardadas: inserted, msg: 'Histórico carregado. Sinais ativos a partir de agora.' });
     }
 
     runtime.ultimaSincronizacao = new Date().toISOString();
@@ -729,19 +793,19 @@ async function syncOnce() {
     if (inserted > 0) {
       runtime.ultimaRodadaNova = new Date().toISOString();
       runtime.ciclosSemNovos = 0;
-      log('NOVAS RODADAS', { quantidade: inserted });
+      log('NOVAS RODADAS', { quantidade: inserted, ultima: ultimaNova?.resultado, motivo: runtime.motivoSemSinal });
     } else {
       runtime.ciclosSemNovos = (runtime.ciclosSemNovos || 0) + 1;
-    }
-
-    if (inserted === 0) {
-      log('SYNC', {
-        novos: 0,
-        duplicados: duplicates,
-        ciclosSemNovos: runtime.ciclosSemNovos,
-        motivo: runtime.motivoSemSinal,
-        api: runtime.ultimoLogAPI
-      });
+      // evita spam: loga a cada 10 ciclos sem novidades
+      if (runtime.ciclosSemNovos % 10 === 1) {
+        log('SYNC', {
+          novos: 0,
+          duplicados: duplicates,
+          ciclosSemNovos: runtime.ciclosSemNovos,
+          motivo: runtime.motivoSemSinal,
+          api: runtime.ultimoLogAPI
+        });
+      }
     }
 
     return { sucesso: true, novos: inserted, duplicados: duplicates };
@@ -763,10 +827,9 @@ function requireAdmin(req, res, next) {
 
 app.get('/', (req, res) => {
   res.json({
-    nome: 'Capunga Dados — Unificado v3.3',
+    nome: 'Capunga Dados — Unificado v3.4',
     estado: 'online',
     horaAngola: horaAngola(),
-    api: 'api-cs.casino.org (robusta)',
     estrategias: ['REPETICAO', 'QUEBRA', 'DOIS_DOIS', 'SURF', 'FORCA', 'NUMERICA']
   });
 });
@@ -776,15 +839,15 @@ app.get('/health', (req, res) => {
     sucesso: true,
     estado: 'online',
     horaAngola: horaAngola(),
+    baselineFeito: runtime.baselineFeito,
     ultimaSincronizacao: runtime.ultimaSincronizacao,
     novosUltimoCiclo: runtime.novosUltimoCiclo,
     ciclosSemNovos: runtime.ciclosSemNovos,
     motivoSemSinal: runtime.motivoSemSinal,
     ultimoLogAPI: runtime.ultimoLogAPI,
-    ultimoSinal: runtime.ultimoSinal ? {
-      id: runtime.ultimoSinal.id,
-      cor: runtime.ultimoSinal.cor
-    } : null
+    erroSincronizacao: runtime.erroSincronizacao,
+    ultimoErroTelegram: runtime.ultimoErroTelegram,
+    ultimoSinal: runtime.ultimoSinal ? { id: runtime.ultimoSinal.id, cor: runtime.ultimoSinal.cor } : null
   });
 });
 
@@ -795,11 +858,13 @@ app.get('/diagnostico', async (req, res) => {
     totalResultados = (await pool.query('SELECT COUNT(*)::int AS t FROM mesa_resultados')).rows[0].t;
     totalSinais = (await pool.query('SELECT COUNT(*)::int AS t FROM sinais')).rows[0].t;
     pendentes = (await pool.query(`SELECT COUNT(*)::int AS t FROM sinais WHERE estado = 'PENDENTE'`)).rows[0].t;
-    recentes = (await pool.query(`
-      SELECT resultado, player_score, banker_score, settled_at
-      FROM mesa_resultados
-      ORDER BY settled_at DESC NULLS LAST LIMIT 15
-    `)).rows;
+    recentes = (
+      await pool.query(`
+        SELECT resultado, player_score, banker_score, settled_at
+        FROM mesa_resultados
+        ORDER BY settled_at DESC NULLS LAST LIMIT 15
+      `)
+    ).rows;
   } catch (_) {}
 
   res.json({
@@ -838,6 +903,15 @@ app.post('/admin/sync', requireAdmin, async (req, res) => {
   res.status(result.sucesso ? 200 : 500).json(result);
 });
 
+app.post('/admin/limpar-sinais', requireAdmin, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM sinais`);
+    res.json({ sucesso: true });
+  } catch (e) {
+    res.status(500).json({ sucesso: false, erro: e.message });
+  }
+});
+
 app.post('/telegram/teste', requireAdmin, async (req, res) => {
   const ok = await telegramSend(`🎲 CAPUNGA DADOS — Teste de conexão OK\n🕒 ${horaAngola()}`);
   res.status(ok ? 200 : 502).json({ sucesso: ok, erro: runtime.ultimoErroTelegram });
@@ -856,7 +930,7 @@ async function start() {
 
   server = app.listen(PORT, '0.0.0.0', () => {
     console.log('==============================================');
-    console.log('   CAPUNGA DADOS — UNIFICADO v3.3');
+    console.log('   CAPUNGA DADOS — UNIFICADO v3.4');
     console.log(`   Porta: ${PORT}`);
     console.log(`   Angola: ${horaAngola()}`);
     console.log(`   Sync a cada: ${CONFIG.intervaloSyncMs / 1000}s`);
@@ -867,29 +941,38 @@ async function start() {
   await syncOnce();
 
   syncTimer = setInterval(async () => {
-    if (runtime.sincronizacaoEmCurso) return;
     try {
       await syncOnce();
-      await verificarResetDiario();
     } catch (err) {
       console.error('[SYNC LOOP]', err.message);
     }
+    try {
+      await verificarResetDiario();
+    } catch (err) {
+      console.error('[RESET LOOP]', err.message);
+    }
   }, CONFIG.intervaloSyncMs);
+
+  // Anti-sleep (plano free do Render): auto-ping a cada 10 min
+  if (SELF_URL) {
+    pingTimer = setInterval(() => {
+      axios.get(`${SELF_URL}/health`, { timeout: 10000 }).catch(() => {});
+    }, 10 * 60 * 1000);
+  }
 }
 
-process.on('SIGTERM', async () => {
+async function shutdown() {
   if (syncTimer) clearInterval(syncTimer);
+  if (pingTimer) clearInterval(pingTimer);
   if (server) server.close();
   if (pool) await pool.end();
   process.exit(0);
-});
+}
 
-process.on('SIGINT', async () => {
-  if (syncTimer) clearInterval(syncTimer);
-  if (server) server.close();
-  if (pool) await pool.end();
-  process.exit(0);
-});
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+process.on('unhandledRejection', err => console.error('[UNHANDLED]', err?.message || err));
 
 start().catch(err => {
   console.error('[FATAL]', err);
