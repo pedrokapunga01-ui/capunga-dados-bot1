@@ -62,7 +62,6 @@ app.use(cors({
     if (!origin || origins.includes(origin)) {
       return callback(null, true);
     }
-
     return callback(null, false);
   },
   allowedHeaders: ['Content-Type', 'x-admin-token'],
@@ -117,16 +116,22 @@ const BOOTSTRAP_LIMIT = Math.max(
   Math.min(500, Number(process.env.BOOTSTRAP_LIMIT || 100))
 );
 
+// ============================================================
+// CORREÇÃO PRINCIPAL: SSL mais tolerante por padrão
+// (resolve "self-signed certificate" no Render / bancos gerenciados)
+// ============================================================
+const isLocalDb = /localhost|127\.0\.0\.1/i.test(DATABASE_URL);
+
 const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
-      ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL)
+      ssl: isLocalDb
         ? false
         : {
+            // Por padrão agora aceita certificados autoassinados.
+            // Para forçar verificação estrita: PGSSL_REJECT_UNAUTHORIZED=true
             rejectUnauthorized:
-              String(
-                process.env.PGSSL_REJECT_UNAUTHORIZED || 'true'
-              ) !== 'false'
+              String(process.env.PGSSL_REJECT_UNAUTHORIZED || 'false') === 'true'
           },
       max: 5,
       idleTimeoutMillis: 30000,
@@ -136,37 +141,28 @@ const pool = DATABASE_URL
 
 const runtime = {
   startedAt: new Date().toISOString(),
-
   polling: false,
-
   browserConnected: false,
   pageUrl: BACBO_SOURCE_URL,
-
   sourceMode: BACBO_SOURCE_MODE,
-
   endpoint:
     BACBO_SOURCE_MODE === 'browser'
       ? BACBO_SOURCE_URL
       : BACBO_API_URL,
-
   lastPollAt: null,
   lastNewAt: null,
   lastSettledAt: null,
   lastSourceId: null,
-
   lastHttpStatus: null,
   lastLatencyMs: null,
   lastError: null,
   consecutiveFailures: 0,
-
   dataIntegrity: 'unknown',
   gapDetected: false,
   gapReason: null,
-
   snapshotSize: 0,
   newResultsLastPoll: 0,
   duplicatesLastPoll: 0,
-
   orientation: null,
   totalStored: 0
 };
@@ -196,9 +192,7 @@ function nowIso() {
 function log(tag, value) {
   console.log(
     `[${tag}]`,
-    typeof value === 'string'
-      ? value
-      : JSON.stringify(value)
+    typeof value === 'string' ? value : JSON.stringify(value)
   );
 }
 
@@ -222,7 +216,6 @@ function safeSource(url) {
 function timingSafeEqualText(a, b) {
   const first = Buffer.from(String(a || ''));
   const second = Buffer.from(String(b || ''));
-
   return (
     first.length === second.length &&
     crypto.timingSafeEqual(first, second)
@@ -291,10 +284,7 @@ function normalizeOutcome(value) {
 }
 
 function parseMaybeJson(value) {
-  if (typeof value !== 'string') {
-    return value;
-  }
-
+  if (typeof value !== 'string') return value;
   try {
     return JSON.parse(value);
   } catch (_) {
@@ -305,13 +295,8 @@ function parseMaybeJson(value) {
 function extractItems(body) {
   const parsed = parseMaybeJson(body);
 
-  if (Array.isArray(parsed)) {
-    return parsed;
-  }
-
-  if (!parsed || typeof parsed !== 'object') {
-    return [];
-  }
+  if (Array.isArray(parsed)) return parsed;
+  if (!parsed || typeof parsed !== 'object') return [];
 
   const candidates = [
     parsed.results,
@@ -323,7 +308,6 @@ function extractItems(body) {
     parsed.history,
     parsed.records,
     parsed.content,
-
     parsed.data?.results,
     parsed.data?.resultados,
     parsed.data?.items,
@@ -337,26 +321,16 @@ function extractItems(body) {
 
   for (const candidate of candidates) {
     const items = parseMaybeJson(candidate);
-
-    if (Array.isArray(items)) {
-      return items;
-    }
+    if (Array.isArray(items)) return items;
   }
 
   return [];
 }
 
 function validDate(value) {
-  if (!value) {
-    return null;
-  }
-
+  if (!value) return null;
   const date = new Date(value);
-
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
-
+  if (Number.isNaN(date.getTime())) return null;
   return date.toISOString();
 }
 
@@ -373,22 +347,12 @@ function normalizeResult(item, index) {
   const result =
     data.result && typeof data.result === 'object'
       ? data.result
-      : parsed?.result &&
-          typeof parsed.result === 'object'
+      : parsed?.result && typeof parsed.result === 'object'
         ? parsed.result
         : {};
 
-  const player =
-    data.player ||
-    data.playerData ||
-    result.player ||
-    {};
-
-  const banker =
-    data.banker ||
-    data.bankerData ||
-    result.banker ||
-    {};
+  const player = data.player || data.playerData || result.player || {};
+  const banker = data.banker || data.bankerData || result.banker || {};
 
   const outcome = normalizeOutcome(
     data.outcome ??
@@ -401,22 +365,21 @@ function normalizeResult(item, index) {
       parsed?.resultado
   );
 
-  if (!outcome) {
-    return null;
-  }
+  if (!outcome) return null;
 
-  const sourceId = String(
-    data.id ??
-      data.roundId ??
-      data.round_id ??
-      data.eventId ??
-      data.gameId ??
-      parsed?.id ??
-      parsed?.roundId ??
-      parsed?.round_id ??
-      parsed?.eventId ??
-      ''
-  ).trim() || null;
+  const sourceId =
+    String(
+      data.id ??
+        data.roundId ??
+        data.round_id ??
+        data.eventId ??
+        data.gameId ??
+        parsed?.id ??
+        parsed?.roundId ??
+        parsed?.round_id ??
+        parsed?.eventId ??
+        ''
+    ).trim() || null;
 
   const settledAt = validDate(
     data.settledAt ??
@@ -450,39 +413,23 @@ function normalizeResult(item, index) {
   );
 
   const multiplier =
-    data.multiplier ??
-    data.multiplicador ??
-    result.multiplier ??
-    null;
+    data.multiplier ?? data.multiplicador ?? result.multiplier ?? null;
 
   const clean = {
     sourceId,
     outcome,
     settledAt,
-
-    playerScore: Number.isFinite(playerScore)
-      ? playerScore
-      : null,
-
-    bankerScore: Number.isFinite(bankerScore)
-      ? bankerScore
-      : null,
-
-    multiplier:
-      multiplier == null
-        ? null
-        : String(multiplier),
-
+    playerScore: Number.isFinite(playerScore) ? playerScore : null,
+    bankerScore: Number.isFinite(bankerScore) ? bankerScore : null,
+    multiplier: multiplier == null ? null : String(multiplier),
     sourceIndex: index,
     raw: parsed
   };
 
   clean.signature = resultSignature(clean);
-
   clean.sourceKey = clean.sourceId
     ? `id:${clean.sourceId}`
     : `hash:${clean.signature}`;
-
   clean.idReliable = Boolean(clean.sourceId);
 
   return clean;
@@ -506,27 +453,16 @@ function resultSignature(result) {
 }
 
 function sameResult(first, second) {
-  return (
-    first?.sourceKey &&
-    first.sourceKey === second?.sourceKey
-  );
+  return first?.sourceKey && first.sourceKey === second?.sourceKey;
 }
 
 function sequenceEquals(first, second) {
   return (
     first.length === second.length &&
-    first.every((item, index) =>
-      sameResult(item, second[index])
-    )
+    first.every((item, index) => sameResult(item, second[index]))
   );
 }
 
-/**
- * Descobre novas rodadas sem assumir a orientação da fonte.
- *
- * Se não houver sobreposição entre snapshots, marca lacuna.
- * O sistema não inventa resultados ausentes.
- */
 function diffSnapshots(previous, current) {
   if (!previous.length) {
     return {
@@ -546,17 +482,11 @@ function diffSnapshots(previous, current) {
     };
   }
 
-  const maxOverlap = Math.min(
-    previous.length,
-    current.length
-  );
+  const maxOverlap = Math.min(previous.length, current.length);
 
   for (let size = maxOverlap; size >= 1; size--) {
-    const previousSuffix =
-      previous.slice(previous.length - size);
-
-    const currentPrefix =
-      current.slice(0, size);
+    const previousSuffix = previous.slice(previous.length - size);
+    const currentPrefix = current.slice(0, size);
 
     if (sequenceEquals(previousSuffix, currentPrefix)) {
       return {
@@ -567,18 +497,12 @@ function diffSnapshots(previous, current) {
       };
     }
 
-    const previousPrefix =
-      previous.slice(0, size);
-
-    const currentSuffix =
-      current.slice(current.length - size);
+    const previousPrefix = previous.slice(0, size);
+    const currentSuffix = current.slice(current.length - size);
 
     if (sequenceEquals(previousPrefix, currentSuffix)) {
       return {
-        newItems: current.slice(
-          0,
-          current.length - size
-        ),
+        newItems: current.slice(0, current.length - size),
         orientation: 'newest_first',
         gap: false,
         reason: 'overlap'
@@ -586,21 +510,12 @@ function diffSnapshots(previous, current) {
     }
   }
 
-  const previousKeys = new Set(
-    previous.map(item => item.sourceKey)
-  );
-
-  const currentKeys = new Set(
-    current.map(item => item.sourceKey)
-  );
+  const previousKeys = new Set(previous.map(item => item.sourceKey));
+  const currentKeys = new Set(current.map(item => item.sourceKey));
 
   const contained =
-    [...currentKeys].every(key =>
-      previousKeys.has(key)
-    ) ||
-    [...previousKeys].every(key =>
-      currentKeys.has(key)
-    );
+    [...currentKeys].every(key => previousKeys.has(key)) ||
+    [...previousKeys].every(key => currentKeys.has(key));
 
   if (contained) {
     return {
@@ -673,7 +588,6 @@ async function ensureSchema() {
 
 async function fetchSnapshot() {
   const started = Date.now();
-
   const items = await source.snapshot();
 
   runtime.lastLatencyMs = Date.now() - started;
@@ -704,38 +618,16 @@ function parseFinishedAt(value) {
     /(\d{1,2})\s+([A-Za-zÀ-ÿ]+)\s+(\d{1,2}):(\d{2})/i
   );
 
-  if (!match) {
-    return null;
-  }
+  if (!match) return null;
 
   const months = {
-    jan: 0,
-    fev: 1,
-    feb: 1,
-    mar: 2,
-    abr: 3,
-    apr: 3,
-    mai: 4,
-    may: 4,
-    jun: 5,
-    jul: 6,
-    ago: 7,
-    aug: 7,
-    set: 8,
-    sep: 8,
-    out: 9,
-    oct: 9,
-    nov: 10,
-    dez: 11,
-    dec: 11
+    jan: 0, fev: 1, feb: 1, mar: 2, abr: 3, apr: 3,
+    mai: 4, may: 4, jun: 5, jul: 6, ago: 7, aug: 7,
+    set: 8, sep: 8, out: 9, oct: 9, nov: 10, dez: 11, dec: 11
   };
 
-  const month =
-    months[match[2].slice(0, 3).toLowerCase()];
-
-  if (month == null) {
-    return null;
-  }
+  const month = months[match[2].slice(0, 3).toLowerCase()];
+  if (month == null) return null;
 
   const now = new Date();
 
@@ -765,15 +657,11 @@ function parseFinishedAt(value) {
 }
 
 function normalizeBrowserResult(item, index) {
-  const playerScore = Number.isFinite(
-    Number(item.playerScore)
-  )
+  const playerScore = Number.isFinite(Number(item.playerScore))
     ? Number(item.playerScore)
     : null;
 
-  const bankerScore = Number.isFinite(
-    Number(item.bankerScore)
-  )
+  const bankerScore = Number.isFinite(Number(item.bankerScore))
     ? Number(item.bankerScore)
     : null;
 
@@ -786,9 +674,7 @@ function normalizeBrowserResult(item, index) {
           ? 'Jogador'
           : 'Banca';
 
-  if (!outcome) {
-    return null;
-  }
+  if (!outcome) return null;
 
   const result = {
     sourceId: item.sourceId || null,
@@ -804,11 +690,9 @@ function normalizeBrowserResult(item, index) {
   };
 
   result.signature = resultSignature(result);
-
   result.sourceKey = result.sourceId
     ? `id:${result.sourceId}`
     : `hash:${result.signature}`;
-
   result.idReliable = Boolean(result.sourceId);
 
   return result;
@@ -848,7 +732,6 @@ async function insertResult(result) {
   ];
 
   const saved = await pool.query(query, values);
-
   return saved.rows.length > 0;
 }
 
@@ -893,11 +776,7 @@ async function pollOnce() {
     await ensureSchema();
 
     const snapshot = await fetchSnapshot();
-
-    const diff = diffSnapshots(
-      previousSnapshot,
-      snapshot
-    );
+    const diff = diffSnapshots(previousSnapshot, snapshot);
 
     runtime.snapshotSize = snapshot.length;
     runtime.orientation = diff.orientation;
@@ -956,16 +835,10 @@ async function pollOnce() {
     if (inserted > 0) {
       runtime.lastNewAt = nowIso();
 
-      const newest =
-        diff.newItems[diff.newItems.length - 1];
+      const newest = diff.newItems[diff.newItems.length - 1];
 
-      runtime.lastSettledAt =
-        newest?.settledAt ||
-        runtime.lastSettledAt;
-
-      runtime.lastSourceId =
-        newest?.sourceId ||
-        runtime.lastSourceId;
+      runtime.lastSettledAt = newest?.settledAt || runtime.lastSettledAt;
+      runtime.lastSourceId = newest?.sourceId || runtime.lastSourceId;
 
       log('MESA', {
         novos: inserted,
@@ -999,22 +872,17 @@ async function pollOnce() {
 
 function healthPayload(dbOk, dbError = null) {
   const lastPollAge = runtime.lastPollAt
-    ? Date.now() -
-      new Date(runtime.lastPollAt).getTime()
+    ? Date.now() - new Date(runtime.lastPollAt).getTime()
     : null;
 
-  const lastDataAt =
-    runtime.lastNewAt ||
-    runtime.lastPollAt;
+  const lastDataAt = runtime.lastNewAt || runtime.lastPollAt;
 
   const lastDataAge = lastDataAt
-    ? Date.now() -
-      new Date(lastDataAt).getTime()
+    ? Date.now() - new Date(lastDataAt).getTime()
     : null;
 
   const stale =
-    lastDataAge == null ||
-    lastDataAge > STALE_AFTER_MS;
+    lastDataAge == null || lastDataAge > STALE_AFTER_MS;
 
   const healthy =
     dbOk &&
@@ -1024,7 +892,6 @@ function healthPayload(dbOk, dbError = null) {
 
   return {
     success: healthy,
-
     state: !dbOk
       ? 'db_unavailable'
       : runtime.gapDetected
@@ -1032,19 +899,14 @@ function healthPayload(dbOk, dbError = null) {
         : stale
           ? 'stale'
           : runtime.dataIntegrity,
-
     dbOk,
     dbError,
-
     source: safeSource(runtime.endpoint),
     pollIntervalMs: POLL_INTERVAL_MS,
-
     lastPollAt: runtime.lastPollAt,
     lastPollAgeMs: lastPollAge,
     lastDataAgeMs: lastDataAge,
-
     stale,
-
     ...runtime
   };
 }
@@ -1119,10 +981,7 @@ app.get('/resultados', async (req, res) => {
 
     const limit = Math.max(
       1,
-      Math.min(
-        500,
-        Number.parseInt(req.query.limit, 10) || 100
-      )
+      Math.min(500, Number.parseInt(req.query.limit, 10) || 100)
     );
 
     const rows = await getLatestResults(limit);
@@ -1144,11 +1003,7 @@ app.post('/admin/poll', requireAdmin, async (_req, res) => {
   const result = await pollOnce();
 
   res
-    .status(
-      result.success || result.skipped
-        ? 200
-        : 503
-    )
+    .status(result.success || result.skipped ? 200 : 503)
     .json(result);
 });
 
@@ -1171,7 +1026,10 @@ async function start() {
       port: PORT,
       source: safeSource(runtime.endpoint),
       pollIntervalMs: POLL_INTERVAL_MS,
-      mode: 'table-monitor'
+      mode: 'table-monitor',
+      sslRejectUnauthorized: isLocalDb
+        ? false
+        : String(process.env.PGSSL_REJECT_UNAUTHORIZED || 'false') === 'true'
     });
   });
 
@@ -1194,9 +1052,7 @@ async function shutdown() {
   }
 
   if (server) {
-    await new Promise(resolve =>
-      server.close(resolve)
-    );
+    await new Promise(resolve => server.close(resolve));
   }
 
   if (source?.close) {
@@ -1226,7 +1082,6 @@ process.on('unhandledRejection', reason => {
 
 process.on('uncaughtException', error => {
   log('UNCAUGHT', safeError(error));
-
   shutdown().finally(() => {
     process.exit(1);
   });
