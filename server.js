@@ -1,11 +1,13 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — UNIFICADO (v3.6)
+ * CAPUNGA DADOS — UNIFICADO (v3.7)
  *
  * Variáveis obrigatórias: DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
  * Opcional: RENDER_EXTERNAL_URL (Render define sozinho) -> auto-ping anti-sleep
  *
+ * v3.7: liderança por lock no Postgres (impede 2 instâncias), alerta de instância estranha,
+ *       resolução de sinais atômica e em ordem, só 1 PENDENTE (índice único), Telegram com retry.
  * v3.6: confiança do sinal (80-95%) na mensagem, índice multifatorial (computeConfidence).
  * v3.5: sinais nunca expiram nem ficam cancelados; só fecham em GREEN/G1/G2/LOSS.
  *
@@ -22,7 +24,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('node:crypto');
-const { Pool } = require('pg');
+const { Pool, Client } = require('pg');
 
 const app = express();
 app.disable('x-powered-by');
@@ -36,6 +38,10 @@ const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
+const INSTANCIA = crypto.randomBytes(3).toString('hex');
+const LOCK_KEY = 727255;
+// RESET_RODADAS=true na Render também apaga o histórico de rodadas no deploy (o bot recarrega 50 da API)
+const RESET_RODADAS = String(process.env.RESET_RODADAS || '').toLowerCase() === 'true';
 
 const API_BACBO =
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
@@ -64,6 +70,9 @@ const pool = DATABASE_URL
 const runtime = {
   iniciadoEm: new Date().toISOString(),
   sincronizacaoEmCurso: false,
+  instancia: INSTANCIA,
+  lider: false,
+  alertaOutraInstancia: null,
   baselineFeito: false,
   ultimaSincronizacao: null,
   ultimaRodadaNova: null,
@@ -89,6 +98,8 @@ let ultimoResetDia = null;
 function log(tag, data) {
   console.log(`[${tag}]`, typeof data === 'string' ? data : JSON.stringify(data));
 }
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function horaAngola() {
   return new Intl.DateTimeFormat('pt-PT', {
@@ -175,27 +186,42 @@ function resultSignature(r) {
 async function telegramSend(texto) {
   if (!BOT_TOKEN || !CHAT_ID) {
     runtime.ultimoErroTelegram = 'BOT_TOKEN ou CHAT_ID não configurado';
+    log('TELEGRAM FALHA', runtime.ultimoErroTelegram);
     return false;
   }
-  try {
-    const response = await axios.post(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-      { chat_id: CHAT_ID, text: texto, disable_web_page_preview: true },
-      { timeout: 12000 }
-    );
-    if (response.data?.ok === true) {
-      runtime.ultimaMensagemTelegram = new Date().toISOString();
-      runtime.ultimoErroTelegram = null;
-      return true;
+
+  for (let tentativa = 1; tentativa <= 3; tentativa++) {
+    try {
+      const response = await axios.post(
+        `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+        { chat_id: CHAT_ID, text: texto, disable_web_page_preview: true },
+        { timeout: 12000 }
+      );
+      if (response.data?.ok === true) {
+        runtime.ultimaMensagemTelegram = new Date().toISOString();
+        runtime.ultimoErroTelegram = null;
+        return true;
+      }
+      runtime.ultimoErroTelegram = JSON.stringify(response.data);
+    } catch (error) {
+      const data = error.response?.data;
+      runtime.ultimoErroTelegram = data ? JSON.stringify(data) : error.message;
+
+      // Erros definitivos: não adianta repetir
+      if (error.response && [400, 401, 403, 404].includes(error.response.status)) break;
+
+      // Limite de envio do Telegram: espera o tempo pedido
+      const espera = Number(data?.parameters?.retry_after);
+      if (Number.isFinite(espera) && espera > 0 && espera <= 20) {
+        await sleep(espera * 1000 + 200);
+        continue;
+      }
     }
-    runtime.ultimoErroTelegram = JSON.stringify(response.data);
-    return false;
-  } catch (error) {
-    runtime.ultimoErroTelegram = error.response?.data
-      ? JSON.stringify(error.response.data)
-      : error.message;
-    return false;
+    if (tentativa < 3) await sleep(1500 * tentativa);
   }
+
+  log('TELEGRAM FALHA', runtime.ultimoErroTelegram);
+  return false;
 }
 
 // ====================== SCHEMA ======================
@@ -238,6 +264,21 @@ async function ensureSchema() {
     `);
     await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS nome_estrategia TEXT`);
     await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS confianca INTEGER`);
+    await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS instancia TEXT`);
+    await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS ultima_fim TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS passo INTEGER NOT NULL DEFAULT 0`);
+
+    // Garante, ao nível da base de dados, no máximo 1 sinal PENDENTE
+    try {
+      await pool.query(`
+        UPDATE sinais SET estado = 'CANCELADO'
+        WHERE estado = 'PENDENTE'
+          AND id <> (SELECT MIN(id) FROM sinais WHERE estado = 'PENDENTE')
+      `);
+      await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_sinal_pendente ON sinais (estado) WHERE estado = 'PENDENTE'`);
+    } catch (e) {
+      log('DB AVISO', `Índice de pendente único não criado: ${e.message}`);
+    }
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_estado ON sinais (estado)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_criado ON sinais (criado_em DESC)`);
 
@@ -329,7 +370,7 @@ async function fetchRounds() {
       timeout: 15000,
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'CapungaDados/3.6',
+        'User-Agent': 'CapungaDados/3.7',
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache'
       }
@@ -820,11 +861,20 @@ async function maybeCreateSignal(round) {
     return;
   }
 
-  const result = await pool.query(
-    `INSERT INTO sinais (cor, estado, gale, resultado_id, empates, estrategia, nome_estrategia, confianca)
-     VALUES ($1, 'PENDENTE', 0, $2, 0, $3, $4, $5) RETURNING *`,
-    [entry.cor, refId, entry.estrategia, entry.nome, entry.confianca]
-  );
+  let result;
+  try {
+    result = await pool.query(
+      `INSERT INTO sinais (cor, estado, gale, resultado_id, empates, estrategia, nome_estrategia, confianca, instancia, ultima_fim, passo)
+       VALUES ($1, 'PENDENTE', 0, $2, 0, $3, $4, $5, $6, $7, 0) RETURNING *`,
+      [entry.cor, refId, entry.estrategia, entry.nome, entry.confianca, INSTANCIA, round.fim]
+    );
+  } catch (e) {
+    if (e.code === '23505') {
+      runtime.motivoSemSinal = 'ja_existe_pendente';
+      return;
+    }
+    throw e;
+  }
 
   const signal = result.rows[0];
   runtime.ultimoSinal = signal;
@@ -832,49 +882,113 @@ async function maybeCreateSignal(round) {
   runtime.motivoSemSinal = null;
 
   await telegramSend(msgNovoSinal(entry));
-  log('SINAL', { id: signal.id, cor: entry.cor, estrategia: entry.estrategia, confianca: entry.confianca, calculo: conf.detalhe });
+  log('SINAL', { id: signal.id, cor: entry.cor, estrategia: entry.estrategia, instancia: INSTANCIA, confianca: entry.confianca, calculo: conf.detalhe });
+}
+
+// Atualiza o sinal de forma atômica: só aplica se ninguém mexeu nele desde que o lemos (passo)
+async function updateSinal(signal, round, campos) {
+  const sets = ['passo = passo + 1', 'ultima_fim = $1'];
+  const vals = [round.fim];
+  for (const [k, v] of Object.entries(campos)) {
+    vals.push(v);
+    sets.push(`${k} = $${vals.length}`);
+  }
+  vals.push(signal.id, Number(signal.passo || 0));
+  const r = await pool.query(
+    `UPDATE sinais SET ${sets.join(', ')}
+     WHERE id = $${vals.length - 1} AND estado = 'PENDENTE' AND passo = $${vals.length}
+     RETURNING *`,
+    vals
+  );
+  return r.rows[0] || null;
 }
 
 async function resolvePending(round) {
   const signal = await getPendingSignal();
   if (!signal) return;
-  if (String(signal.resultado_id) === String(round.source_id || round.source_key)) return;
 
-  // Ignora rodadas anteriores à criação do sinal
-  if (new Date(round.fim).getTime() < new Date(signal.criado_em).getTime() - 60000) return;
+  // Só aceita rodadas ESTRITAMENTE posteriores à última aplicada (ou à rodada de entrada)
+  const base = new Date(signal.ultima_fim || signal.criado_em).getTime();
+  if (new Date(round.fim).getTime() <= base) return;
 
   if (round.resultado === 'Empate') {
     if (!CONFIG.empateProtegido) return;
-    await pool.query(`UPDATE sinais SET empates = COALESCE(empates,0) + 1 WHERE id = $1 AND estado = 'PENDENTE'`, [signal.id]);
-    await telegramSend(msgEmpate(signal));
+    const upd = await updateSinal(signal, round, { empates: Number(signal.empates || 0) + 1 });
+    if (upd) await telegramSend(msgEmpate(signal));
     return;
   }
 
   if (round.resultado === signal.cor) {
     const galeNum = Number(signal.gale || 0);
     const state = galeNum === 0 ? 'GREEN' : galeNum === 1 ? 'G1' : 'G2';
-    await pool.query(
-      `UPDATE sinais SET estado = $1, resultado_final = $2 WHERE id = $3 AND estado = 'PENDENTE'`,
-      [state, round.resultado, signal.id]
-    );
-    const placar = await getPlacarDia();
-    await telegramSend(msgResultadoGreen(signal, state) + formatPlacar(placar));
+    const upd = await updateSinal(signal, round, { estado: state, resultado_final: round.resultado });
+    if (upd) {
+      const placar = await getPlacarDia();
+      await telegramSend(msgResultadoGreen(signal, state) + formatPlacar(placar));
+    }
     return;
   }
 
   const nextGale = Number(signal.gale || 0) + 1;
   if (nextGale <= CONFIG.maxGale) {
-    await pool.query(`UPDATE sinais SET gale = $1 WHERE id = $2 AND estado = 'PENDENTE'`, [nextGale, signal.id]);
-    await telegramSend(msgGale(signal, nextGale));
+    const upd = await updateSinal(signal, round, { gale: nextGale });
+    if (upd) await telegramSend(msgGale(signal, nextGale));
     return;
   }
 
-  await pool.query(
-    `UPDATE sinais SET estado = 'LOSS', resultado_final = $1 WHERE id = $2 AND estado = 'PENDENTE'`,
-    [round.resultado, signal.id]
+  const upd = await updateSinal(signal, round, { estado: 'LOSS', resultado_final: round.resultado });
+  if (upd) {
+    const placar = await getPlacarDia();
+    await telegramSend(msgResultadoLoss(signal) + formatPlacar(placar));
+  }
+}
+
+// ====================== LIDERANÇA / OUTRA INSTÂNCIA ======================
+let lockClient = null;
+let resetInicialFeito = false;
+let ultimoAvisoStandby = 0;
+let ultimoAvisoEstranha = 0;
+
+async function tryAcquireLeadership() {
+  const client = new Client({
+    connectionString: DATABASE_URL,
+    ssl: isLocalDb ? false : { rejectUnauthorized: false },
+    keepAlive: true
+  });
+  client.on('error', err => {
+    log('LOCK ERRO', err.message);
+    runtime.lider = false;
+    lockClient = null;
+  });
+  await client.connect();
+  const r = await client.query('SELECT pg_try_advisory_lock($1) AS ok', [LOCK_KEY]);
+  if (r.rows[0].ok) {
+    lockClient = client;
+    runtime.lider = true;
+    return true;
+  }
+  await client.end().catch(() => {});
+  return false;
+}
+
+// Depois do reset inicial, qualquer sinal que não foi criado por esta instância vem de outro processo
+async function verificarOutraInstancia() {
+  const r = await pool.query(
+    `SELECT id, instancia, criado_em FROM sinais WHERE instancia IS DISTINCT FROM $1 ORDER BY id DESC LIMIT 3`,
+    [INSTANCIA]
   );
-  const placar = await getPlacarDia();
-  await telegramSend(msgResultadoLoss(signal) + formatPlacar(placar));
+  if (r.rows.length) {
+    runtime.alertaOutraInstancia = {
+      msg: 'Existem sinais criados por OUTRA instância usando a mesma base de dados',
+      exemplos: r.rows.map(x => ({ id: x.id, instancia: x.instancia || 'versao-antiga', criado_em: x.criado_em }))
+    };
+    if (Date.now() - ultimoAvisoEstranha > 60000) {
+      ultimoAvisoEstranha = Date.now();
+      log('ALERTA', runtime.alertaOutraInstancia);
+    }
+  } else {
+    runtime.alertaOutraInstancia = null;
+  }
 }
 
 // ====================== RESET ======================
@@ -971,7 +1085,7 @@ function requireAdmin(req, res, next) {
 
 app.get('/', (req, res) => {
   res.json({
-    nome: 'Capunga Dados — Unificado v3.6',
+    nome: 'Capunga Dados — Unificado v3.7',
     estado: 'online',
     horaAngola: horaAngola(),
     estrategias: ['REPETICAO', 'QUEBRA', 'DOIS_DOIS', 'SURF', 'FORCA', 'NUMERICA']
@@ -983,6 +1097,9 @@ app.get('/health', (req, res) => {
     sucesso: true,
     estado: 'online',
     horaAngola: horaAngola(),
+    instancia: runtime.instancia,
+    lider: runtime.lider,
+    alertaOutraInstancia: runtime.alertaOutraInstancia,
     baselineFeito: runtime.baselineFeito,
     ultimaSincronizacao: runtime.ultimaSincronizacao,
     novosUltimoCiclo: runtime.novosUltimoCiclo,
@@ -1062,19 +1179,61 @@ app.post('/telegram/teste', requireAdmin, async (req, res) => {
 });
 
 // ====================== START ======================
+let cicloEmCurso = false;
+
+async function cicloPrincipal() {
+  if (cicloEmCurso) return;
+  cicloEmCurso = true;
+  try {
+    if (!runtime.lider) {
+      let ok = false;
+      try {
+        ok = await tryAcquireLeadership();
+      } catch (e) {
+        log('LOCK ERRO', e.message);
+      }
+      if (!ok) {
+        if (Date.now() - ultimoAvisoStandby > 60000) {
+          ultimoAvisoStandby = Date.now();
+          log('STANDBY', `Instância ${INSTANCIA} em espera: outra instância é a líder (lock ocupado)`);
+        }
+        return;
+      }
+      log('LIDER', `Instância ${INSTANCIA} assumiu a liderança`);
+      if (!resetInicialFeito) {
+        // Deploy = começo limpo: apaga todos os sinais e reinicia a numeração (#1, #2...)
+        await pool.query(`TRUNCATE TABLE sinais RESTART IDENTITY`);
+        if (RESET_RODADAS) {
+          await pool.query(`TRUNCATE TABLE mesa_resultados`);
+        }
+        resetInicialFeito = true;
+        runtime.ultimoSinal = null;
+        runtime.ultimaEstrategia = null;
+        runtime.motivoSemSinal = null;
+        log('RESET', { sinais: 'apagados', numeracao: 'reiniciada', rodadas: RESET_RODADAS ? 'apagadas' : 'mantidas' });
+      }
+    }
+
+    await syncOnce();
+    await verificarOutraInstancia();
+    await verificarResetDiario();
+  } catch (err) {
+    console.error('[CICLO]', err.message);
+  } finally {
+    cicloEmCurso = false;
+  }
+}
+
 async function start() {
   if (!DATABASE_URL) throw new Error('DATABASE_URL não configurada');
   if (!BOT_TOKEN || !CHAT_ID) console.warn('⚠️  BOT_TOKEN ou CHAT_ID não configurado');
 
   await ensureSchema();
 
-  // Reset automático no start (novo deploy)
-  await pool.query(`DELETE FROM sinais`);
-  log('RESET', 'Histórico de sinais limpo no start do servidor');
-
   server = app.listen(PORT, '0.0.0.0', () => {
     console.log('==============================================');
-    console.log('   CAPUNGA DADOS — UNIFICADO v3.6');
+    console.log('   CAPUNGA DADOS — UNIFICADO v3.7');
+    console.log(`   Instância: ${INSTANCIA}`);
     console.log(`   Porta: ${PORT}`);
     console.log(`   Angola: ${horaAngola()}`);
     console.log(`   Sync a cada: ${CONFIG.intervaloSyncMs / 1000}s`);
@@ -1082,20 +1241,8 @@ async function start() {
     console.log('==============================================');
   });
 
-  await syncOnce();
-
-  syncTimer = setInterval(async () => {
-    try {
-      await syncOnce();
-    } catch (err) {
-      console.error('[SYNC LOOP]', err.message);
-    }
-    try {
-      await verificarResetDiario();
-    } catch (err) {
-      console.error('[RESET LOOP]', err.message);
-    }
-  }, CONFIG.intervaloSyncMs);
+  await cicloPrincipal();
+  syncTimer = setInterval(cicloPrincipal, CONFIG.intervaloSyncMs);
 
   // Anti-sleep (plano free do Render): auto-ping a cada 10 min
   if (SELF_URL) {
@@ -1109,6 +1256,7 @@ async function shutdown() {
   if (syncTimer) clearInterval(syncTimer);
   if (pingTimer) clearInterval(pingTimer);
   if (server) server.close();
+  if (lockClient) await lockClient.end().catch(() => {});
   if (pool) await pool.end();
   process.exit(0);
 }
@@ -1118,7 +1266,11 @@ process.on('SIGINT', shutdown);
 
 process.on('unhandledRejection', err => console.error('[UNHANDLED]', err?.message || err));
 
-start().catch(err => {
-  console.error('[FATAL]', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  start().catch(err => {
+    console.error('[FATAL]', err);
+    process.exit(1);
+  });
+} else {
+  module.exports = { resolvePending, updateSinal, computeConfidence, telegramSend, runtime };
+}
