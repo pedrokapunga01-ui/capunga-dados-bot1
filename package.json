@@ -1,10 +1,14 @@
 {
   "name": "capunga-dados",
   "version": "18.0.0",
-  "description": "CAPUNGA DADOS — Bot BAC BO v18 (Gale 2)",
+  "description": "CAPUNGA DADOS — Bot BAC BO v18 (Gale 2) com Telegram, PostgreSQL e API Evolution",
   "main": "server.js",
   "private": true,
-  "engines": { "node": ">=18.0.0" },
+  "license": "UNLICENSED",
+  "author": "Capunga Dados",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
