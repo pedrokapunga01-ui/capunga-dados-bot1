@@ -1,21 +1,22 @@
 {
-  "name": "bacbo-signal-monitor",
-  "version": "21.0.0",
+  "name": "capunga-dados",
+  "version": "18.0.0",
+  "description": "CAPUNGA DADOS — Bot BAC BO v18 (Gale 2) com Telegram, PostgreSQL e API Evolution",
+  "main": "index.js",
   "private": true,
-  "description": "Monitor de resultados Bac Bo, com persistência PostgreSQL e apuração idempotente",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js",
-    "test": "node --test logic.test.js"
-  },
+  "license": "UNLICENSED",
+  "author": "Capunga Dados",
   "engines": {
-    "node": ">=18"
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "axios": "^1.7.9",
+    "axios": "^1.7.7",
     "cors": "^2.8.5",
-    "express": "^4.21.2",
+    "express": "^4.21.1",
     "pg": "^8.13.1"
   }
 }
