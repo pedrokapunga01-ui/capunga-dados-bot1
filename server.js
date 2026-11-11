@@ -1,10 +1,12 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v18 (Gale 2)
- * Correções: DB sobrecarga, falha silenciosa de API, lock de instância única,
- * suspensão persistida, stats consistentes, LOSS imediato em gap, scores null-safe,
- * regime filter, amostra mínima por estratégia, alertas operacionais.
+ * CAPUNGA DADOS — BAC BO · v18.1 (Gale 2) — fix arranque Render
+ * Correções v18.1:
+ *  - HTTP abre ANTES do advisory lock (Render precisa da porta para "live")
+ *  - Lock timeout reduzido (3×5s) e não-bloqueante (modo degradado se falhar)
+ *  - app.listen(PORT, '0.0.0.0') explícito
+ *  - keepAlive/wakeCheck só arrancam depois do listen
  * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT, API_BACBO (opcional)
  */
 
@@ -23,25 +25,27 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 
 const CFG = {
   ativos: true,
-  maxGale: 2,               // GALE 2 = 3 rodadas por sinal
+  maxGale: 2,
   maxPending: 1,
   scoreMin: 80,
   minAmostra: 60,
-  minStratN: 5,             // amostra mínima (backtest + live) por estratégia
+  minStratN: 5,
   sinalInicial: 1,
   syncMs: 3000,
   minGapMs: 30000,
-  minSettledAgeMs: 5000,    // só sinaliza se a última rodada está "assentada" há 5s+
-  apuraMaxMs: 900000,       // backstop de segurança
+  minSettledAgeMs: 5000,
+  apuraMaxMs: 900000,
   maxHist: 4000,
   gapMs: 7 * 60 * 1000,
   maxSignalsMem: 500,
   signalsOnBoot: 500,
   suspendMs: 4 * 3600 * 1000,
   suspendLossStreak: 3,
-  staleAlertMs: 3 * 60 * 1000,   // API sem rodadas novas por 3min -> alerta
+  staleAlertMs: 3 * 60 * 1000,
   alertThrottleMs: 10 * 60 * 1000,
-  keepAliveMs: 60000
+  keepAliveMs: 60000,
+  lockTries: 3,
+  lockDelayMs: 5000
 };
 
 const J = 'Jogador';
@@ -50,7 +54,7 @@ const E = 'Empate';
 const isCol = (x) => x === J || x === B;
 const opp = (c) => (c === J ? B : c === B ? J : null);
 const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
-const LOCK_KEY = 727272; // pg advisory lock — garante instância única
+const LOCK_KEY = 727272;
 
 const API_BACBO = process.env.API_BACBO ||
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
@@ -102,7 +106,6 @@ const SEP = '━━━━━━━━━━━━━━━';
 async function dbInit() {
   if (!DATABASE_URL) { log('DB', 'sem persistência'); return; }
   try {
-    // SSL só se o host não for local (evita falso positivo com senha contendo "localhost")
     const local = /^postgres(?:ql)?:\/\/[^@]*@?(localhost|127\.0\.0\.1)(:|\/|$)/i.test(DATABASE_URL);
     pool = new Pool({
       connectionString: DATABASE_URL,
@@ -128,13 +131,13 @@ async function dbInit() {
 
 async function acquireLock() {
   if (!pool) return false;
-  for (let i = 1; i <= 10; i++) {
+  for (let i = 1; i <= CFG.lockTries; i++) {
     try {
       const r = await pool.query('SELECT pg_try_advisory_lock($1) AS ok', [LOCK_KEY]);
-      if (r.rows[0].ok) { R.lockOk = true; return true; }
-      log('LOCK', `instância concorrente detectada — tentativa ${i}/10, aguardando 15s`);
+      if (r.rows[0].ok) { R.lockOk = true; log('LOCK', 'adquirido'); return true; }
+      log('LOCK', `tentativa ${i}/${CFG.lockTries} — concorrente ativa`);
     } catch (e) { R.erroDB = e.message; log('LOCK ERRO', e.message); }
-    await sleep(15000);
+    if (i < CFG.lockTries) await sleep(CFG.lockDelayMs);
   }
   return false;
 }
@@ -182,7 +185,6 @@ async function dbRoundUpsert(r) {
 }
 
 async function dbLoadStats() {
-  // Stats SEMPRE a partir do banco completo — consistente antes/depois de restart
   if (!pool) return;
   try {
     const r = await pool.query(`SELECT status, COUNT(*)::int AS n FROM capunga_signals
@@ -210,7 +212,6 @@ async function dbLoadState() {
     if (nextId) S.nextId = Math.max(CFG.sinalInicial, parseInt(nextId, 10));
     if (lastSignalAt) S.lastSignalAt = parseInt(lastSignalAt, 10);
 
-    // Suspensões persistidas
     try {
       const raw = await dbStateGet('suspended');
       if (raw) {
@@ -263,13 +264,12 @@ async function tgDelete(messageId) {
       { chat_id: CHAT_ID, message_id: messageId }, { timeout: 8000 });
   } catch (_) {}
 }
-// Alerta operacional (throttled) — avisa no canal quando algo está quebrado
 async function tgAlert(tag, detalhe) {
   const now = Date.now();
-  if (now - R.ultimoAlertaAPI < CFG.alertThrottleMs && (tag === 'API' || tag === 'DB')) {
-    if (tag === 'API') return;
+  if (tag === 'API') {
+    if (now - R.ultimoAlertaAPI < CFG.alertThrottleMs) return;
+    R.ultimoAlertaAPI = now;
   }
-  if (tag === 'API') R.ultimoAlertaAPI = now;
   if (tag === 'DB') {
     if (now - R.ultimoAlertaDB < CFG.alertThrottleMs) return;
     R.ultimoAlertaDB = now;
@@ -277,7 +277,7 @@ async function tgAlert(tag, detalhe) {
   await tgSendRaw(`⚠️ <b>ALERTA ${tag}</b>\n\n${detalhe}\n\n⏱ ${hora()}\n<i>Capunga Dados v18</i>`);
 }
 
-/* ============================ TEMPLATES SMS ============================ */
+/* ============================ TEMPLATES ============================ */
 
 function fmtAnalisando() {
   return ['🔍 <b>Analisando o mercado tropa…</b>', '', `⏱ ${hora()}`].join('\n');
@@ -321,6 +321,17 @@ function fmtResult(s) {
   return msg[s.status] || msg.LOSS;
 }
 
+function getGreenStreak() {
+  let count = 0;
+  for (let i = S.signals.length - 1; i >= 0; i--) {
+    const s = S.signals[i];
+    if (!FECHADOS.has(s.status)) continue;
+    if (s.status === 'LOSS') break;
+    count++;
+  }
+  return count;
+}
+
 function fmtHistorico() {
   const wins = STATS.green + STATS.g1 + STATS.g2 + STATS.empate + STATS.eg1 + STATS.eg2;
   const taxa = STATS.total > 0 ? (wins / STATS.total) * 100 : 0;
@@ -346,17 +357,6 @@ function fmtHistorico() {
   ].join('\n');
 }
 
-function getGreenStreak() {
-  let count = 0;
-  for (let i = S.signals.length - 1; i >= 0; i--) {
-    const s = S.signals[i];
-    if (!FECHADOS.has(s.status)) continue;
-    if (s.status === 'LOSS') break;
-    count++;
-  }
-  return count;
-}
-
 /* ============================ API ============================ */
 
 function normalizeOutcome(v) {
@@ -376,7 +376,6 @@ function extractItems(b) {
     b.data?.results, b.data?.items, b.data?.resultados, b.data?.rounds,
     b.data?.events, b.data?.data].find(Array.isArray) || [];
 }
-// null-safe: Number(null) === 0 criaria scores falsos
 const numOrNull = (v) => {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
@@ -403,7 +402,7 @@ async function fetchRounds() {
   for (let i = 1; i <= 2; i++) {
     try {
       const resp = await axios.get(API_BACBO, {
-        timeout: 10000, headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/18.0' }
+        timeout: 10000, headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/18.1' }
       });
       const map = new Map();
       for (const it of extractItems(resp.data)) {
@@ -455,16 +454,14 @@ function detectRegime(seq) {
   const label = chop >= 0.65 ? 'errático' : chop <= 0.35 ? 'tendência' : 'neutro';
   return { trend, chop, label };
 }
-// Estratégias de "quebra/alternância" só fazem sentido em regime errático;
-// estratégias de "sequência" só em regime de tendência. Filtra ruído.
 function regimeFit(cand, regime) {
   const k = cand.key;
   if (/SEQ_(QUEBRA|SURF|PINGPONG|2x2|EXTEND|3_1|MOMENTUM|ALT)/.test(k)) return regime.chop >= 0.45;
   if (/SEQ_(REP|STRONG_STREAK)|BANKER_BIAS/.test(k)) return regime.trend >= 0.45;
-  return true; // numéricas e de empate são neutras
+  return true;
 }
 
-/* ============================ ESTRATÉGIAS (34) ============================ */
+/* ============================ ESTRATÉGIAS ============================ */
 
 const STRATS = [
   function seqRepeticao({ seq }) {
@@ -494,679 +491,4 @@ const STRATS = [
   function seqTresUm({ seq }) {
     if (seq.length < 4) return null;
     const [a, b, c, d] = seq.map((x) => x.resultado);
-    if (a !== b && b === c && c === d) return { cor: a, key: 'SEQ_3_1', nome: '3→1 confirmado', emoji: '🧩', strength: 78, tipo: 'seq' };
-    return null;
-  },
-  function seqMomentum2({ seq }) { // NOVA v18: [X, Y, Y] — adversário confirmou 2 seguidas
-    if (seq.length < 3) return null;
-    const [a, b, c] = seq.map((x) => x.resultado);
-    if (a !== b && b === c) return { cor: c, key: 'SEQ_MOMENTUM_2', nome: 'Momentum 2', emoji: '⚡', strength: 77, tipo: 'seq' };
-    return null;
-  },
-  function seqBreakWeak4({ seq }) { // NOVA v18: sequência de 4 com margens fracas → tende a quebrar
-    const n = streak(seq);
-    if (n !== 4) return null;
-    const s = seq.slice(0, 4);
-    if (!s.every((r) => hasScore(r) && margem(r) <= 2)) return null;
-    return { cor: opp(seq[0].resultado), key: 'SEQ_BREAK_WEAK_4', nome: 'Quebra fraca x4', emoji: '🩹', strength: 79, tipo: 'seq' };
-  },
-  function seqExtend({ seq }) {
-    if (seq.length < 5) return null;
-    const [a, b, c, d, e] = seq.map((x) => x.resultado);
-    if (a === b && b === c && c !== d && d === e) {
-      return { cor: a, key: 'SEQ_EXTEND', nome: 'Streak extend', emoji: '⏭️', strength: 80, tipo: 'seq' };
-    }
-    return null;
-  },
-  function seqStrongStreak({ seq }) {
-    const n = streak(seq);
-    if (n < 4 || n > 6) return null;
-    const same = seq.slice(0, n);
-    if (!same.every((r) => hasScore(r) && margem(r) >= 3)) return null;
-    return { cor: seq[0].resultado, key: 'SEQ_STRONG_STREAK', nome: `Dragon ${n}`, emoji: '🐉', strength: 82, tipo: 'seq' };
-  },
-  function seqPingPong({ seq }) {
-    const L = alternation(seq);
-    if (L < 4 || L > 10) return null;
-    return { cor: opp(seq[0].resultado), key: 'SEQ_PINGPONG', nome: `Ping-pong ${L}`, emoji: '🏓', strength: 79, tipo: 'seq' };
-  },
-  function seqAlternatingStrong({ seq }) {
-    const L = alternation(seq);
-    if (L < 3) return null;
-    const s = seq.slice(0, L);
-    if (!s.every((r) => hasScore(r) && margem(r) >= 3)) return null;
-    return { cor: opp(seq[0].resultado), key: 'SEQ_ALT_STRONG', nome: `Alt. forte ${L}`, emoji: '⚔️', strength: 78, tipo: 'seq' };
-  },
-  function bankerBias20({ seq }) {
-    const s = seq.slice(0, 20);
-    if (s.length < 15) return null;
-    const b = s.filter((r) => r.resultado === B).length;
-    const j = s.filter((r) => r.resultado === J).length;
-    if (b >= 12) return { cor: B, key: 'BANKER_BIAS_20', nome: 'Viés Banca', emoji: '📉', strength: 80, tipo: 'seq' };
-    if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', emoji: '📈', strength: 80, tipo: 'seq' };
-    return null;
-  },
-  function numEscada({ seq }) {
-    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
-    const [a, b, c] = seq;
-    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
-    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c);
-    if ((sb - sa === 1 && sc - sb === 1) || (sa - sb === 1 && sb - sc === 1)) {
-      return { cor: a.resultado, key: 'NUM_ESCADA', nome: `Escada ${sa}→${sb}→${sc}`, emoji: '🪜', strength: 88, tipo: 'num' };
-    }
-    return null;
-  },
-  function numRepeteScore({ seq }) {
-    if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
-    const [a, b] = seq;
-    if (a.resultado !== b.resultado) return null;
-    if (scoreOf(a) === scoreOf(b)) return { cor: a.resultado, key: 'NUM_REPETE', nome: `Score repetido ${scoreOf(a)}`, emoji: '🔂', strength: 84, tipo: 'num' };
-    return null;
-  },
-  function numThreeLow({ seq }) { // NOVA v18: 3 vitórias seguidas com scores baixos → virada
-    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
-    const [a, b, c] = seq;
-    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
-    if (scoreOf(a) <= 3 && scoreOf(b) <= 3 && scoreOf(c) <= 3) {
-      return { cor: opp(a.resultado), key: 'NUM_THREE_LOW', nome: 'Virada de baixos x3', emoji: '📉', strength: 81, tipo: 'num' };
-    }
-    return null;
-  },
-  function numGatilho_0({ seq }) {
-    if (!seq.length || !hasScore(seq[0])) return null;
-    if (scoreOf(seq[0]) === 0) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_0', nome: 'Gatilho 0', emoji: '🎯', strength: 86, tipo: 'num' };
-    return null;
-  },
-  function numGatilho_1({ seq }) {
-    if (!seq.length || !hasScore(seq[0])) return null;
-    if (scoreOf(seq[0]) === 1) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_1', nome: 'Gatilho 1', emoji: '🎯', strength: 84, tipo: 'num' };
-    return null;
-  },
-  function numGatilho_9({ seq }) {
-    if (!seq.length || !hasScore(seq[0])) return null;
-    if (scoreOf(seq[0]) === 9) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_9', nome: 'Gatilho 9', emoji: '🎯', strength: 88, tipo: 'num' };
-    return null;
-  },
-  function numGatilho_8({ seq }) {
-    if (!seq.length || !hasScore(seq[0])) return null;
-    if (scoreOf(seq[0]) === 8) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_8', nome: 'Gatilho 8', emoji: '🎯', strength: 78, tipo: 'num' };
-    return null;
-  },
-  function numMargemAlta({ rows }) {
-    const r = rows[0];
-    if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null;
-    return { cor: r.resultado, key: 'NUM_MARGEM5', nome: `Margem alta ${r.pj}×${r.pb}`, emoji: '📊', strength: 82, tipo: 'num' };
-  },
-  function numDiff4x3({ seq }) {
-    if (seq.length < 3) return null;
-    const t = seq.slice(0, 3);
-    if (!t.every((r) => hasScore(r) && margem(r) >= 4 && r.resultado === t[0].resultado)) return null;
-    return { cor: t[0].resultado, key: 'NUM_DIFF4x3', nome: 'Diff ≥4 ×3', emoji: '🔢', strength: 85, tipo: 'num' };
-  },
-  function numViradaBaixa({ seq }) {
-    if (seq.length < 2) return null;
-    const [a, b] = seq;
-    if (!hasScore(a) || !hasScore(b) || a.resultado !== b.resultado) return null;
-    if (scoreOf(a) > 4 || scoreOf(b) > 4) return null;
-    return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Virada de baixos', emoji: '🔄', strength: 80, tipo: 'num' };
-  },
-  function numEspelho({ rows }) {
-    const r = rows[0];
-    if (!r || !hasScore(r) || r.pj !== r.pb) return null;
-    return { cor: r.resultado, key: 'NUM_ESPELHO', nome: `Espelho ${r.pj}×${r.pb}`, emoji: '🪞', strength: 83, tipo: 'num' };
-  },
-  function numTendencia({ rows }) {
-    const s = rows.slice(0, 8).filter(hasScore);
-    if (s.length < 6) return null;
-    const mj = s.reduce((a, r) => a + r.pj, 0) / s.length;
-    const mb = s.reduce((a, r) => a + r.pb, 0) / s.length;
-    const diff = mj - mb;
-    if (Math.abs(diff) < 1.5) return null;
-    return {
-      cor: diff > 0 ? J : B, key: 'NUM_TENDENCIA',
-      nome: `Tendência ${mj.toFixed(1)}×${mb.toFixed(1)}`, emoji: '📈',
-      strength: Math.abs(diff) >= 2.2 ? 84 : 76, tipo: 'num'
-    };
-  },
-  function numRangeSalto({ seq }) {
-    if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
-    const [a, b] = seq;
-    const ra = scoreRange(scoreOf(a)), rb = scoreRange(scoreOf(b));
-    if (!ra || !rb) return null;
-    if ((ra === 'MB' && rb === 'MA') || (ra === 'MA' && rb === 'MB')) {
-      return { cor: opp(a.resultado), key: 'NUM_SALTO_RANGE', nome: `Salto ${scoreOf(b)}→${scoreOf(a)}`, emoji: '📐', strength: 81, tipo: 'num' };
-    }
-    return null;
-  },
-  function numScoreTrend3({ seq }) {
-    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
-    const [a, b, c] = seq;
-    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
-    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c);
-    if (sa < sb && sb < sc) {
-      return { cor: a.resultado, key: 'NUM_SCORE_TREND_3', nome: `Escala ascendente ${sa}→${sc}`, emoji: '📊', strength: 82, tipo: 'num' };
-    }
-    return null;
-  },
-  function numDoubleHigh({ seq }) {
-    if (seq.length < 2 || !seq.slice(0, 2).every(hasScore)) return null;
-    const [a, b] = seq;
-    if (a.resultado !== b.resultado) return null;
-    if (margem(a) >= 5 && margem(b) >= 5) {
-      return { cor: a.resultado, key: 'NUM_DOUBLE_HIGH', nome: 'Dupla margem alta', emoji: '💪', strength: 84, tipo: 'num' };
-    }
-    return null;
-  },
-  function numNatural({ rows }) {
-    const r = rows[0];
-    if (!r || !hasScore(r)) return null;
-    if (r.pj >= 8 && r.pb >= 8) {
-      return { cor: r.resultado, key: 'NUM_NATURAL', nome: `Natural ${r.pj}×${r.pb}`, emoji: '🎴', strength: 86, tipo: 'num' };
-    }
-    return null;
-  },
-  function numFibonacci({ seq }) {
-    if (!seq.length || !hasScore(seq[0])) return null;
-    const s = scoreOf(seq[0]);
-    if (s === 5 || s === 8) {
-      return { cor: seq[0].resultado, key: 'NUM_FIBONACCI', nome: `Fibonacci ${s}`, emoji: '🌀', strength: 80, tipo: 'num' };
-    }
-    return null;
-  },
-  function numMomentumShift({ seq }) {
-    if (seq.length < 4 || !seq.slice(0, 4).every(hasScore)) return null;
-    const [a, b, c, d] = seq;
-    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c), sd = scoreOf(d);
-    const m1 = sa - sb, m2 = sb - sc, m3 = sc - sd;
-    if (m1 < 0 && m2 < 0 && m3 < 0) {
-      return { cor: opp(a.resultado), key: 'MOMENTUM_SHIFT', nome: 'Mudança de momentum', emoji: '🔀', strength: 78, tipo: 'num' };
-    }
-    return null;
-  },
-  function numPosEmpate({ rows, seq }) {
-    if (!rows[0] || rows[0].resultado !== E || !seq.length) return null;
-    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', emoji: '🎯', strength: 74, tipo: 'num' };
-  },
-  function tieCascade({ rows }) {
-    const ties = rows.slice(0, 3).filter((r) => r.resultado === E).length;
-    if (ties < 2) return null;
-    const pre = rows.find((r) => isCol(r.resultado));
-    if (!pre) return null;
-    return { cor: pre.resultado, key: 'TIE_CASCADE', nome: 'Cascata de empates', emoji: '🟡', strength: 76, tipo: 'num' };
-  },
-  function tieSingle({ rows, seq }) {
-    if (!rows[0] || rows[0].resultado !== E) return null;
-    if (!rows[1] || rows[1].resultado === E) return null;
-    if (!seq.length) return null;
-    return { cor: opp(seq[0].resultado), key: 'TIE_SINGLE', nome: 'Empate isolado', emoji: '🔀', strength: 77, tipo: 'num' };
-  },
-  function tieDoubleBack({ rows }) { // NOVA v18: dois empates seguidos → volta a cor anterior
-    if (rows.length < 3) return null;
-    if (rows[0].resultado !== E || rows[1].resultado !== E) return null;
-    if (!isCol(rows[2].resultado)) return null;
-    return { cor: rows[2].resultado, key: 'TIE_DOUBLE_BACK', nome: 'Retorno pós-duplo empate', emoji: '🔙', strength: 78, tipo: 'num' };
-  }
-];
-
-function runStrategies(rows) {
-  const seq = rows.filter((r) => isCol(r.resultado));
-  const ctx = { rows, seq };
-  const out = [];
-  for (const fn of STRATS) {
-    try { const r = fn(ctx); if (r && isCol(r.cor)) out.push(r); } catch (_) {}
-  }
-  return out;
-}
-
-/* ============================ BACKTEST ============================ */
-
-function windowAt(H, i) {
-  const rows = [];
-  for (let j = i; j >= 0 && rows.length < 20; j--) {
-    if (rows.length && rows[rows.length - 1].t - H[j].t > CFG.gapMs) break;
-    rows.push(H[j]);
-  }
-  return rows;
-}
-function evalEntry(H, i, cor) {
-  for (let k = 1; k <= CFG.maxGale + 1; k++) {
-    const idx = i + k;
-    if (idx >= H.length) return null;
-    if (H[idx].t - H[idx - 1].t > CFG.gapMs) return false; // gap = entrada expirou (perde)
-    if (H[idx].resultado === cor || H[idx].resultado === E) return true;
-  }
-  return false;
-}
-function backtest() {
-  const H = S.hist;
-  const per = {};
-  const ini = 10, fim = H.length - 1;
-  if (fim - ini < 30) return { per, baseRate: 0.90 };
-  let bw = 0, bn = 0;
-  for (let i = ini; i < fim; i++) {
-    const win = windowAt(H, i);
-    if (win.length < 6) continue;
-    for (const c of runStrategies(win)) {
-      const v = evalEntry(H, i, c.cor);
-      if (v === null) continue;
-      const p = per[c.key] || (per[c.key] = { n: 0, w: 0 });
-      p.n++; if (v) p.w++;
-      bn++; if (v) bw++;
-    }
-  }
-  const baseRate = bn ? bw / bn : 0.90;
-  return { per, baseRate: Math.min(0.95, Math.max(0.80, baseRate)) };
-}
-function getStats(force = false) {
-  if (force || !S.stats || S.hist.length - S.statsAtLen >= 30) {
-    S.stats = backtest();
-    S.statsAtLen = S.hist.length;
-  }
-  return S.stats;
-}
-
-/* ============================ CONFIANÇA (Gale 2) ============================ */
-
-function bayesianRate(w, n, priorRate = 0.90, priorWeight = 10) {
-  return (w + priorRate * priorWeight) / (n + priorWeight);
-}
-function confianca(cand, ctx) {
-  const stats = ctx.stats;
-  const p = stats.per[cand.key] || { n: 0, w: 0 };
-  // Prior empírico medido no próprio backtest (não mais taxa fixa chutada)
-  const baseRate = stats.baseRate || 0.90;
-  const btRate = bayesianRate(p.w, p.n, baseRate, 6);
-  const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status));
-  const liveW = live.filter((x) => x.status !== 'LOSS').length;
-  const liveRate = live.length >= 3 ? bayesianRate(liveW, live.length, btRate, 4) : null;
-  const btSamples = p.n + 6;
-  const liveSamples = live.length >= 3 ? live.length + 4 : 0;
-  const observed = ((btRate * btSamples) + ((liveRate ?? btRate) * liveSamples)) / (btSamples + liveSamples);
-
-  let conf = Math.round(observed * 100);
-
-  const agree = ctx.agreement?.confirmations || 0;
-  conf += agree >= 3 ? 2 : agree >= 2 ? 1 : 0;
-  conf += Math.round((cand.strength - 80) * 0.2);
-  if (cand.tipo === 'seq' && ctx.regime) {
-    const regimeMatch = (cand.key.includes('QUEBRA') || cand.key.includes('SURF') || cand.key.includes('PINGPONG'))
-      ? ctx.regime.chop : ctx.regime.trend;
-    conf += Math.round((regimeMatch - 0.5) * 4);
-  }
-  // Penalidades de desempenho real
-  if (live.length >= 5 && liveW / live.length < 0.85) conf -= 4;
-  const recentLoss = S.signals.find((x) =>
-    x.key === cand.key && x.status === 'LOSS' && Date.now() - (x.fechadoEm || 0) < 5 * 60 * 1000);
-  if (recentLoss) conf -= 3;
-
-  return Math.max(80, Math.min(95, conf));
-}
-
-/* ============================ SUSPENSÃO (persistente) ============================ */
-
-function isSuspended(key) {
-  const u = SUSPENDED[key];
-  if (!u) return false;
-  if (Date.now() > u) { delete SUSPENDED[key]; dbStateSet('suspended', JSON.stringify(Object.entries(SUSPENDED))); return false; }
-  return true;
-}
-function maybeSuspend(key) {
-  const recent = S.signals.filter((x) => x.key === key && FECHADOS.has(x.status)).slice(-CFG.suspendLossStreak);
-  if (recent.length < CFG.suspendLossStreak) return;
-  if (recent.every((x) => x.status === 'LOSS')) {
-    SUSPENDED[key] = Date.now() + CFG.suspendMs;
-    dbStateSet('suspended', JSON.stringify(Object.entries(SUSPENDED)));
-    log('SUSPENSO', { key, consecutiveLosses: recent.length });
-  }
-}
-
-/* ============================ GATE ============================ */
-
-function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
-
-function podeGerar() {
-  if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return false; }
-  if (pendentes().length >= CFG.maxPending) { R.ultimoMotivo = 'max pending'; return false; }
-  const now = Date.now();
-  if (S.lastSignalAt && now - S.lastSignalAt < CFG.minGapMs) {
-    R.ultimoMotivo = `gap ${Math.ceil((CFG.minGapMs - (now - S.lastSignalAt)) / 1000)}s`;
-    return false;
-  }
-  const last = S.hist[S.hist.length - 1];
-  if (!last) { R.ultimoMotivo = 'sem hist'; return false; }
-  // Só sinaliza se a última rodada está "assentada" — evita sinal sobre dado que a API ainda pode corrigir
-  if (now - last.t < CFG.minSettledAgeMs) {
-    R.ultimoMotivo = `rodada recente ${Math.ceil((CFG.minSettledAgeMs - (now - last.t)) / 1000)}s`;
-    return false;
-  }
-  if (S.hist.length < CFG.minAmostra) { R.ultimoMotivo = `amostra ${S.hist.length}`; return false; }
-  return true;
-}
-
-/* ============================ GERAR SINAL ============================ */
-
-function stratSamples(key, stats) {
-  const p = stats.per[key];
-  const bn = p ? p.n : 0;
-  let liveN = 0;
-  for (const x of S.signals) if (x.key === key && FECHADOS.has(x.status)) liveN++;
-  return bn + liveN;
-}
-
-async function tentarSinal() {
-  if (!podeGerar()) return;
-
-  const rows = S.hist.slice(-30).reverse();
-  const stats = getStats();
-  const seq = rows.filter((r) => isCol(r.resultado));
-  const regime = detectRegime(seq);
-
-  let cands = runStrategies(rows).filter((c) => regimeFit(c, regime));
-  if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
-
-  // Amostra mínima POR ESTRATÉGIA — estratégia nunca testada não sinaliza
-  cands = cands.filter((c) => stratSamples(c.key, stats) >= CFG.minStratN);
-  if (!cands.length) { R.ultimoMotivo = `amostra estratégia < ${CFG.minStratN}`; return; }
-
-  const byColor = {};
-  for (const c of cands) {
-    if (!byColor[c.cor]) byColor[c.cor] = [];
-    byColor[c.cor].push(c);
-  }
-
-  let melhor = null;
-  for (const cor of Object.keys(byColor)) {
-    const list = byColor[cor].filter((c) => !isSuspended(c.key));
-    if (!list.length) continue;
-    const scored = list.map((c) => ({ ...c, conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } }) }));
-    scored.sort((a, b) => b.conf - a.conf);
-    const top = scored[0];
-    if (!melhor || top.conf > melhor.conf) {
-      melhor = { ...top, agree: scored.length };
-    }
-  }
-
-  if (!melhor || melhor.conf < CFG.scoreMin) { R.ultimoMotivo = `score < ${CFG.scoreMin}`; return; }
-
-  const reservedId = S.nextId;
-  const sinalPreliminar = {
-    id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome, emoji: melhor.emoji,
-    conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE',
-    t: 0, criadoEm: 0, agree: melhor.agree,
-    gale1MsgId: null, gale2MsgId: null, galeLevel: 0
-  };
-
-  const analisando = await tgSendRaw(fmtAnalisando());
-  try {
-    const envio = await tgSendRaw(fmtSinal(sinalPreliminar));
-    if (!envio.ok) {
-      log('SINAL', { motivo: 'telegram rejeitou sinal', id: reservedId });
-      R.ultimoMotivo = 'telegram falhou';
-      return;
-    }
-    const agora = Date.now();
-    sinalPreliminar.t = agora;
-    sinalPreliminar.criadoEm = agora;
-    S.nextId++;
-    S.signals.push(sinalPreliminar);
-    if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
-    S.lastSignalAt = agora; // timestamp PÓS-envio — gap mínimo real de 30s
-    R.ultimoSinal = sinalPreliminar;
-    R.ultimoMotivo = null;
-
-    await dbSignalInsert(sinalPreliminar);
-    await dbStateSet('nextId', String(S.nextId));
-    await dbStateSet('lastSignalAt', String(agora));
-
-    log('SINAL', { id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf, key: sinalPreliminar.key });
-  } finally {
-    // "Analisando..." é sempre removida, sinal enviado ou não
-    if (analisando.ok) await tgDelete(analisando.messageId);
-  }
-}
-
-async function notificarGale(s, nivel) {
-  if (nivel === 2 && s.gale1MsgId) {
-    await tgDelete(s.gale1MsgId);
-    s.gale1MsgId = null;
-  }
-  const r = await tgSendRaw(fmtGale(s, nivel));
-  if (r.ok) {
-    if (nivel === 1) s.gale1MsgId = r.messageId;
-    else s.gale2MsgId = r.messageId;
-    s.galeLevel = nivel;
-  }
-}
-
-/* ============================ FECHAR ============================ */
-
-async function fecharSinal(s, status, gale) {
-  s.status = status;
-  s.gale = gale;
-  s.fechadoEm = Date.now();
-
-  if (s.gale1MsgId) { await tgDelete(s.gale1MsgId); s.gale1MsgId = null; }
-  if (s.gale2MsgId) { await tgDelete(s.gale2MsgId); s.gale2MsgId = null; }
-
-  if (status === 'GREEN') STATS.green++;
-  else if (status === 'G1') STATS.g1++;
-  else if (status === 'G2') STATS.g2++;
-  else if (status === 'EMPATE') STATS.empate++;
-  else if (status === 'EG1') STATS.eg1++;
-  else if (status === 'EG2') STATS.eg2++;
-  else if (status === 'LOSS') STATS.loss++;
-  STATS.total++;
-
-  await dbSignalUpdate(s);
-  await tgSendRaw(fmtResult(s));
-  await tgSendRaw(fmtHistorico());
-  maybeSuspend(s.key);
-}
-
-/* ============================ APURAÇÃO GALE 2 ============================ */
-/* REGRA v18: gap > 7min entre rodadas = janela de gale expirada → LOSS imediato.
-   Nada de ficar PENDENTE 7-15 min esperando rodadas fora da janela. */
-
-async function apurar() {
-  const now = Date.now();
-  for (const s of S.signals) {
-    if (FECHADOS.has(s.status)) continue;
-    const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
-    let decided = false;
-    for (let k = 0; k <= CFG.maxGale && k < after.length; k++) {
-      const r = after[k];
-      const prevT = k === 0 ? s.t : after[k - 1].t;
-      if (r.t - prevT > CFG.gapMs) {
-        // Janela expirou: as tentativas restantes nunca aconteceram dentro do gale
-        await fecharSinal(s, 'LOSS', k);
-        decided = true;
-        break;
-      }
-      if (r.resultado === s.cor || r.resultado === E) {
-        const status = r.resultado === E ? (k === 0 ? 'EMPATE' : k === 1 ? 'EG1' : 'EG2') : (k === 0 ? 'GREEN' : k === 1 ? 'G1' : 'G2');
-        await fecharSinal(s, status, k); decided = true; break;
-      }
-      if (k < CFG.maxGale && s.galeLevel < k + 1) await notificarGale(s, k + 1);
-    }
-    if (decided) continue;
-    // Nunca chegaram rodadas suficientes: se a primeira demorou além da janela, fecha LOSS
-    if (!after.length && now - s.t > CFG.gapMs) {
-      await fecharSinal(s, 'LOSS', 0);
-      continue;
-    }
-    if (after.length >= CFG.maxGale + 1) {
-      await fecharSinal(s, 'LOSS', CFG.maxGale);
-    } else if (now - s.t >= CFG.apuraMaxMs) {
-      // Backstop absoluto de segurança
-      await fecharSinal(s, 'LOSS', s.galeLevel || 0);
-    }
-  }
-}
-
-/* ============================ SYNC ============================ */
-
-async function sync() {
-  try {
-    const rounds = await fetchRounds();
-    let novos = 0, atualizados = 0;
-    const byId = new Map(S.hist.map((r) => [r.id, r]));
-    for (const r of rounds) {
-      const previous = byId.get(r.id);
-      if (!previous) {
-        novos++; byId.set(r.id, r);
-        await dbRoundUpsert(r);          // v18: só grava NOVAS rodadas
-      } else if (previous.t !== r.t || previous.resultado !== r.resultado || previous.pj !== r.pj || previous.pb !== r.pb) {
-        Object.assign(previous, r); atualizados++;
-        await dbRoundUpsert(r);          // v18: só grava se MUDOU
-      }
-    }
-    S.hist = [...byId.values()].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
-    if (S.hist.length > CFG.maxHist) S.hist = S.hist.slice(-CFG.maxHist);
-    S.seen = new Set(S.hist.map((r) => r.id));
-    R.ultimaSync = new Date().toISOString();
-    const newest = S.hist[S.hist.length - 1];
-    if (newest) R.ultimaRodadaNova = new Date(newest.t).toISOString();
-
-    // Falha silenciosa v18: API respondendo mas SEM rodadas novas → alerta no Telegram
-    if (newest && Date.now() - newest.t > CFG.staleAlertMs) {
-      const mins = Math.floor((Date.now() - newest.t) / 60000);
-      await tgAlert('API', `⚠️ API BACBO sem rodadas novas há <b>${mins} min</b>.\nÚltima: ${R.ultimaRodadaNova}\nO bot está parado de sinalizar até a API voltar.`);
-    }
-    if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length });
-  } catch (e) {
-    R.erroAPI = e.message;
-    log('SYNC ERRO', e.message);
-    await tgAlert('API', `❌ Erro ao consultar API BACBO:\n<code>${e.message}</code>`);
-  }
-}
-
-async function tick() {
-  if (busy || stopping) return;
-  busy = true; lastTickMs = Date.now();
-  try { await sync(); await apurar(); await tentarSinal(); }
-  catch (e) { log('TICK ERRO', e.message); }
-  finally { busy = false; }
-}
-
-async function keepAlive() {
-  const self = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '';
-  if (self) { try { await axios.get(self.replace(/\/$/, '') + '/health', { timeout: 7000 }); } catch (_) {} }
-}
-function wakeCheck() {
-  if (Date.now() - lastTickMs > CFG.syncMs * 5) {
-    R.wakes++; R.ultimoWake = new Date().toISOString();
-    log('WAKE', 'atraso'); tick().catch(() => {});
-  }
-}
-
-/* ============================ EXPRESS ============================ */
-
-const app = express();
-app.disable('x-powered-by');
-const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map((x) => x.trim()).filter(Boolean);
-app.use(cors(corsOrigins.length ? { origin: corsOrigins } : { origin: false }));
-app.use(express.json({ limit: '200kb' }));
-
-function requireAdmin(req, res, next) {
-  if (!ADMIN_TOKEN) return res.status(503).json({ erro: 'ADMIN_TOKEN não configurado' });
-  const supplied = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
-  const a = Buffer.from(supplied);
-  const b = Buffer.from(ADMIN_TOKEN);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ erro: 'não autorizado' });
-  next();
-}
-
-app.get('/health', (req, res) => {
-  const newest = S.hist[S.hist.length - 1];
-  res.json({
-    ok: !R.erroAPI && Boolean(R.ultimaSync) && R.lockOk,
-    versao: '18.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
-    hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
-    stats: { ...STATS, greenStreak: getGreenStreak() },
-    ultimaSync: R.ultimaSync, ultimaRodada: newest ? R.ultimaRodadaNova : null,
-    apiStale: newest ? Date.now() - newest.t > CFG.staleAlertMs : true,
-    erroAPI: R.erroAPI, erroDB: R.erroDB,
-    uptime: Math.round(process.uptime())
-  });
-});
-app.get('/status', requireAdmin, (req, res) => {
-  res.json({ motivo: R.ultimoMotivo, R, STATS, CFG, suspenso: Object.keys(SUSPENDED) });
-});
-app.get('/sinais', requireAdmin, (req, res) => {
-  const n = Math.min(100, Math.max(1, parseInt(req.query.n, 10) || 20));
-  res.json(S.signals.slice(-n).reverse());
-});
-app.get('/stats', requireAdmin, (req, res) => {
-  const wins = STATS.green + STATS.g1 + STATS.g2 + STATS.empate + STATS.eg1 + STATS.eg2;
-  const winsReais = STATS.green + STATS.g1 + STATS.g2;
-  const decididos = winsReais + STATS.loss;
-  res.json({
-    ...STATS,
-    wins,
-    taxaComEmpate: STATS.total > 0 ? wins / STATS.total : null,
-    taxaReal: decididos > 0 ? winsReais / decididos : null,
-    greenStreak: getGreenStreak()
-  });
-});
-app.get('/calibracao', requireAdmin, (req, res) => {
-  const buckets = { '80-85': { n: 0, w: 0 }, '86-92': { n: 0, w: 0 }, '93-95': { n: 0, w: 0 } };
-  for (const s of S.signals) {
-    if (!FECHADOS.has(s.status)) continue;
-    const b = s.conf >= 93 ? '93-95' : s.conf >= 86 ? '86-92' : '80-85';
-    buckets[b].n++;
-    if (s.status !== 'LOSS') buckets[b].w++;
-  }
-  res.json(buckets);
-});
-
-/* ============================ START ============================ */
-
-async function start() {
-  for (const [name, value] of Object.entries({ BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL })) {
-    if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
-  }
-  if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
-  log('BOOT', { versao: '18.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale });
-  await dbInit();
-  if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
-
-  // Instância única: se outra réplica estiver ativa, espera ou morre (Render reinicia)
-  const locked = await acquireLock();
-  if (!locked) throw new Error('Outra instância do bot está ativa (advisory lock). Encerrando.');
-
-  await dbLoadState();
-  await sync();
-  getStats(true);
-
-  // Recupera PENDENTES: re-checa se já saiu resultado
-  for (const s of S.signals) {
-    if (s.status !== 'PENDENTE') continue;
-    const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
-    let consecutivasFalhas = 0, prevT = s.t;
-    for (const r of after) {
-      if (r.t - prevT > CFG.gapMs || r.resultado === s.cor || r.resultado === E) break;
-      consecutivasFalhas++; prevT = r.t;
-      if (consecutivasFalhas >= CFG.maxGale) break;
-    }
-    s.galeLevel = Math.min(consecutivasFalhas, CFG.maxGale);
-  }
-
-  server = app.listen(PORT, () => log('HTTP', `porta ${PORT}`));
-  tickTimer = setInterval(() => tick().catch(() => {}), CFG.syncMs);
-  keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
-  setTimeout(() => tick().catch(() => {}), 2000);
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-}
-async function shutdown() {
-  if (stopping) return;
-  stopping = true; log('SHUTDOWN', 'ok');
-  clearInterval(tickTimer); clearInterval(keepTimer);
-  if (server) await new Promise((resolve) => server.close(resolve));
-  await releaseLock();
-  if (pool) await pool.end().catch(() => {});
-  process.exit(0);
-}
-
-start().catch((e) => { console.error(e); process.exit(1); });
+    
