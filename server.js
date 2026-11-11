@@ -1,12 +1,13 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v18.1 (Gale 2) — fix arranque Render
- * Correções v18.1:
- *  - HTTP abre ANTES do advisory lock (Render precisa da porta para "live")
- *  - Lock timeout reduzido (3×5s) e não-bloqueante (modo degradado se falhar)
- *  - app.listen(PORT, '0.0.0.0') explícito
- *  - keepAlive/wakeCheck só arrancam depois do listen
+ * CAPUNGA DADOS — BAC BO · v19 (Gale 2)
+ * Novidades v19:
+ *  - sync a cada 5s (syncMs: 5000)
+ *  - janela de aposta: bot só apura resultado depois de betWindowMs (20s)
+ *  - reset diário de STATS às 00h00 Africa/Luanda (nextId continua a crescer)
+ *  - cooldown 429 com Retry-After + backoff exponencial
+ *  - porta HTTP abre antes do advisory lock (Render)
  * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT, API_BACBO (opcional)
  */
 
@@ -31,8 +32,9 @@ const CFG = {
   minAmostra: 60,
   minStratN: 5,
   sinalInicial: 1,
-  syncMs: 3000,
-  minGapMs: 30000,
+  syncMs: 5000,               // v19: sincroniza a cada 5s
+  minGapMs: 45000,            // v19: 45s entre sinais (dá tempo do utilizador apostar)
+  betWindowMs: 20000,         // v19: só apura resultado após 20s do sinal
   minSettledAgeMs: 5000,
   apuraMaxMs: 900000,
   maxHist: 4000,
@@ -41,11 +43,15 @@ const CFG = {
   signalsOnBoot: 500,
   suspendMs: 4 * 3600 * 1000,
   suspendLossStreak: 3,
-  staleAlertMs: 3 * 60 * 1000,
+  staleAlertMs: 5 * 60 * 1000,
   alertThrottleMs: 10 * 60 * 1000,
   keepAliveMs: 60000,
   lockTries: 3,
-  lockDelayMs: 5000
+  lockDelayMs: 5000,
+  apiMaxTries: 3,
+  apiBackoffBase: 2000,
+  api429CooldownMs: 60000,
+  resetTz: 'Africa/Luanda'    // v19: reset diário nesta timezone
 };
 
 const J = 'Jogador';
@@ -68,7 +74,9 @@ const DEPLOY_ID = (() => {
 const S = {
   hist: [], seen: new Set(), signals: [],
   nextId: CFG.sinalInicial, lastSignalAt: 0,
-  stats: null, statsAtLen: -1
+  stats: null, statsAtLen: -1,
+  dayKey: null,               // v19: 'YYYY-MM-DD' em Africa/Luanda
+  dayResetAt: 0               // v19: timestamp do próximo reset
 };
 
 const STATS = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0 };
@@ -79,11 +87,14 @@ const R = {
   ultimaSync: null, ultimaRodadaNova: null,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, wakes: 0, ultimoWake: null,
-  ultimoAlertaAPI: 0, ultimoAlertaDB: 0, lockOk: false
+  ultimoAlertaAPI: 0, ultimoAlertaDB: 0, lockOk: false,
+  api429Count: 0, api429Consec: 0,
+  ultimoResetDiario: null, proximoResetDiario: null
 };
 
-let pool = null, server = null, tickTimer = null, keepTimer = null;
+let pool = null, server = null, tickTimer = null, keepTimer = null, resetTimer = null;
 let busy = false, stopping = false, lastTickMs = Date.now();
+let apiCooldownUntil = 0;      // v19: cooldown global para 429
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (tag, d) => console.log(`[${new Date().toISOString()}] [${tag}] ${typeof d === 'string' ? d : JSON.stringify(d)}`);
@@ -93,6 +104,12 @@ const fmtHora = new Intl.DateTimeFormat('pt-PT', {
 });
 const hora = (ms = Date.now()) => fmtHora.format(new Date(ms));
 
+// v19: helpers de data em Africa/Luanda
+const fmtDataLuanda = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Africa/Luanda', year: 'numeric', month: '2-digit', day: '2-digit'
+});
+const dayKeyLuanda = (ms = Date.now()) => fmtDataLuanda.format(new Date(ms)); // 'YYYY-MM-DD'
+
 const nomeCor = (c) => (c === B ? 'Vermelho🔴' : c === J ? 'Azul🔵' : 'Empate🟡');
 const emojiCor = (c) => (c === B ? '🔴' : c === J ? '🔵' : '🟡');
 const barra = (p) => {
@@ -100,6 +117,59 @@ const barra = (p) => {
   return '▰'.repeat(f) + '▱'.repeat(10 - f);
 };
 const SEP = '━━━━━━━━━━━━━━━';
+
+function resetStats() {
+  STATS.total = 0; STATS.green = 0; STATS.g1 = 0; STATS.g2 = 0;
+  STATS.empate = 0; STATS.eg1 = 0; STATS.eg2 = 0; STATS.loss = 0;
+}
+
+function agendarProximoReset() {
+  // v19: calcula próximo 00h00 em Africa/Luanda (UTC+1 fixo — Angola não tem DST)
+  const now = new Date();
+  const luandaOffsetMs = 60 * 60 * 1000;
+  const nowLuanda = new Date(now.getTime() + luandaOffsetMs);
+  const nextLuanda = new Date(Date.UTC(
+    nowLuanda.getUTCFullYear(),
+    nowLuanda.getUTCMonth(),
+    nowLuanda.getUTCDate() + 1,
+    0, 0, 0, 0
+  ));
+  const nextUtc = new Date(nextLuanda.getTime() - luandaOffsetMs);
+  const delay = Math.max(1000, nextUtc.getTime() - now.getTime());
+  S.dayKey = dayKeyLuanda(now.getTime());
+  S.dayResetAt = nextUtc.getTime();
+  R.proximoResetDiario = nextUtc.toISOString();
+  if (resetTimer) clearTimeout(resetTimer);
+  resetTimer = setTimeout(executarResetDiario, delay);
+  log('RESET', `próximo reset em ${Math.round(delay / 1000)}s → ${R.proximoResetDiario}`);
+}
+
+async function executarResetDiario() {
+  try {
+    const antes = { ...STATS };
+    resetStats();
+    R.ultimoResetDiario = new Date().toISOString();
+    log('RESET', { antes, depois: { ...STATS } });
+    // Aviso no Telegram (uma vez por dia)
+    await tgSendRaw([
+      '🔄 <b>RESET DIÁRIO — 00h00 Angola</b>',
+      SEP,
+      'O histórico de estatísticas foi reiniciado.',
+      '',
+      '📊 <b>Resumo de ontem:</b>',
+      `Total: ${antes.total}`,
+      `✅ Green: ${antes.green} | G1: ${antes.g1} | G2: ${antes.g2}`,
+      `🟡 Empate: ${antes.empate} | EG1: ${antes.eg1} | EG2: ${antes.eg2}`,
+      `❌ Loss: ${antes.loss}`,
+      '',
+      '💎 <i>Capunga Dados v19</i>'
+    ].join('\n'));
+  } catch (e) {
+    log('RESET ERRO', e.message);
+  } finally {
+    agendarProximoReset();
+  }
+}
 
 /* ============================ DB ============================ */
 
@@ -184,13 +254,17 @@ async function dbRoundUpsert(r) {
   } catch (e) { R.erroDB = e.message; }
 }
 
+// v19: stats do DIA em Africa/Luanda — reset diário não perde sinais antigos no banco
 async function dbLoadStats() {
   if (!pool) return;
   try {
-    const r = await pool.query(`SELECT status, COUNT(*)::int AS n FROM capunga_signals
-      WHERE status <> 'PENDENTE' GROUP BY status`);
-    STATS.total = 0; STATS.green = 0; STATS.g1 = 0; STATS.g2 = 0;
-    STATS.empate = 0; STATS.eg1 = 0; STATS.eg2 = 0; STATS.loss = 0;
+    const dayKey = dayKeyLuanda();
+    const startLuanda = new Date(`${dayKey}T00:00:00+01:00`).getTime();
+    const r = await pool.query(
+      `SELECT status, COUNT(*)::int AS n FROM capunga_signals
+       WHERE status <> 'PENDENTE' AND created_at >= to_timestamp($1 / 1000.0)
+       GROUP BY status`, [startLuanda]);
+    resetStats();
     for (const row of r.rows) {
       STATS.total += row.n;
       if (row.status === 'GREEN') STATS.green = row.n;
@@ -233,7 +307,7 @@ async function dbLoadState() {
       gale1MsgId: null, gale2MsgId: null, galeLevel: row.status !== 'PENDENTE' ? 2 : 0
     }));
     await dbLoadStats();
-    log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}, stats=${STATS.total}`);
+    log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}, statsHoje=${STATS.total}`);
   } catch (e) { R.erroDB = e.message; log('DB ERRO load', e.message); }
 }
 
@@ -274,7 +348,7 @@ async function tgAlert(tag, detalhe) {
     if (now - R.ultimoAlertaDB < CFG.alertThrottleMs) return;
     R.ultimoAlertaDB = now;
   }
-  await tgSendRaw(`⚠️ <b>ALERTA ${tag}</b>\n\n${detalhe}\n\n⏱ ${hora()}\n<i>Capunga Dados v18</i>`);
+  await tgSendRaw(`⚠️ <b>ALERTA ${tag}</b>\n\n${detalhe}\n\n⏱ ${hora()}\n<i>Capunga Dados v19</i>`);
 }
 
 /* ============================ TEMPLATES ============================ */
@@ -282,7 +356,6 @@ async function tgAlert(tag, detalhe) {
 function fmtAnalisando() {
   return ['🔍 <b>Analisando o mercado tropa…</b>', '', `⏱ ${hora()}`].join('\n');
 }
-
 function fmtSinal(s) {
   const confEmoji = s.conf >= 93 ? '💎' : s.conf >= 86 ? '🔥' : '⚡';
   return [
@@ -295,10 +368,11 @@ function fmtSinal(s) {
     `⏱ ${hora(s.t)}`,
     '╚════════════════════════════╝',
     '',
+    '⏳ <i>Faça sua aposta. Resultado em ~20s.</i>',
+    '',
     '💎 <i>Capunga Premium</i>'
   ].join('\n');
 }
-
 function fmtGale(s, nivel) {
   const icons = '✊🏿'.repeat(nivel);
   const extra = nivel === 2 ? '\n⚠️ <i>2ª tentativa — dobra a aposta</i>' : '';
@@ -307,7 +381,6 @@ function fmtGale(s, nivel) {
     `Continuar na cor: ${emojiCor(s.cor)}${extra}`
   ].join('\n');
 }
-
 function fmtResult(s) {
   const msg = {
     GREEN:  '✅ <b>GREEN</b> ✅\n\nA mesa obedeceu tropa 💚\n\n<i>Capunga Dados</i>',
@@ -320,7 +393,6 @@ function fmtResult(s) {
   };
   return msg[s.status] || msg.LOSS;
 }
-
 function getGreenStreak() {
   let count = 0;
   for (let i = S.signals.length - 1; i >= 0; i--) {
@@ -331,7 +403,6 @@ function getGreenStreak() {
   }
   return count;
 }
-
 function fmtHistorico() {
   const wins = STATS.green + STATS.g1 + STATS.g2 + STATS.empate + STATS.eg1 + STATS.eg2;
   const taxa = STATS.total > 0 ? (wins / STATS.total) * 100 : 0;
@@ -341,7 +412,7 @@ function fmtHistorico() {
   const streak = getGreenStreak();
   const streakTxt = streak >= 3 ? `${streak}🔥` : `${streak}`;
   return [
-    '📊 <b>HISTÓRICO</b>',
+    `📊 <b>HISTÓRICO — ${S.dayKey || dayKeyLuanda()}</b>`,
     SEP,
     `Total: ${STATS.total} sinais`,
     `✅ Green: ${STATS.green}`,
@@ -353,7 +424,9 @@ function fmtHistorico() {
     `❌ Loss: ${STATS.loss}`,
     `Sequência de greens: ${streakTxt}`,
     `🎯 Taxa: ${taxa.toFixed(1)}%`,
-    `💡 Taxa real (sem empate): ${taxaReal.toFixed(1)}%`
+    `💡 Taxa real (sem empate): ${taxaReal.toFixed(1)}%`,
+    '',
+    `<i>Reset diário 00h00 (Angola)</i>`
   ].join('\n');
 }
 
@@ -397,12 +470,14 @@ function normalizeRound(item) {
   const pb = numOrNull(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
   return { id, resultado, t, pj, pb };
 }
+
 async function fetchRounds() {
   let lastErr = null;
-  for (let i = 1; i <= 2; i++) {
+  for (let i = 1; i <= CFG.apiMaxTries; i++) {
     try {
       const resp = await axios.get(API_BACBO, {
-        timeout: 10000, headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/18.1' }
+        timeout: 10000,
+        headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/19.0' }
       });
       const map = new Map();
       for (const it of extractItems(resp.data)) {
@@ -410,10 +485,24 @@ async function fetchRounds() {
         if (rd) map.set(rd.id, rd);
       }
       R.erroAPI = null;
+      R.api429Consec = 0;
       return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
     } catch (e) {
-      lastErr = e; R.erroAPI = e.message;
-      if (i < 2) await sleep(500);
+      lastErr = e;
+      R.erroAPI = e.message;
+      const status = e.response?.status;
+
+      if (status === 429) {
+        R.api429Count++; R.api429Consec++;
+        const retryAfter = Number(e.response.headers?.['retry-after']);
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : Math.min(30000, CFG.apiBackoffBase * Math.pow(2, i - 1));
+        log('API 429', `tentativa ${i}/${CFG.apiMaxTries}, espera ${waitMs}ms`);
+        if (i < CFG.apiMaxTries) await sleep(waitMs);
+      } else if (i < CFG.apiMaxTries) {
+        await sleep(1000 * i);
+      }
     }
   }
   throw lastErr || new Error('Falha API');
@@ -780,7 +869,6 @@ function confianca(cand, ctx) {
   const observed = ((btRate * btSamples) + ((liveRate ?? btRate) * liveSamples)) / (btSamples + liveSamples);
 
   let conf = Math.round(observed * 100);
-
   const agree = ctx.agreement?.confirmations || 0;
   conf += agree >= 3 ? 2 : agree >= 2 ? 1 : 0;
   conf += Math.round((cand.strength - 80) * 0.2);
@@ -956,11 +1044,17 @@ async function fecharSinal(s, status, gale) {
 }
 
 /* ============================ APURAÇÃO ============================ */
+/* v19: respeita betWindowMs (20s) — só apura depois que o utilizador teve tempo de apostar.
+   gapMs (7min) continua a marcar LOSS se a janela expirar. */
 
 async function apurar() {
   const now = Date.now();
   for (const s of S.signals) {
     if (FECHADOS.has(s.status)) continue;
+
+    // v19: ainda dentro da janela de aposta — não avaliar resultado
+    if (now - s.t < CFG.betWindowMs) continue;
+
     const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
     let decided = false;
     for (let k = 0; k <= CFG.maxGale && k < after.length; k++) {
@@ -993,6 +1087,10 @@ async function apurar() {
 /* ============================ SYNC ============================ */
 
 async function sync() {
+  if (Date.now() < apiCooldownUntil) {
+    R.ultimoMotivo = 'API em cooldown (429)';
+    return;
+  }
   try {
     const rounds = await fetchRounds();
     let novos = 0, atualizados = 0;
@@ -1016,12 +1114,16 @@ async function sync() {
 
     if (newest && Date.now() - newest.t > CFG.staleAlertMs) {
       const mins = Math.floor((Date.now() - newest.t) / 60000);
-      await tgAlert('API', `⚠️ API BACBO sem rodadas novas há <b>${mins} min</b>.\nÚltima: ${R.ultimaRodadaNova}\nO bot está parado de sinalizar até a API voltar.`);
+      await tgAlert('API', `⚠️ API BACBO sem rodadas novas há <b>${mins} min</b>.\nÚltima: ${R.ultimaRodadaNova}`);
     }
     if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length });
   } catch (e) {
     R.erroAPI = e.message;
     log('SYNC ERRO', e.message);
+    if (e.response?.status === 429) {
+      apiCooldownUntil = Date.now() + CFG.api429CooldownMs;
+      log('API', `cooldown ${CFG.api429CooldownMs / 1000}s`);
+    }
     await tgAlert('API', `❌ Erro ao consultar API BACBO:\n<code>${e.message}</code>`);
   }
 }
@@ -1066,9 +1168,10 @@ app.get('/health', (req, res) => {
   const newest = S.hist[S.hist.length - 1];
   res.json({
     ok: !R.erroAPI && Boolean(R.ultimaSync) && R.lockOk,
-    versao: '18.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    versao: '19.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
-    stats: { ...STATS, greenStreak: getGreenStreak() },
+    statsHoje: { ...STATS, greenStreak: getGreenStreak() },
+    dayKey: S.dayKey, proximoResetDiario: R.proximoResetDiario,
     ultimaSync: R.ultimaSync, ultimaRodada: newest ? R.ultimaRodadaNova : null,
     apiStale: newest ? Date.now() - newest.t > CFG.staleAlertMs : true,
     erroAPI: R.erroAPI, erroDB: R.erroDB,
@@ -1076,7 +1179,7 @@ app.get('/health', (req, res) => {
   });
 });
 app.get('/status', requireAdmin, (req, res) => {
-  res.json({ motivo: R.ultimoMotivo, R, STATS, CFG, suspenso: Object.keys(SUSPENDED) });
+  res.json({ motivo: R.ultimoMotivo, R, STATS, CFG, suspenso: Object.keys(SUSPENDED), dayKey: S.dayKey });
 });
 app.get('/sinais', requireAdmin, (req, res) => {
   const n = Math.min(100, Math.max(1, parseInt(req.query.n, 10) || 20));
@@ -1088,6 +1191,7 @@ app.get('/stats', requireAdmin, (req, res) => {
   const decididos = winsReais + STATS.loss;
   res.json({
     ...STATS,
+    dayKey: S.dayKey,
     wins,
     taxaComEmpate: STATS.total > 0 ? wins / STATS.total : null,
     taxaReal: decididos > 0 ? winsReais / decididos : null,
@@ -1112,12 +1216,12 @@ async function start() {
     if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
   }
   if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
-  log('BOOT', { versao: '18.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale });
+  log('BOOT', { versao: '19.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale, syncMs: CFG.syncMs, betWindowMs: CFG.betWindowMs });
 
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
-  // 1) ABRIR PORTA PRIMEIRO — Render considera o deploy "live" assim que a porta responde
+  // v19: porta abre PRIMEIRO (Render precisa)
   await new Promise((resolve, reject) => {
     server = app.listen(PORT, '0.0.0.0', () => {
       log('HTTP', `porta ${PORT} aberta`);
@@ -1126,10 +1230,10 @@ async function start() {
     server.on('error', (e) => reject(e));
   });
 
-  // 2) Advisory lock (não-bloqueante para o deploy). Se falhar, entra em modo degradado.
+  // v19: lock não-bloqueante
   const locked = await acquireLock();
   if (!locked) {
-    log('LOCK', 'não obtido — modo degradado (sem sinais, só health). Verifica lock preso no Postgres.');
+    log('LOCK', 'não obtido — modo degradado (sem sinais, só health)');
     CFG.ativos = false;
   } else {
     await dbLoadState();
@@ -1149,7 +1253,9 @@ async function start() {
     }
   }
 
-  // 3) Loops só depois do listen
+  // v19: agenda reset diário
+  agendarProximoReset();
+
   tickTimer = setInterval(() => tick().catch(() => {}), CFG.syncMs);
   keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
   setTimeout(() => tick().catch(() => {}), 2000);
@@ -1162,6 +1268,7 @@ async function shutdown() {
   if (stopping) return;
   stopping = true; log('SHUTDOWN', 'ok');
   clearInterval(tickTimer); clearInterval(keepTimer);
+  if (resetTimer) clearTimeout(resetTimer);
   if (server) await new Promise((resolve) => server.close(resolve));
   await releaseLock();
   if (pool) await pool.end().catch(() => {});
