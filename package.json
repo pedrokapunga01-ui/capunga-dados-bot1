@@ -1,31 +1,21 @@
 {
-  "name": "capunga-dados-bacbo",
-  "version": "17.7.0",
-  "description": "Capunga Dados — Bot de sinais Bac Bo com Gale 2, frequência adaptativa 25-30/h e templates premium",
-  "main": "server.js",
-  "type": "commonjs",
+  "name": "bacbo-signal-monitor",
+  "version": "21.0.0",
   "private": true,
-  "license": "UNLICENSED",
-  "author": "Capunga Dados",
-  "engines": {
-    "node": "20.x"
-  },
+  "description": "Monitor de resultados Bac Bo, com persistência PostgreSQL e apuração idempotente",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "check": "node --check server.js",
+    "test": "node --test logic.test.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "axios": "^1.7.9",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "pg": "^8.13.1"
-  },
-  "keywords": [
-    "bac-bo",
-    "bacbo",
-    "evolution",
-    "telegram",
-    "signals",
-    "capunga"
-  ]
+  }
 }
