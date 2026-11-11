@@ -11,8 +11,9 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
+const { analyze } = require('./strategy-engine');
 
-const VERSION = '20.0.0';
+const VERSION = '21.0.0';
 const PORT = Number(process.env.PORT || 10000);
 const { BOT_TOKEN = '', CHAT_ID = '', ADMIN_TOKEN = '', DATABASE_URL = '' } = process.env;
 const TZ = 'Africa/Luanda';
@@ -253,7 +254,7 @@ async function drainOutbox() {
   }
 }
 function signalText(id, candidate, evidence) {
-  return [`🎲 <b>BAC BO · SINAL #${id}</b>`, '━━━━━━━━━━━━━━━', `Entrada: <b>${candidate.color === OUTCOME.BANKER ? 'Banca 🔴' : 'Jogador 🔵'}</b>`, 'Proteção: empate (push)', `Leitura: ${candidate.strategy}`, `Amostra semelhante: ${evidence.n}`, `Frequência histórica observada: ${(evidence.rate*100).toFixed(1)}%`, `Hora Angola: ${luandaTime()}`, '━━━━━━━━━━━━━━━', '<i>Estatística passada não prevê nem garante o próximo resultado. Aposte apenas o que pode perder.</i>'].join('\n');
+  return [`🎲 <b>BAC BO · SINAL #${id}</b>`, '━━━━━━━━━━━━━━━', `Entrada: <b>${candidate.color === OUTCOME.BANKER ? 'Banca 🔴' : 'Jogador 🔵'}</b>`, 'Proteção: empate (push)', `Leitura: ${candidate.strategy}`, `Confluência: ${candidate.agree} regra(s)`, `Amostra semelhante: ${evidence.n}`, `Frequência histórica observada: ${(evidence.rate*100).toFixed(1)}%`, `Hora Angola: ${luandaTime()}`, '━━━━━━━━━━━━━━━', '<i>Estatística passada não prevê nem garante o próximo resultado. Aposte apenas o que pode perder.</i>'].join('\n');
 }
 async function maybeCreateSignal() {
   if (!state.feedHealthy) return;
@@ -262,9 +263,9 @@ async function maybeCreateSignal() {
   if (Date.now() - (state.lastRoundAt || 0) < CFG.settleDelayMs) return;
   if (Date.now() - state.lastSignalAt < CFG.minSignalIntervalMs) return;
   const anchor = state.rounds.at(-1);
-  const candidate = transitionPattern([...state.rounds].reverse()); if (!candidate) return;
-  const evidence = strategyEvidence(candidate.strategy, candidate.color);
-  if (evidence.n < CFG.minStrategySamples || evidence.lower < CFG.minLowerBound) return;
+  const analysis = analyze(state.rounds, { minSamples: CFG.minStrategySamples, minLowerBound: CFG.minLowerBound, maxGale: CFG.maxGale, maxGapMs: CFG.roundGapMs });
+  const candidate = analysis.candidate; if (!candidate) return;
+  const evidence = { n: candidate.n, rate: candidate.rate, lower: candidate.lower };
   const id = state.nextSignalId;
   const nextId = id + 1;
   const createdAt = Date.now();
@@ -273,7 +274,7 @@ async function maybeCreateSignal() {
   let began = false;
   try {
     await client.query('BEGIN'); began = true;
-    await client.query('INSERT INTO bb_signals(id,round_id,color,strategy,status,created_at,sample_n,empirical_rate) VALUES($1,$2,$3,$4,$5,NOW(),$6,$7)', [id, anchor.id, candidate.color, candidate.strategy, 'PENDENTE', evidence.n, evidence.rate]);
+    await client.query('INSERT INTO bb_signals(id,round_id,color,strategy,status,created_at,sample_n,empirical_rate) VALUES($1,$2,$3,$4,$5,NOW(),$6,$7)', [id, anchor.id, candidate.color, candidate.key, 'PENDENTE', evidence.n, evidence.rate]);
     await client.query("INSERT INTO bb_state(k,v) VALUES('nextId',$1),('lastSignalAt',$2) ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v,updated_at=NOW()", [String(nextId), String(createdAt)]);
     await client.query('INSERT INTO bb_outbox(dedupe_key,text) VALUES($1,$2) ON CONFLICT(dedupe_key) DO NOTHING', [`signal:${id}`, text]);
     await client.query('COMMIT'); began = false;
@@ -281,9 +282,9 @@ async function maybeCreateSignal() {
   finally { client.release(); }
   state.nextSignalId = nextId;
   state.lastSignalAt = createdAt;
-  state.signals.push({ id, roundId: anchor.id, color: candidate.color, strategy: candidate.strategy, status: 'PENDENTE', gale: null, t: createdAt, closedAt: null, sampleN: evidence.n, empiricalRate: evidence.rate });
+  state.signals.push({ id, roundId: anchor.id, color: candidate.color, strategy: candidate.key, strategyName: candidate.strategy, agree: candidate.agree, status: 'PENDENTE', gale: null, t: createdAt, closedAt: null, sampleN: evidence.n, empiricalRate: evidence.rate });
   state.pending = state.signals.filter(s => s.status === 'PENDENTE');
-  log('signal_created', { id, anchor: anchor.id, strategy: candidate.strategy, n: evidence.n, rate: evidence.rate, lower: evidence.lower });
+  log('signal_created', { id, anchor: anchor.id, strategy: candidate.key, n: evidence.n, rate: evidence.rate, lower: evidence.lower, agreement: candidate.agree, regime: analysis.regime?.label });
 }
 function settleStatus(round, color, attempt) {
   if (round.outcome === OUTCOME.TIE) return attempt === 0 ? 'EMPATE' : attempt === 1 ? 'EG1' : 'EG2';
