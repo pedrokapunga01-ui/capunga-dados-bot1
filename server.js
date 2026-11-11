@@ -24,7 +24,8 @@ const CFG = Object.freeze({
   maxGale: 2, maxPending: 1, minHistory: 120, minStrategySamples: 100,
   minLowerBound: 0.55, // Conservative research gate, not an assurance of positive EV.
   roundGapMs: 7 * 60_000, alertCooldownMs: 10 * 60_000,
-  requestTimeoutMs: 9000, telegramTimeoutMs: 10000
+  requestTimeoutMs: 9000, telegramTimeoutMs: 10000,
+  lockRetryMs: 5000, lockWaitMs: 300000
 });
 const OUTCOME = Object.freeze({ PLAYER: 'Jogador', BANKER: 'Banca', TIE: 'Empate' });
 const CLOSED = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
@@ -103,6 +104,22 @@ async function fetchSnapshot() {
 async function initDb() {
   if (!BOT_TOKEN || !CHAT_ID || !ADMIN_TOKEN || !DATABASE_URL) throw new Error('Configure BOT_TOKEN, CHAT_ID, ADMIN_TOKEN e DATABASE_URL.');
   if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL não parece uma URL PostgreSQL.');
+  // During Render's rolling deploy the old process may still own the session lock.
+  // Keep this instance alive and visible on HTTP while waiting; never steal a live lock.
+  const lock = await pool.connect();
+  const deadline = Date.now() + CFG.lockWaitMs;
+  try {
+    while (true) {
+      const result = await lock.query('SELECT pg_try_advisory_lock($1) AS ok', [727272]);
+      if (result.rows[0].ok) { state.lockClient = lock; state.lockOk = true; break; }
+      if (Date.now() >= deadline) throw new Error(`Advisory lock ainda pertence a outra instância após ${Math.round(CFG.lockWaitMs/1000)}s; confirme que o serviço antigo encerrou.`);
+      log('lock_wait', { retrySeconds: CFG.lockRetryMs/1000, elapsedSeconds: Math.round((CFG.lockWaitMs-(deadline-Date.now()))/1000) });
+      await sleep(CFG.lockRetryMs);
+    }
+  } catch (e) {
+    if (!state.lockOk) lock.release();
+    throw e;
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bb_rounds(id TEXT PRIMARY KEY, outcome TEXT NOT NULL, at_ms BIGINT NOT NULL, player DOUBLE PRECISION, banker DOUBLE PRECISION, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
     CREATE INDEX IF NOT EXISTS bb_rounds_at_idx ON bb_rounds(at_ms);
@@ -133,10 +150,6 @@ async function initDb() {
       throw new Error(`Migração do banco legado falhou sem concluir parcialmente: ${e.message}`);
     } finally { client.release(); }
   }
-  const lock = await pool.connect();
-  const locked = await lock.query('SELECT pg_try_advisory_lock($1) AS ok', [727272]);
-  if (!locked.rows[0].ok) { lock.release(); throw new Error('Outra instância do bot mantém o lock no banco.'); }
-  state.lockClient = lock; state.lockOk = true;
 }
 async function loadState() {
   const [rounds, signals] = await Promise.all([
@@ -356,8 +369,10 @@ app.get('/stats',admin,(_req,res)=>res.json({dateLuanda:luandaDate(),...state.da
 const calibrationHandler=(_req,res)=>{const settled=state.signals.filter(s=>CLOSED.has(s.status));const n=settled.length,w=settled.filter(s=>s.status!=='LOSS').length;res.json({n,wins:w,observedRate:n?w/n:null,warning:'Historical hit rate is not expected value and is not a guarantee.'});};
 app.get('/calibration',admin,calibrationHandler); app.get('/calibracao',admin,calibrationHandler);
 async function start() {
-  await initDb(); await loadState();
+  // Bind the web port before waiting for database ownership so the platform sees a live process.
   httpServer=app.listen(PORT,()=>log('http_listen',{port:PORT,version:VERSION}));
+  await new Promise((resolve,reject)=>{httpServer.once('listening',resolve);httpServer.once('error',reject);});
+  await initDb(); await loadState();
   timer=setInterval(()=>runCycle().catch(e=>log('unhandled_cycle',{error:e.message})),CFG.pollMs);
   await runCycle();
 }
