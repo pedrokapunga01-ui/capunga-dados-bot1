@@ -1,3 +1,41 @@
+Server completo + package.json — corrigido para Render
+
+Aqui está o server.js completo com todas as correções de arranque (porta aberta primeiro, lock não-bloqueante, timeout reduzido, bind a 0.0.0.0) e o package.json correspondente.
+
+---
+
+📄 package.json
+
+```json
+{
+  "name": "capunga-dados",
+  "version": "18.0.0",
+  "description": "CAPUNGA DADOS — Bot BAC BO v18 (Gale 2) com Telegram, PostgreSQL e API Evolution",
+  "main": "server.js",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": "Capunga Dados",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cors": "^2.8.5",
+    "express": "^4.21.1",
+    "pg": "^8.13.1"
+  }
+}
+```
+
+---
+
+📄 server.js
+
+```javascript
 'use strict';
 
 /**
@@ -1141,4 +1179,31 @@ async function start() {
       const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
       let consecutivasFalhas = 0, prevT = s.t;
       for (const r of after) {
-        if (r.t - prevT > CFG.gapMs || r.resultado === s.cor || r
+        if (r.t - prevT > CFG.gapMs || r.resultado === s.cor || r.resultado === E) break;
+        consecutivasFalhas++; prevT = r.t;
+        if (consecutivasFalhas >= CFG.maxGale) break;
+      }
+      s.galeLevel = Math.min(consecutivasFalhas, CFG.maxGale);
+    }
+  }
+
+  // 3) Loops só depois do listen
+  tickTimer = setInterval(() => tick().catch(() => {}), CFG.syncMs);
+  keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
+  setTimeout(() => tick().catch(() => {}), 2000);
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
+
+async function shutdown() {
+  if (stopping) return;
+  stopping = true; log('SHUTDOWN', 'ok');
+  clearInterval(tickTimer); clearInterval(keepTimer);
+  if (server) await new Promise((resolve) => server.close(resolve));
+  await releaseLock();
+  if (pool) await pool.end().catch(() => {});
+  process.exit(0);
+}
+
+start().catch((e) => { console.error(e); process.exit(1); });
