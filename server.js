@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v20 · SEM GALE
+ * CAPUNGA DADOS — BAC BO · v21 · SEM GALE
  * Política: uma entrada por sinal, sem Gale e sem proteção. Só a próxima rodada
  * pode fechar GREEN; qualquer outro resultado (incluindo empate) fecha RED.
  * Sem tiers relaxados/forçados. Placar diário zera às 00h00 de Angola.
@@ -82,7 +82,7 @@ const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, l
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '20.0',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.0',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
@@ -122,16 +122,16 @@ async function dbInit() {
     });
     await pool.query('SELECT 1');
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS capunga_state (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS capunga_v21_state (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS capunga_rounds (id TEXT PRIMARY KEY, resultado TEXT NOT NULL, t BIGINT NOT NULL, pj DOUBLE PRECISION, pb DOUBLE PRECISION);
       CREATE INDEX IF NOT EXISTS idx_cap_rounds_t ON capunga_rounds(t DESC);
-      CREATE TABLE IF NOT EXISTS capunga_signals (
+      CREATE TABLE IF NOT EXISTS capunga_v21_signals (
         id INTEGER PRIMARY KEY, cor TEXT NOT NULL, key TEXT NOT NULL, nome TEXT NOT NULL,
         tipo TEXT NOT NULL, conf INT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDENTE',
         gale INT, agree INT, tier INT DEFAULT 0, created_at TIMESTAMPTZ NOT NULL, closed_at TIMESTAMPTZ
       );
-      CREATE INDEX IF NOT EXISTS idx_cap_sig_status ON capunga_signals(status);
-      CREATE INDEX IF NOT EXISTS idx_cap_sig_created ON capunga_signals(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_cap_v21_sig_status ON capunga_v21_signals(status);
+      CREATE INDEX IF NOT EXISTS idx_cap_v21_sig_created ON capunga_v21_signals(created_at DESC);
     `);
     R.erroDB = null; log('DB', 'schema ok');
   } catch (e) { R.erroDB = e.message; log('DB ERRO', e.message); pool = null; }
@@ -156,20 +156,20 @@ async function releaseLock() {
 
 async function dbStateGet(k) {
   if (!pool) return null;
-  try { const r = await pool.query('SELECT v FROM capunga_state WHERE k=$1', [k]); return r.rows[0]?.v ?? null; }
+  try { const r = await pool.query('SELECT v FROM capunga_v21_state WHERE k=$1', [k]); return r.rows[0]?.v ?? null; }
   catch (e) { R.erroDB = e.message; return null; }
 }
 async function dbStateSet(k, v) {
   if (!pool) return;
   try {
-    await pool.query(`INSERT INTO capunga_state(k,v,updated_at) VALUES ($1,$2,NOW())
+    await pool.query(`INSERT INTO capunga_v21_state(k,v,updated_at) VALUES ($1,$2,NOW())
       ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()`, [k, String(v)]);
   } catch (e) { R.erroDB = e.message; }
 }
 async function dbSignalInsert(s) {
   if (!pool) return;
   try {
-    await pool.query(`INSERT INTO capunga_signals (id,cor,key,nome,tipo,conf,status,gale,agree,tier,created_at,closed_at)
+    await pool.query(`INSERT INTO capunga_v21_signals (id,cor,key,nome,tipo,conf,status,gale,agree,tier,created_at,closed_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING`,
       [s.id, s.cor, s.key, s.nome, s.tipo, s.conf, s.status, s.gale ?? null, s.agree ?? 1, s.tier ?? 0,
        new Date(s.t), s.fechadoEm ? new Date(s.fechadoEm) : null]);
@@ -178,7 +178,7 @@ async function dbSignalInsert(s) {
 async function dbSignalUpdate(s) {
   if (!pool) return;
   try {
-    await pool.query('UPDATE capunga_signals SET status=$1, gale=$2, closed_at=$3 WHERE id=$4',
+    await pool.query('UPDATE capunga_v21_signals SET status=$1, gale=$2, closed_at=$3 WHERE id=$4',
       [s.status, s.gale ?? null, s.fechadoEm ? new Date(s.fechadoEm) : null, s.id]);
   } catch (e) { R.erroDB = e.message; }
 }
@@ -194,7 +194,7 @@ async function dbRoundUpsert(r) {
 async function dbLoadAlltime() {
   if (!pool) return;
   try {
-    const r = await pool.query(`SELECT status, COUNT(*)::int AS n FROM capunga_signals
+    const r = await pool.query(`SELECT status, COUNT(*)::int AS n FROM capunga_v21_signals
       WHERE status IN ('GREEN', 'LOSS', 'VOID') GROUP BY status`);
     for (const k of Object.keys(ALLTIME)) ALLTIME[k] = 0;
     for (const row of r.rows) {
@@ -214,15 +214,15 @@ async function dbLoadAlltime() {
 async function dbLoadState() {
   if (!pool) return;
   try {
-    const nextId = await dbStateGet('nextId');
-    const lastSignalAt = await dbStateGet('lastSignalAt');
-    const curStreak = await dbStateGet('curStreak_v20');
+    const nextId = await dbStateGet('nextId_v21');
+    const lastSignalAt = await dbStateGet('lastSignalAt_v21');
+    const curStreak = await dbStateGet('curStreak_v21');
     if (nextId) S.nextId = Math.max(1, parseInt(nextId, 10));
     if (lastSignalAt) S.lastSignalAt = parseInt(lastSignalAt, 10);
     if (curStreak) S.curStreak = parseInt(curStreak, 10);
 
     try {
-      const raw = await dbStateGet('suspended');
+      const raw = await dbStateGet('suspended_v21');
       if (raw) {
         const arr = JSON.parse(raw);
         const now = Date.now();
@@ -232,7 +232,7 @@ async function dbLoadState() {
 
     // Placar diário persistido
     try {
-      const rawD = await dbStateGet('daily_v20');
+      const rawD = await dbStateGet('daily_v21');
       if (rawD) Object.assign(DAILY, JSON.parse(rawD));
     } catch (_) {}
     if (!DAILY.date) DAILY.date = luandaDayKey();
@@ -240,7 +240,7 @@ async function dbLoadState() {
     const rounds = await pool.query(`SELECT id,resultado,t,pj,pb FROM capunga_rounds ORDER BY t DESC LIMIT ${CFG.maxHist}`);
     S.hist = rounds.rows.map((r) => ({ id: r.id, resultado: r.resultado, t: Number(r.t), pj: r.pj === null ? null : Number(r.pj), pb: r.pb === null ? null : Number(r.pb) })).reverse();
     S.seen = new Set(S.hist.map((r) => r.id));
-    const r = await pool.query(`SELECT * FROM capunga_signals ORDER BY created_at DESC LIMIT ${CFG.signalsOnBoot}`);
+    const r = await pool.query(`SELECT * FROM capunga_v21_signals ORDER BY created_at DESC LIMIT ${CFG.signalsOnBoot}`);
     S.signals = r.rows.reverse().map((row) => ({
       id: row.id, cor: row.cor, key: row.key, nome: row.nome, tipo: row.tipo,
       conf: row.conf, status: row.status, gale: row.gale, agree: row.agree, tier: row.tier || 0,
@@ -249,7 +249,7 @@ async function dbLoadState() {
       gale1MsgId: null, gale2MsgId: null, galeLevel: row.status !== 'PENDENTE' ? 2 : 0
     }));
     await dbLoadAlltime();
-    log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}, diário=${DAILY.date}`);
+    log('DB', `v21 isolado carregado: nextId=${S.nextId}, sinais_v21=${S.signals.length}, histórico_rondas=${S.hist.length}, diário=${DAILY.date}`);
   } catch (e) { R.erroDB = e.message; log('DB ERRO load', e.message); }
 }
 
@@ -323,17 +323,17 @@ async function checkDailyReset() {
     await sendDailySummary(ontem);
     for (const k of ['total', 'green', 'g1', 'g2', 'empate', 'eg1', 'eg2', 'loss', 'void', 'bestStreak']) DAILY[k] = 0;
     DAILY.date = hoje;
-    await dbStateSet('daily_v20', JSON.stringify(DAILY));
+    await dbStateSet('daily_v21', JSON.stringify(DAILY));
     log('DIÁRIO', `reset de ${ontem} -> ${hoje}`);
   } else if (!DAILY.date) {
     DAILY.date = hoje;
   }
 }
 
-/* ============================ TEMPLATES SMS (novo estilo v20) ============================ */
+/* ============================ TEMPLATES SMS (novo estilo v21) ============================ */
 
 function fmtAnalisando() {
-  return [`⚙️ <b>CAPUNGA v20 — Lendo a mesa…</b>`, `⏱ ${hora()}`].join('\n');
+  return [`⚙️ <b>CAPUNGA v21 — Lendo a mesa…</b>`, `⏱ ${hora()}`].join('\n');
 }
 
 function fmtSinal(s) {
@@ -429,7 +429,7 @@ function normalizeRound(item) {
 async function fetchFrom(url) {
   const resp = await axios.get(url, {
     timeout: 10000,
-    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/20.0' }
+    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/21.0' }
   });
   const map = new Map();
   for (const it of extractItems(resp.data)) {
@@ -810,7 +810,7 @@ function confianca(cand, ctx) {
 function isSuspended(key) {
   const u = SUSPENDED[key];
   if (!u) return false;
-  if (Date.now() > u) { delete SUSPENDED[key]; dbStateSet('suspended', JSON.stringify(Object.entries(SUSPENDED))); return false; }
+  if (Date.now() > u) { delete SUSPENDED[key]; dbStateSet('suspended_v21', JSON.stringify(Object.entries(SUSPENDED))); return false; }
   return true;
 }
 function maybeSuspend(key) {
@@ -818,7 +818,7 @@ function maybeSuspend(key) {
   if (recent.length < CFG.suspendLossStreak) return;
   if (recent.every((x) => x.status !== 'GREEN')) {
     SUSPENDED[key] = Date.now() + CFG.suspendMs;
-    dbStateSet('suspended', JSON.stringify(Object.entries(SUSPENDED)));
+    dbStateSet('suspended_v21', JSON.stringify(Object.entries(SUSPENDED)));
     log('SUSPENSO', { key, consecutiveLosses: recent.length });
   }
 }
@@ -884,7 +884,7 @@ async function tentarSinal() {
     if (lr !== null && lr < T.liveMin) return false;
     return true;
   });
-  if (!cands.length) { R.ultimoMotivo = `filtros: score ${T.scoreMin}%, amostra ${T.minStratN}`; return; }
+  if (!cands.length) { R.ultimoMotivo = `nenhuma estratégia elegível: validação fora da amostra ≥${Math.round(CFG.minBacktestRate * 100)}% em ≥${T.minStratN} casos; amostra geral ≥${CFG.minAmostra}`; return; }
 
   const byColor = {};
   for (const c of cands) {
@@ -902,7 +902,7 @@ async function tentarSinal() {
     if (!melhor || top.conf > melhor.conf) melhor = { ...top, agree: scored.length };
   }
 
-  if (!melhor) { R.ultimoMotivo = 'sem candidato'; return; }
+  if (!melhor) { R.ultimoMotivo = `sem consenso: são necessárias ${CFG.minAgreement} estratégias elegíveis a favor da mesma cor`; return; }
   if (melhor.conf < T.scoreMin) { R.ultimoMotivo = `score ${melhor.conf} < ${T.scoreMin} (tier${tier})`; return; }
 
   const reservedId = S.nextId;
@@ -932,8 +932,8 @@ async function tentarSinal() {
     R.ultimoMotivo = null;
 
     await dbSignalInsert(sinalPreliminar);
-    await dbStateSet('nextId', String(S.nextId));
-    await dbStateSet('lastSignalAt', String(agora));
+    await dbStateSet('nextId_v21', String(S.nextId));
+    await dbStateSet('lastSignalAt_v21', String(agora));
 
     log('SINAL', { id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf, key: sinalPreliminar.key, tier });
   } finally {
@@ -953,7 +953,7 @@ async function fecharSinal(s, status, gale) {
 
   if (status === 'VOID') {
     ALLTIME.void++; DAILY.void++;
-    await dbStateSet('daily_v20', JSON.stringify(DAILY));
+    await dbStateSet('daily_v21', JSON.stringify(DAILY));
     await dbSignalUpdate(s);
     await tgSendRaw(fmtResult(s));
     await tgSendRaw(fmtHistorico());
@@ -969,8 +969,8 @@ async function fecharSinal(s, status, gale) {
     S.curStreak++;
     if (S.curStreak > DAILY.bestStreak) DAILY.bestStreak = S.curStreak;
   }
-  await dbStateSet('curStreak_v20', String(S.curStreak));
-  await dbStateSet('daily_v20', JSON.stringify(DAILY));
+  await dbStateSet('curStreak_v21', String(S.curStreak));
+  await dbStateSet('daily_v21', JSON.stringify(DAILY));
 
   await dbSignalUpdate(s);
   await tgSendRaw(fmtResult(s));
@@ -1090,7 +1090,7 @@ app.get('/health', (req, res) => {
   const newest = S.hist[S.hist.length - 1];
   res.json({
     ok: !R.erroAPI && Boolean(R.ultimaSync) && R.lockOk,
-    versao: '20.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    versao: '21.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     diario: { ...DAILY, taxa: dailyTaxa() }, geral: ALLTIME,
@@ -1136,7 +1136,7 @@ async function start() {
     if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
   }
   if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
-  log('BOOT', { versao: '20.0', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  log('BOOT', { versao: '21.0', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
