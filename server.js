@@ -1,12 +1,11 @@
 'use strict';
 
 /**
- * CAPUNGA DIAMOND — BAC BO · v20.1
- * Elite only · sem Gale 2 · sinais só em mesas saudáveis
- *
- * Fixes v20.1:
- *   - hora do sinal registada ANTES do envio (bug do 01:00:00 fixo)
- *   - log do sinal inclui a hora real
+ * CAPUNGA DADOS — BAC BO · v20 · SEM GALE
+ * Política: uma entrada por sinal, sem Gale e sem proteção. Só a próxima rodada
+ * pode fechar GREEN; qualquer outro resultado (incluindo empate) fecha RED.
+ * Sem tiers relaxados/forçados. Placar diário zera às 00h00 de Angola.
+ * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT, API_BACBO (opcional), API_BACBO_2 (opcional)
  */
 
 const fs = require('fs');
@@ -24,14 +23,14 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 
 const CFG = {
   ativos: true,
-  maxGale: 1,
+  maxGale: 0,
   maxPending: 1,
-  minAmostra: 60,
-  syncMs: 3000,
-  syncFastMs: 1000,
-  minGapMs: 20000,
-  relaxMs: 3 * 60 * 1000,
+  minAmostra: 120,
+  syncMs: 3000,          // polling normal
+  syncFastMs: 1000,      // polling com sinal pendente / mesa quente
+  minGapMs: 60000,       // no máximo um sinal por minuto
   minSettledAgeMs: 5000,
+  maxDataAgeMs: 45000,
   apuraMaxMs: 600000,
   maxHist: 4000,
   gapMs: 7 * 60 * 1000,
@@ -42,10 +41,11 @@ const CFG = {
   staleAlertMs: 3 * 60 * 1000,
   alertThrottleMs: 10 * 60 * 1000,
   keepAliveMs: 60000,
-  tiers: [
-    { scoreMin: 84, minStratN: 4, liveMin: 0.85 },
-    { scoreMin: 80, minStratN: 3, liveMin: 0.75 }
-  ]
+  // Filtros fixos: sem relaxamento automático nem sinal forçado.
+  tiers: [{ scoreMin: 60, minStratN: 30, liveMin: 0.60 }],
+  minAgreement: 2,
+  minBacktestRate: 0.55,
+  validationFraction: 0.25
 };
 
 const J = 'Jogador';
@@ -53,7 +53,8 @@ const B = 'Banca';
 const E = 'Empate';
 const isCol = (x) => x === J || x === B;
 const opp = (c) => (c === J ? B : c === B ? J : null);
-const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
+const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS', 'VOID']);
+const RESULTADOS_APURADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']); // compatibilidade com histórico legado
 const LOCK_KEY = 727272;
 
 const API_SOURCES = [
@@ -74,17 +75,18 @@ const S = {
   stats: null, statsAtLen: -1
 };
 
-const DAILY = { date: '', total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0, bestStreak: 0 };
-const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0 };
+// Placar DIÁRIO (zera 00h00 Angola = UTC+1)
+const DAILY = { date: '', total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0, void: 0, bestStreak: 0 };
+// Placar GERAL (persistente)
+const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0, void: 0 };
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '20.1',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '20.0',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
-  ultimoAlertaAPI: 0, ultimoAlertaDB: 0, lockOk: false,
-  lastErrorAt: 0
+  ultimoAlertaAPI: 0, ultimoAlertaDB: 0, lockOk: false
 };
 
 let pool = null, server = null, tickTimer = null, keepTimer = null;
@@ -97,100 +99,17 @@ const fmtHora = new Intl.DateTimeFormat('pt-PT', {
   timeZone: 'Africa/Luanda', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
 });
 const hora = (ms = Date.now()) => fmtHora.format(new Date(ms));
+// Meia-noite em Angola (UTC+1, sem horário de verão)
 const luandaDayKey = (ms = Date.now()) => new Date(ms + 3600000).toISOString().slice(0, 10);
 
 const nomeCor = (c) => (c === B ? 'VERMELHO 🔴' : c === J ? 'AZUL 🔵' : 'EMPATE 🟡');
+const emojiCor = (c) => (c === B ? '🔴' : c === J ? '🔵' : '🟡');
 const barra = (p) => {
   const f = Math.max(0, Math.min(10, Math.round((p / 100) * 10)));
   return '▰'.repeat(f) + '▱'.repeat(10 - f);
 };
 
-/* ══════════════════════ DIAMOND TEMPLATES ══════════════════════ */
-
-const LINHA = '◆━━━━━━━━━━━━━━━━━━━━━◆';
-
-function fmtAnalisando() {
-  return [
-    LINHA,
-    '   💎 <b>CAPUNGA DIAMOND</b>',
-    LINHA,
-    '',
-    `◈ Analisando mesa…`,
-    `◈ ${hora()}`
-  ].join('\n');
-}
-
-function fmtSinal(s) {
-  const confEmoji = s.conf >= 93 ? '💎' : s.conf >= 86 ? '🔥' : '⚡';
-  const tagTipo = s.tipo === 'mix' ? ' · MISTA' : s.tipo === 'elite' ? ' · ELITE' : ' · G1';
-  return [
-    LINHA,
-    '   💎 <b>CAPUNGA DIAMOND</b>',
-    LINHA,
-    '',
-    `🏆 <b>SINAL #${s.id}</b>${tagTipo}`,
-    '',
-    `◈ Lado    → <b>${nomeCor(s.cor)}</b>`,
-    `◈ Escudo  → EMPATE 🟡`,
-    `◈ Índice  → ${confEmoji} <b>${s.conf}%</b> ${barra(s.conf)}`,
-    `◈ Padrão  → ${s.emoji || '🧩'} ${s.nome}`,
-    `◈ Hora    → ${hora(s.t)}`,
-    '',
-    LINHA,
-    '  Elite only · sem Gale 2'
-  ].join('\n');
-}
-
-function fmtGale(s, nivel) {
-  return [
-    LINHA,
-    `   ⚡ <b>REFORÇO ${nivel} · #${s.id}</b>`,
-    LINHA,
-    '',
-    `◈ Manter → <b>${nomeCor(s.cor)}</b>`,
-    `◈ Hora   → ${hora()}`,
-    '',
-    LINHA
-  ].join('\n');
-}
-
-function fmtResult(s) {
-  const wins = dailyWins();
-  const taxa = dailyTaxa().toFixed(0);
-  const placar = `◈ Hoje: ${wins}W · ${DAILY.loss}L · ${taxa}%`;
-
-  if (s.status === 'GREEN' || s.status === 'EMPATE') {
-    const titulo = s.status === 'GREEN' ? '💚 <b>ACERTO DIRETO</b>' : '🟡 <b>EMPATE PROTEGIDO</b>';
-    const linha1 = s.status === 'GREEN' ? '◈ Fechado na 1ª rodada' : '◈ Escudo segurou';
-    return [LINHA, `   ${titulo} · #${s.id}`, LINHA, '', linha1, placar, '', LINHA].join('\n');
-  }
-
-  if (s.status === 'G1' || s.status === 'EG1') {
-    const titulo = s.status === 'G1' ? '💚 <b>ACERTO NO G1</b>' : '🟡 <b>EMPATE NO G1</b>';
-    const linha1 = s.status === 'G1' ? '◈ Recuperado no 1º gale' : '◈ Escudo no 1º gale';
-    return [LINHA, `   ${titulo} · #${s.id}`, LINHA, '', linha1, placar, '', LINHA].join('\n');
-  }
-
-  const titulo = s.status === 'LOSS' ? '🔴 <b>STOP</b>' : '🔴 <b>ENCERRADO</b>';
-  return [LINHA, `   ${titulo} · #${s.id}`, LINHA, '', '◈ Stop atingido', '◈ Próxima em análise', placar, '', LINHA].join('\n');
-}
-
-function fmtHistorico() {
-  const wins = dailyWins();
-  const streakTxt = S.curStreak >= 3 ? `${S.curStreak} 🔥` : `${S.curStreak}`;
-  return [
-    `📊 <b>PLACAR · ${DAILY.date}</b>`,
-    '━━━━━━━━━━━━━━━━━━━━',
-    `◈ Sinais     → ${DAILY.total}`,
-    `◈ Acertos    → ${wins}`,
-    `◈ Empates    → ${DAILY.empate + DAILY.eg1 + DAILY.eg2}`,
-    `◈ Stop       → ${DAILY.loss}`,
-    `◈ Sequência  → ${streakTxt} (recorde ${DAILY.bestStreak})`,
-    `◈ Taxa       → ${dailyTaxa().toFixed(1)}%`
-  ].join('\n');
-}
-
-/* ══════════════════════ DB ══════════════════════ */
+/* ============================ DB ============================ */
 
 async function dbInit() {
   if (!DATABASE_URL) { log('DB', 'sem persistência'); return; }
@@ -224,7 +143,7 @@ async function acquireLock() {
     try {
       const r = await pool.query('SELECT pg_try_advisory_lock($1) AS ok', [LOCK_KEY]);
       if (r.rows[0].ok) { R.lockOk = true; return true; }
-      log('LOCK', `instância concorrente — tentativa ${i}/10`);
+      log('LOCK', `instância concorrente detectada — tentativa ${i}/10`);
     } catch (e) { R.erroDB = e.message; log('LOCK ERRO', e.message); }
     await sleep(15000);
   }
@@ -234,6 +153,7 @@ async function releaseLock() {
   if (!pool || !R.lockOk) return;
   try { await pool.query('SELECT pg_advisory_unlock($1)', [LOCK_KEY]); } catch (_) {}
 }
+
 async function dbStateGet(k) {
   if (!pool) return null;
   try { const r = await pool.query('SELECT v FROM capunga_state WHERE k=$1', [k]); return r.rows[0]?.v ?? null; }
@@ -270,14 +190,15 @@ async function dbRoundUpsert(r) {
       [r.id, r.resultado, r.t, r.pj, r.pb]);
   } catch (e) { R.erroDB = e.message; }
 }
+
 async function dbLoadAlltime() {
   if (!pool) return;
   try {
     const r = await pool.query(`SELECT status, COUNT(*)::int AS n FROM capunga_signals
-      WHERE status <> 'PENDENTE' GROUP BY status`);
+      WHERE status IN ('GREEN', 'LOSS', 'VOID') GROUP BY status`);
     for (const k of Object.keys(ALLTIME)) ALLTIME[k] = 0;
     for (const row of r.rows) {
-      ALLTIME.total += row.n;
+      if (row.status !== 'VOID') ALLTIME.total += row.n;
       if (row.status === 'GREEN') ALLTIME.green = row.n;
       else if (row.status === 'G1') ALLTIME.g1 = row.n;
       else if (row.status === 'G2') ALLTIME.g2 = row.n;
@@ -285,6 +206,7 @@ async function dbLoadAlltime() {
       else if (row.status === 'EG1') ALLTIME.eg1 = row.n;
       else if (row.status === 'EG2') ALLTIME.eg2 = row.n;
       else if (row.status === 'LOSS') ALLTIME.loss = row.n;
+      else if (row.status === 'VOID') ALLTIME.void = row.n;
     }
   } catch (e) { R.erroDB = e.message; }
 }
@@ -294,7 +216,7 @@ async function dbLoadState() {
   try {
     const nextId = await dbStateGet('nextId');
     const lastSignalAt = await dbStateGet('lastSignalAt');
-    const curStreak = await dbStateGet('curStreak');
+    const curStreak = await dbStateGet('curStreak_v20');
     if (nextId) S.nextId = Math.max(1, parseInt(nextId, 10));
     if (lastSignalAt) S.lastSignalAt = parseInt(lastSignalAt, 10);
     if (curStreak) S.curStreak = parseInt(curStreak, 10);
@@ -308,6 +230,7 @@ async function dbLoadState() {
       }
     } catch (_) {}
 
+    // Placar diário persistido
     try {
       const rawD = await dbStateGet('daily_v20');
       if (rawD) Object.assign(DAILY, JSON.parse(rawD));
@@ -323,14 +246,14 @@ async function dbLoadState() {
       conf: row.conf, status: row.status, gale: row.gale, agree: row.agree, tier: row.tier || 0,
       t: new Date(row.created_at).getTime(), criadoEm: new Date(row.created_at).getTime(),
       fechadoEm: row.closed_at ? new Date(row.closed_at).getTime() : null,
-      gale1MsgId: null, galeLevel: row.status !== 'PENDENTE' ? 1 : 0
+      gale1MsgId: null, gale2MsgId: null, galeLevel: row.status !== 'PENDENTE' ? 2 : 0
     }));
     await dbLoadAlltime();
-    log('DB', `estado: nextId=${S.nextId}, sinais=${S.signals.length}, diário=${DAILY.date}`);
+    log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}, diário=${DAILY.date}`);
   } catch (e) { R.erroDB = e.message; log('DB ERRO load', e.message); }
 }
 
-/* ══════════════════════ TELEGRAM ══════════════════════ */
+/* ============================ TELEGRAM ============================ */
 
 async function tgSendRaw(texto) {
   if (!BOT_TOKEN || !CHAT_ID) { R.erroTelegram = 'TOKEN/CHAT em falta'; return { ok: false }; }
@@ -367,46 +290,30 @@ async function tgAlert(tag, detalhe) {
     if (now - R.ultimoAlertaDB < CFG.alertThrottleMs) return;
     R.ultimoAlertaDB = now;
   }
-  const msg = [
-    LINHA,
-    `   ⚠️ <b>ALERTA ${tag}</b>`,
-    LINHA,
-    '',
-    detalhe,
-    `◈ ${hora()}`,
-    '',
-    LINHA
-  ].join('\n');
-  await tgSendRaw(msg);
+  await tgSendRaw(`⚠️ <b>ALERTA ${tag}</b>\n${detalhe}\n⏱ ${hora()}`);
 }
 
-/* ══════════════════════ RESET DIÁRIO ══════════════════════ */
+/* ============================ RESET DIÁRIO (00h00 ANGOLA) ============================ */
 
-function dailyWins() { return DAILY.green + DAILY.g1 + DAILY.g2 + DAILY.empate + DAILY.eg1 + DAILY.eg2; }
+function dailyWins() { return DAILY.green; }
 function dailyTaxa() { return DAILY.total > 0 ? (dailyWins() / DAILY.total) * 100 : 0; }
 
 async function sendDailySummary(ontem) {
-  const wins = dailyWins();
-  const taxa = dailyTaxa();
-  const reais = DAILY.green + DAILY.g1 + DAILY.g2;
-  const decididos = reais + DAILY.loss;
-  const taxaReal = decididos > 0 ? (reais / decididos) * 100 : 0;
-  const msg = [
-    LINHA,
-    `   🌙 <b>FECHO · ${ontem}</b>`,
-    LINHA,
+  const wins = DAILY.green;
+  const taxa = DAILY.total > 0 ? (wins / DAILY.total) * 100 : 0;
+  await tgSendRaw([
+    `🕛 <b>FIM DO DIA ${ontem}</b> 🕛`,
     '',
-    `◈ Sinais      → ${DAILY.total}`,
-    `◈ Acertos     → ${wins} (${taxa.toFixed(1)}%)`,
-    `◈ Empates     → ${DAILY.empate + DAILY.eg1 + DAILY.eg2}`,
-    `◈ Stop        → ${DAILY.loss}`,
-    `◈ Sequência   → ${DAILY.bestStreak} (recorde)`,
-    `◈ Real        → ${taxaReal.toFixed(1)}%`,
+    `📊 Resultados apurados: <b>${DAILY.total}</b>`,
+    `✅ Green direto: ${wins}`,
+    `⚪ Invalidado (API): ${DAILY.void}`, 
+    `🟡 Empates: contam como RED (sem proteção)`,
+    `🔴 RED: ${DAILY.loss}`, 
+    `🔥 Maior sequência: ${DAILY.bestStreak}`,
+    `🎯 Taxa de green direto: ${taxa.toFixed(1)}%`,
     '',
-    LINHA,
-    '   🌅 NOVO DIA · ZERADO'
-  ].join('\n');
-  await tgSendRaw(msg);
+    `🌅 <b>PLACAR ZERADO — BOM DIA!</b>`
+  ].join('\n'));
 }
 
 async function checkDailyReset() {
@@ -414,23 +321,72 @@ async function checkDailyReset() {
   if (DAILY.date && DAILY.date !== hoje) {
     const ontem = DAILY.date;
     await sendDailySummary(ontem);
-    for (const k of ['total', 'green', 'g1', 'g2', 'empate', 'eg1', 'eg2', 'loss', 'bestStreak']) DAILY[k] = 0;
+    for (const k of ['total', 'green', 'g1', 'g2', 'empate', 'eg1', 'eg2', 'loss', 'void', 'bestStreak']) DAILY[k] = 0;
     DAILY.date = hoje;
     await dbStateSet('daily_v20', JSON.stringify(DAILY));
-    log('DIÁRIO', `reset ${ontem} -> ${hoje}`);
+    log('DIÁRIO', `reset de ${ontem} -> ${hoje}`);
   } else if (!DAILY.date) {
     DAILY.date = hoje;
   }
 }
 
-/* ══════════════════════ API ══════════════════════ */
+/* ============================ TEMPLATES SMS (novo estilo v20) ============================ */
 
+function fmtAnalisando() {
+  return [`⚙️ <b>CAPUNGA v20 — Lendo a mesa…</b>`, `⏱ ${hora()}`].join('\n');
+}
+
+function fmtSinal(s) {
+  const confEmoji = s.conf >= 93 ? '💎' : s.conf >= 90 ? '✅' : '📊';
+  return [
+    `🎯 ═══ <b>CAPUNGA · SINAL SEM GALE</b> ═══ 🎯`,
+    '',
+    `📍 <b>ENTRADA ÚNICA #${s.id}</b>`,
+    `➡️ Cor: <b>${nomeCor(s.cor)}</b>`,
+    `${confEmoji} Estimativa histórica 1ª rodada: <b>${s.conf}%</b>`,
+    `🧠 Estratégia: <b>${s.nome}</b>`,
+    `🤝 Estratégias concordantes: <b>${s.agree}</b>`,
+    `🕒 ${hora(s.t || Date.now())}`,
+    '',
+    `⛔ <b>Sem Gale e sem proteção.</b>`,
+    `Se a próxima rodada não for ${nomeCor(s.cor)}, o resultado é <b>RED</b>.`,
+    `⚠️ Score histórico não garante resultado futuro.`
+  ].join('\n');
+}
+
+function fmtResult(s) {
+  const placar = `📅 Dia: ${DAILY.green} GREEN • ${DAILY.loss} RED • ${dailyTaxa().toFixed(0)}% GREEN direto`;
+  if (s.status === 'GREEN') return `✅ <b>GREEN DIRETO #${s.id}</b> ✅\n\n🎯 Acertou na primeira rodada.\n${placar}`;
+  if (s.status === 'VOID') return `⚪ <b>SINAL INVALIDADO #${s.id}</b> ⚪\n\nA API não forneceu uma rodada válida dentro da janela; resultado não apurado e não contado como GREEN/RED.`;
+  return `🔴 <b>RED #${s.id}</b> 🔴\n\nA entrada única não acertou na primeira rodada. Sem Gale.\n${placar}`;
+}
+
+function fmtHistorico() {
+  const streak = S.curStreak;
+  const streakTxt = streak >= 3 ? `${streak} 🔥` : `${streak}`;
+  return [
+    `📊 <b>PLACAR DO DIA — ${DAILY.date}</b>`,
+    '━━━━━━━━━━━━━━━',
+    `Sinais: ${DAILY.total}`,
+    `✅ Green direto: ${DAILY.green}`,
+    `⚪ Invalidado (API): ${DAILY.void}`, 
+    `🟡 Empates: contam como RED (sem proteção)`,
+    `🔴 RED: ${DAILY.loss}`, 
+    `🔥 Sequência atual: ${streakTxt} | Recorde: ${DAILY.bestStreak}`,
+    `🎯 Green direto: ${DAILY.total ? (DAILY.green / DAILY.total * 100).toFixed(1) : '0.0'}%`
+  ].join('\n');
+}
+
+/* ============================ API ============================ */
+
+// Remove acentos SEM regex de caracteres combinantes (evita corrupção de encoding)
 function stripAccents(str) {
   return String(str ?? '').normalize('NFD').split('').filter((c) => {
     const code = c.charCodeAt(0);
     return code < 0x0300 || code > 0x036f;
   }).join('');
 }
+
 function normalizeOutcome(v) {
   if (v && typeof v === 'object') v = v.outcome ?? v.resultado ?? v.winner ?? v.name;
   const s = stripAccents(v).trim().toLowerCase().replace(/[\s_-]+/g, '');
@@ -447,6 +403,7 @@ function extractItems(b) {
     b.data?.results, b.data?.items, b.data?.resultados, b.data?.rounds,
     b.data?.events, b.data?.data].find(Array.isArray) || [];
 }
+// null-safe: Number(null) === 0 criaria scores falsos (ex.: Gatilho 0 falso)
 const numOrNull = (v) => {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
@@ -468,10 +425,11 @@ function normalizeRound(item) {
   const pb = numOrNull(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
   return { id, resultado, t, pj, pb };
 }
+
 async function fetchFrom(url) {
   const resp = await axios.get(url, {
     timeout: 10000,
-    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDiamond/20.1' }
+    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/20.0' }
   });
   const map = new Map();
   for (const it of extractItems(resp.data)) {
@@ -480,6 +438,8 @@ async function fetchFrom(url) {
   }
   return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
 }
+
+// Fallback automático entre fontes: se a primária falhar, tenta a secundária
 async function fetchRounds() {
   const erros = [];
   for (let idx = 0; idx < API_SOURCES.length; idx++) {
@@ -499,12 +459,19 @@ async function fetchRounds() {
   throw new Error(R.erroAPI);
 }
 
-/* ══════════════════════ HELPERS ══════════════════════ */
+/* ============================ HELPERS ============================ */
 
 const hasScore = (r) => r && Number.isFinite(r.pj) && Number.isFinite(r.pb);
 const margem = (r) => Math.abs((r.pj || 0) - (r.pb || 0));
 const scoreOf = (r) => (r.resultado === J ? r.pj : r.pb);
-
+const scoreRange = (s) => {
+  if (!Number.isFinite(s)) return null;
+  if (s <= 2) return 'MB';
+  if (s <= 4) return 'B';
+  if (s <= 6) return 'M';
+  if (s <= 8) return 'A';
+  return 'MA';
+};
 function streak(seq) {
   if (!seq.length) return 0;
   let n = 0; const cor = seq[0].resultado;
@@ -527,163 +494,237 @@ function detectRegime(seq) {
   const label = chop >= 0.65 ? 'errático' : chop <= 0.35 ? 'tendência' : 'neutro';
   return { trend, chop, label };
 }
+// Estratégias de quebra só em mesa errática; de sequência só em tendência
 function regimeFit(cand, regime) {
   const k = cand.key;
-  if (/SEQ_(PINGPONG|2x2|3_1|MOMENTUM|ALT_STRONG)/.test(k)) return regime.chop >= 0.45;
-  if (/BANKER_BIAS/.test(k)) return regime.trend >= 0.45;
+  if (/SEQ_(QUEBRA|SURF|PINGPONG|2x2|EXTEND|3_1|MOMENTUM|ALT|BREAK_WEAK)/.test(k)) return regime.chop >= 0.45;
+  if (/SEQ_(REP|STRONG_STREAK)|BANKER_BIAS/.test(k)) return regime.trend >= 0.45;
   return true;
 }
 
-/* ══════════════════════ API HEALTH GATE ══════════════════════ */
-
-function apiHealthy() {
-  if (!S.hist.length) return false;
-  const last = S.hist[S.hist.length - 1];
-  if (Date.now() - last.t > 90000) return false;
-  if (R.erroAPI) return false;
-  if (R.lastErrorAt && Date.now() - R.lastErrorAt < 60000) return false;
-  return true;
-}
-
-/* ══════════════════════ FILTROS (não emitem sinal) ══════════════════════ */
-
-function _margemAlta({ rows }) {
-  const r = rows[0];
-  if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null;
-  return { cor: r.resultado, key: 'NUM_MARGEM5', strength: 82 };
-}
-function _tendencia({ rows }) {
-  const s = rows.slice(0, 8).filter(hasScore);
-  if (s.length < 6) return null;
-  const mj = s.reduce((a, r) => a + r.pj, 0) / s.length;
-  const mb = s.reduce((a, r) => a + r.pb, 0) / s.length;
-  const diff = mj - mb;
-  if (Math.abs(diff) < 1.5) return null;
-  return { cor: diff > 0 ? J : B, strength: 82 };
-}
-
-/* ══════════════════════ ELITE ══════════════════════ */
-
-function _altForte({ seq }) {
-  const L = alternation(seq);
-  if (L < 3) return null;
-  const s = seq.slice(0, L);
-  if (!s.every((r) => hasScore(r) && margem(r) >= 3)) return null;
-  return { cor: opp(seq[0].resultado), key: 'SEQ_ALT_STRONG', nome: `Alt. forte ${L}`, emoji: '⚔️', strength: 86, tipo: 'elite' };
-}
-function _3to1({ seq }) {
-  if (seq.length < 4) return null;
-  const [a, b, c, d] = seq.map((x) => x.resultado);
-  if (a !== b && b === c && c === d) return { cor: a, key: 'SEQ_3_1', nome: '3→1 confirmado', emoji: '🧩', strength: 86, tipo: 'elite' };
-  return null;
-}
-function _empateIsolado({ rows, seq }) {
-  if (!rows[0] || rows[0].resultado !== E) return null;
-  if (!rows[1] || rows[1].resultado === E) return null;
-  if (!seq.length) return null;
-  return { cor: opp(seq[0].resultado), key: 'TIE_SINGLE', nome: 'Empate isolado', emoji: '🔀', strength: 82, tipo: 'elite' };
-}
-
-/* ══════════════════════ G1 MAX ══════════════════════ */
-
-function _bloco22({ seq }) {
-  if (seq.length < 4) return null;
-  const [a, b, c, d] = seq.map((x) => x.resultado);
-  if (a === b && c === d && a !== c) return { cor: c, key: 'SEQ_2x2', nome: 'Bloco 2+2', emoji: '♟️', strength: 82, tipo: 'g1' };
-  return null;
-}
-function _pingPong({ seq }) {
-  const L = alternation(seq);
-  if (L < 4 || L > 10) return null;
-  return { cor: opp(seq[0].resultado), key: 'SEQ_PINGPONG', nome: `Ping-pong ${L}`, emoji: '🏓', strength: 80, tipo: 'g1' };
-}
-function _momentum2({ seq }) {
-  if (seq.length < 3) return null;
-  const [a, b, c] = seq.map((x) => x.resultado);
-  if (a !== b && b === c) return { cor: c, key: 'SEQ_MOMENTUM_2', nome: 'Momentum 2', emoji: '⚡', strength: 80, tipo: 'g1' };
-  return null;
-}
-function _scoreRep({ seq }) {
-  if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
-  const [a, b] = seq;
-  if (a.resultado !== b.resultado) return null;
-  if (scoreOf(a) === scoreOf(b)) return { cor: a.resultado, key: 'NUM_REPETE', nome: `Score repetido ${scoreOf(a)}`, emoji: '🔂', strength: 82, tipo: 'g1' };
-  return null;
-}
-function _vies({ seq }) {
-  const s = seq.slice(0, 20);
-  if (s.length < 15) return null;
-  const b = s.filter((r) => r.resultado === B).length;
-  const j = s.filter((r) => r.resultado === J).length;
-  if (b >= 12) return { cor: B, key: 'BANKER_BIAS_20', nome: 'Viés Banca', emoji: '📉', strength: 82, tipo: 'g1' };
-  if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', emoji: '📈', strength: 82, tipo: 'g1' };
-  return null;
-}
-
-/* ══════════════════════ MISTAS ══════════════════════ */
-
-function _travaTripla({ rows, seq }) {
-  const alt = _altForte({ seq });
-  const bloco = _bloco22({ seq });
-  if (alt && bloco && alt.cor === bloco.cor) {
-    return { cor: alt.cor, key: 'MIX_TRIPLA', nome: 'Trava Tripla', emoji: '🔐', strength: 90, tipo: 'mix' };
-  }
-  return null;
-}
-function _duploSinal({ rows, seq }) {
-  const elite = [_altForte({ seq }), _3to1({ seq }), _empateIsolado({ rows, seq })].filter(Boolean);
-  const byColor = {};
-  for (const e of elite) byColor[e.cor] = (byColor[e.cor] || 0) + 1;
-  for (const cor in byColor) {
-    if (byColor[cor] >= 2) return { cor, key: 'MIX_DUPLO', nome: 'Duplo Sinal Elite', emoji: '🎯', strength: 90, tipo: 'mix' };
-  }
-  return null;
-}
-function _confluencia({ rows, seq }) {
-  const elite = _altForte({ seq }) || _3to1({ seq });
-  if (!elite) return null;
-  const checks = [_vies({ seq }), _margemAlta({ rows }), _tendencia({ rows })]
-    .filter((x) => x && x.cor === elite.cor).length;
-  if (checks >= 1) {
-    return { cor: elite.cor, key: 'MIX_CONFLUENCIA', nome: 'Confluência Elite', emoji: '🌟', strength: 86 + checks * 2, tipo: 'mix' };
-  }
-  return null;
-}
-function _empateBlindado({ rows, seq, isBacktest }) {
-  if (isBacktest) return null;
-  const tie = _empateIsolado({ rows, seq });
-  if (!tie) return null;
-  const recent = S.signals.filter((x) => x.key === 'TIE_SINGLE' && FECHADOS.has(x.status)).slice(-2);
-  if (recent.length === 2 && recent.every((x) => x.status === 'LOSS')) return null;
-  return { cor: tie.cor, key: 'MIX_EMPATE', nome: 'Empate Blindado', emoji: '🛡️', strength: 85, tipo: 'mix' };
-}
-function _mesaQuente({ rows, seq, isBacktest }) {
-  if (isBacktest) return null;
-  const recent = S.signals.filter((x) => FECHADOS.has(x.status)).slice(-2);
-  if (recent.length < 2) return null;
-  if (!recent.every((x) => x.status === 'GREEN' || x.status === 'EMPATE')) return null;
-  const elite = _altForte({ seq }) || _3to1({ seq }) || _bloco22({ seq });
-  if (!elite) return null;
-  return { cor: elite.cor, key: 'MIX_QUENTE', nome: 'Mesa Quente Confirmada', emoji: '🔥', strength: 86, tipo: 'mix' };
-}
-
-/* ══════════════════════ ARRAY FINAL ══════════════════════ */
+/* ============================ ESTRATÉGIAS (30 — só as com lógica real) ============================ */
 
 const STRATS = [
-  _altForte, _3to1, _empateIsolado,
-  _bloco22, _pingPong, _momentum2, _scoreRep, _vies,
-  _travaTripla, _duploSinal, _confluencia, _empateBlindado, _mesaQuente,
+  // ---- SEQUÊNCIA (padrões reais de repetição/alternância) ----
+  function seqRepeticao({ seq }) {
+    const n = streak(seq);
+    if (n < 3 || n > 7) return null;
+    const strength = [0, 0, 0, 72, 78, 84, 86, 86][n] || 86;
+    return { cor: seq[0].resultado, key: `SEQ_REP_${n}`, nome: `Sequência x${n}`, emoji: '🔁', strength, tipo: 'seq' };
+  },
+  function seqQuebra({ seq }) {
+    const n = streak(seq);
+    if (n < 4 || n > 8) return null;
+    const strength = [0, 0, 0, 0, 74, 80, 84, 85, 85][n] || 85;
+    return { cor: opp(seq[0].resultado), key: `SEQ_QUEBRA_${n}`, nome: `Quebra x${n}`, emoji: '💥', strength, tipo: 'seq' };
+  },
+  function seqSurf({ seq }) {
+    const L = alternation(seq);
+    if (L < 4) return null;
+    const strength = L >= 6 ? 84 : L >= 5 ? 78 : 72;
+    return { cor: opp(seq[0].resultado), key: `SEQ_SURF_${L}`, nome: `Surf ${L}`, emoji: '🌊', strength, tipo: 'seq' };
+  },
+  function seqDoisDois({ seq }) {
+    if (seq.length < 4) return null;
+    const [a, b, c, d] = seq.map((x) => x.resultado);
+    if (a === b && c === d && a !== c) return { cor: c, key: 'SEQ_2x2', nome: 'Bloco 2+2', emoji: '♟️', strength: 76, tipo: 'seq' };
+    return null;
+  },
+  function seqTresUm({ seq }) {
+    if (seq.length < 4) return null;
+    const [a, b, c, d] = seq.map((x) => x.resultado);
+    if (a !== b && b === c && c === d) return { cor: a, key: 'SEQ_3_1', nome: '3→1 confirmado', emoji: '🧩', strength: 78, tipo: 'seq' };
+    return null;
+  },
+  function seqMomentum2({ seq }) {
+    if (seq.length < 3) return null;
+    const [a, b, c] = seq.map((x) => x.resultado);
+    if (a !== b && b === c) return { cor: c, key: 'SEQ_MOMENTUM_2', nome: 'Momentum 2', emoji: '⚡', strength: 77, tipo: 'seq' };
+    return null;
+  },
+  function seqBreakWeak4({ seq }) {
+    const n = streak(seq);
+    if (n !== 4) return null;
+    const s = seq.slice(0, 4);
+    if (!s.every((r) => hasScore(r) && margem(r) <= 2)) return null;
+    return { cor: opp(seq[0].resultado), key: 'SEQ_BREAK_WEAK_4', nome: 'Quebra fraca x4', emoji: '🩹', strength: 79, tipo: 'seq' };
+  },
+  function seqExtend({ seq }) {
+    if (seq.length < 5) return null;
+    const [a, b, c, d, e] = seq.map((x) => x.resultado);
+    if (a === b && b === c && c !== d && d === e) {
+      return { cor: a, key: 'SEQ_EXTEND', nome: 'Streak extend', emoji: '⏭️', strength: 80, tipo: 'seq' };
+    }
+    return null;
+  },
+  function seqStrongStreak({ seq }) {
+    const n = streak(seq);
+    if (n < 4 || n > 6) return null;
+    const same = seq.slice(0, n);
+    if (!same.every((r) => hasScore(r) && margem(r) >= 3)) return null;
+    return { cor: seq[0].resultado, key: 'SEQ_STRONG_STREAK', nome: `Dragon ${n}`, emoji: '🐉', strength: 82, tipo: 'seq' };
+  },
+  function seqPingPong({ seq }) {
+    const L = alternation(seq);
+    if (L < 4 || L > 10) return null;
+    return { cor: opp(seq[0].resultado), key: 'SEQ_PINGPONG', nome: `Ping-pong ${L}`, emoji: '🏓', strength: 79, tipo: 'seq' };
+  },
+  function seqAlternatingStrong({ seq }) {
+    const L = alternation(seq);
+    if (L < 3) return null;
+    const s = seq.slice(0, L);
+    if (!s.every((r) => hasScore(r) && margem(r) >= 3)) return null;
+    return { cor: opp(seq[0].resultado), key: 'SEQ_ALT_STRONG', nome: `Alt. forte ${L}`, emoji: '⚔️', strength: 78, tipo: 'seq' };
+  },
+  function bankerBias20({ seq }) {
+    const s = seq.slice(0, 20);
+    if (s.length < 15) return null;
+    const b = s.filter((r) => r.resultado === B).length;
+    const j = s.filter((r) => r.resultado === J).length;
+    if (b >= 12) return { cor: B, key: 'BANKER_BIAS_20', nome: 'Viés Banca', emoji: '📉', strength: 80, tipo: 'seq' };
+    if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', emoji: '📈', strength: 80, tipo: 'seq' };
+    return null;
+  },
+  // ---- NUMÉRICA (força real dos dados: margens, escores, sequências de pontos) ----
+  function numEscada({ seq }) {
+    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
+    const [a, b, c] = seq;
+    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
+    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c);
+    if ((sb - sa === 1 && sc - sb === 1) || (sa - sb === 1 && sb - sc === 1)) {
+      return { cor: a.resultado, key: 'NUM_ESCADA', nome: `Escada ${sa}→${sb}→${sc}`, emoji: '🪜', strength: 88, tipo: 'num' };
+    }
+    return null;
+  },
+  function numRepeteScore({ seq }) {
+    if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
+    const [a, b] = seq;
+    if (a.resultado !== b.resultado) return null;
+    if (scoreOf(a) === scoreOf(b)) return { cor: a.resultado, key: 'NUM_REPETE', nome: `Score repetido ${scoreOf(a)}`, emoji: '🔂', strength: 84, tipo: 'num' };
+    return null;
+  },
+  function numThreeLow({ seq }) {
+    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
+    const [a, b, c] = seq;
+    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
+    if (scoreOf(a) <= 3 && scoreOf(b) <= 3 && scoreOf(c) <= 3) {
+      return { cor: opp(a.resultado), key: 'NUM_THREE_LOW', nome: 'Virada de baixos x3', emoji: '📉', strength: 81, tipo: 'num' };
+    }
+    return null;
+  },
+  function numGatilho_0({ seq }) {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 0) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_0', nome: 'Gatilho 0', emoji: '🎯', strength: 86, tipo: 'num' };
+    return null;
+  },
+  function numGatilho_1({ seq }) {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 1) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_1', nome: 'Gatilho 1', emoji: '🎯', strength: 84, tipo: 'num' };
+    return null;
+  },
+  function numGatilho_9({ seq }) {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 9) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_9', nome: 'Gatilho 9', emoji: '🎯', strength: 88, tipo: 'num' };
+    return null;
+  },
+  function numMargemAlta({ rows }) {
+    const r = rows[0];
+    if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null;
+    return { cor: r.resultado, key: 'NUM_MARGEM5', nome: `Margem alta ${r.pj}×${r.pb}`, emoji: '📊', strength: 82, tipo: 'num' };
+  },
+  function numDiff4x3({ seq }) {
+    if (seq.length < 3) return null;
+    const t = seq.slice(0, 3);
+    if (!t.every((r) => hasScore(r) && margem(r) >= 4 && r.resultado === t[0].resultado)) return null;
+    return { cor: t[0].resultado, key: 'NUM_DIFF4x3', nome: 'Diff ≥4 ×3', emoji: '🔢', strength: 85, tipo: 'num' };
+  },
+  function numViradaBaixa({ seq }) {
+    if (seq.length < 2) return null;
+    const [a, b] = seq;
+    if (!hasScore(a) || !hasScore(b) || a.resultado !== b.resultado) return null;
+    if (scoreOf(a) > 4 || scoreOf(b) > 4) return null;
+    return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Virada de baixos', emoji: '🔄', strength: 80, tipo: 'num' };
+  },
+  function numTendencia({ rows }) {
+    const s = rows.slice(0, 8).filter(hasScore);
+    if (s.length < 6) return null;
+    const mj = s.reduce((a, r) => a + r.pj, 0) / s.length;
+    const mb = s.reduce((a, r) => a + r.pb, 0) / s.length;
+    const diff = mj - mb;
+    if (Math.abs(diff) < 1.5) return null;
+    return {
+      cor: diff > 0 ? J : B, key: 'NUM_TENDENCIA',
+      nome: `Tendência ${mj.toFixed(1)}×${mb.toFixed(1)}`, emoji: '📈',
+      strength: Math.abs(diff) >= 2.2 ? 84 : 76, tipo: 'num'
+    };
+  },
+  function numRangeSalto({ seq }) {
+    if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
+    const [a, b] = seq;
+    const ra = scoreRange(scoreOf(a)), rb = scoreRange(scoreOf(b));
+    if (!ra || !rb) return null;
+    if ((ra === 'MB' && rb === 'MA') || (ra === 'MA' && rb === 'MB')) {
+      return { cor: opp(a.resultado), key: 'NUM_SALTO_RANGE', nome: `Salto ${scoreOf(b)}→${scoreOf(a)}`, emoji: '📐', strength: 81, tipo: 'num' };
+    }
+    return null;
+  },
+  function numScoreTrend3({ seq }) {
+    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
+    const [a, b, c] = seq;
+    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
+    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c);
+    if (sa < sb && sb < sc) {
+      return { cor: a.resultado, key: 'NUM_SCORE_TREND_3', nome: `Escala ascendente ${sa}→${sc}`, emoji: '📊', strength: 82, tipo: 'num' };
+    }
+    return null;
+  },
+  function numDoubleHigh({ seq }) {
+    if (seq.length < 2 || !seq.slice(0, 2).every(hasScore)) return null;
+    const [a, b] = seq;
+    if (a.resultado !== b.resultado) return null;
+    if (margem(a) >= 5 && margem(b) >= 5) {
+      return { cor: a.resultado, key: 'NUM_DOUBLE_HIGH', nome: 'Dupla margem alta', emoji: '💪', strength: 84, tipo: 'num' };
+    }
+    return null;
+  },
+  function numMomentumShift({ seq }) {
+    if (seq.length < 4 || !seq.slice(0, 4).every(hasScore)) return null;
+    const [a, b, c, d] = seq;
+    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c), sd = scoreOf(d);
+    if (sb - sa < 0 && sc - sb < 0 && sd - sc < 0) {
+      return { cor: opp(a.resultado), key: 'MOMENTUM_SHIFT', nome: 'Mudança de momentum', emoji: '🔀', strength: 78, tipo: 'num' };
+    }
+    return null;
+  },
+  // ---- EMPATE (padrões pós-empate reais) ----
+  function numPosEmpate({ rows, seq }) {
+    if (!rows[0] || rows[0].resultado !== E || !seq.length) return null;
+    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', emoji: '🎯', strength: 74, tipo: 'num' };
+  },
+  function tieCascade({ rows }) {
+    const ties = rows.slice(0, 3).filter((r) => r.resultado === E).length;
+    if (ties < 2) return null;
+    const pre = rows.find((r) => isCol(r.resultado));
+    if (!pre) return null;
+    return { cor: pre.resultado, key: 'TIE_CASCADE', nome: 'Cascata de empates', emoji: '🟡', strength: 76, tipo: 'num' };
+  },
+  function tieSingle({ rows, seq }) {
+    if (!rows[0] || rows[0].resultado !== E) return null;
+    if (!rows[1] || rows[1].resultado === E) return null;
+    if (!seq.length) return null;
+    return { cor: opp(seq[0].resultado), key: 'TIE_SINGLE', nome: 'Empate isolado', emoji: '🔀', strength: 77, tipo: 'num' };
+  },
+  function tieDoubleBack({ rows }) {
+    if (rows.length < 3) return null;
+    if (rows[0].resultado !== E || rows[1].resultado !== E) return null;
+    if (!isCol(rows[2].resultado)) return null;
+    return { cor: rows[2].resultado, key: 'TIE_DOUBLE_BACK', nome: 'Retorno pós-duplo empate', emoji: '🔙', strength: 78, tipo: 'num' };
+  }
 ];
 
-const STRAT_WHITELIST = new Set([
-  'SEQ_ALT_STRONG', 'SEQ_3_1', 'TIE_SINGLE',
-  'SEQ_2x2', 'SEQ_PINGPONG', 'SEQ_MOMENTUM_2', 'NUM_REPETE', 'BANKER_BIAS_20',
-  'MIX_TRIPLA', 'MIX_DUPLO', 'MIX_CONFLUENCIA', 'MIX_EMPATE', 'MIX_QUENTE',
-]);
-
-function runStrategies(rows, isBacktest = false) {
+function runStrategies(rows) {
   const seq = rows.filter((r) => isCol(r.resultado));
-  const ctx = { rows, seq, isBacktest };
+  const ctx = { rows, seq };
   const out = [];
   for (const fn of STRATS) {
     try { const r = fn(ctx); if (r && isCol(r.cor)) out.push(r); } catch (_) {}
@@ -691,7 +732,7 @@ function runStrategies(rows, isBacktest = false) {
   return out;
 }
 
-/* ══════════════════════ BACKTEST ══════════════════════ */
+/* ============================ BACKTEST ============================ */
 
 function windowAt(H, i) {
   const rows = [];
@@ -702,34 +743,38 @@ function windowAt(H, i) {
   return rows;
 }
 function evalEntry(H, i, cor) {
-  for (let k = 1; k <= CFG.maxGale + 1; k++) {
-    const idx = i + k;
-    if (idx >= H.length) return null;
-    if (H[idx].t - H[idx - 1].t > CFG.gapMs) return false;
-    if (H[idx].resultado === cor || H[idx].resultado === E) return true;
-  }
-  return false;
+  const idx = i + 1;
+  if (idx >= H.length) return null;
+  if (H[idx].t - H[i].t > CFG.gapMs) return null; // sem dado fiável: exclui da amostra
+  return H[idx].resultado === cor; // empate e cor oposta são RED; sem recuperação
 }
+
 function backtest() {
   const H = S.hist;
   const per = {};
   const ini = 10, fim = H.length - 1;
-  if (fim - ini < 30) return { per, baseRate: 0.90 };
-  let bw = 0, bn = 0;
+  if (fim - ini < 30) return { per, baseRate: 0.50, validationN: 0 };
+  // Últimos 25% do histórico são reservados como validação temporal.
+  const validationStart = Math.floor(H.length * (1 - CFG.validationFraction));
+  let validationWins = 0, validationN = 0;
   for (let i = ini; i < fim; i++) {
     const win = windowAt(H, i);
     if (win.length < 6) continue;
-    for (const c of runStrategies(win, true)) {
+    for (const c of runStrategies(win)) {
       const v = evalEntry(H, i, c.cor);
       if (v === null) continue;
-      const p = per[c.key] || (per[c.key] = { n: 0, w: 0 });
+      const p = per[c.key] || (per[c.key] = { n: 0, w: 0, validationN: 0, validationW: 0 });
       p.n++; if (v) p.w++;
-      bn++; if (v) bw++;
+      if (i >= validationStart) {
+        p.validationN++; if (v) p.validationW++;
+        validationN++; if (v) validationWins++;
+      }
     }
   }
-  const baseRate = bn ? bw / bn : 0.90;
-  return { per, baseRate: Math.min(0.95, Math.max(0.80, baseRate)) };
+  const baseRate = validationN ? validationWins / validationN : 0.50;
+  return { per, baseRate, validationN };
 }
+
 function getStats(force = false) {
   if (force || !S.stats || S.hist.length - S.statsAtLen >= 30) {
     S.stats = backtest();
@@ -738,41 +783,29 @@ function getStats(force = false) {
   return S.stats;
 }
 
-/* ══════════════════════ CONFIANÇA ══════════════════════ */
+/* ============================ CONFIANÇA ============================ */
 
-function bayesianRate(w, n, priorRate = 0.90, priorWeight = 10) {
+function bayesianRate(w, n, priorRate = 0.50, priorWeight = 10) {
   return (w + priorRate * priorWeight) / (n + priorWeight);
 }
 function confianca(cand, ctx) {
   const stats = ctx.stats;
-  const p = stats.per[cand.key] || { n: 0, w: 0 };
-  const baseRate = stats.baseRate || 0.90;
-  const btRate = bayesianRate(p.w, p.n, baseRate, 6);
-  const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status));
-  const liveW = live.filter((x) => x.status !== 'LOSS').length;
+  const p = stats.per[cand.key] || { validationN: 0, validationW: 0 };
+  const baseRate = Number.isFinite(stats.baseRate) ? stats.baseRate : 0.50;
+  const btRate = bayesianRate(p.validationW, p.validationN, baseRate, 6);
+  const live = S.signals.filter((x) => x.key === cand.key && RESULTADOS_APURADOS.has(x.status));
+  const liveW = live.filter((x) => x.status === 'GREEN').length;
   const liveRate = live.length >= 3 ? bayesianRate(liveW, live.length, btRate, 4) : null;
-  const btSamples = p.n + 6;
+  const btSamples = p.validationN + 6;
   const liveSamples = live.length >= 3 ? live.length + 4 : 0;
   const observed = ((btRate * btSamples) + ((liveRate ?? btRate) * liveSamples)) / (btSamples + liveSamples);
 
   let conf = Math.round(observed * 100);
-  const agree = ctx.agreement?.confirmations || 0;
-  conf += agree >= 3 ? 2 : agree >= 2 ? 1 : 0;
-  conf += Math.round((cand.strength - 80) * 0.2);
-  if (cand.tipo === 'seq' && ctx.regime) {
-    const regimeMatch = (cand.key.includes('PINGPONG') || cand.key.includes('MOMENTUM') || cand.key.includes('ALT'))
-      ? ctx.regime.chop : ctx.regime.trend;
-    conf += Math.round((regimeMatch - 0.5) * 4);
-  }
-  if (live.length >= 5 && liveW / live.length < 0.85) conf -= 4;
-  const recentLoss = S.signals.find((x) =>
-    x.key === cand.key && x.status === 'LOSS' && Date.now() - (x.fechadoEm || 0) < 5 * 60 * 1000);
-  if (recentLoss) conf -= 3;
 
-  return Math.max(80, Math.min(95, conf));
+  return Math.max(0, Math.min(100, conf));
 }
 
-/* ══════════════════════ SUSPENSÃO ══════════════════════ */
+/* ============================ SUSPENSÃO (persistente) ============================ */
 
 function isSuspended(key) {
   const u = SUSPENDED[key];
@@ -781,29 +814,23 @@ function isSuspended(key) {
   return true;
 }
 function maybeSuspend(key) {
-  const recent = S.signals.filter((x) => x.key === key && FECHADOS.has(x.status)).slice(-CFG.suspendLossStreak);
+  const recent = S.signals.filter((x) => x.key === key && RESULTADOS_APURADOS.has(x.status)).slice(-CFG.suspendLossStreak);
   if (recent.length < CFG.suspendLossStreak) return;
-  if (recent.every((x) => x.status === 'LOSS')) {
+  if (recent.every((x) => x.status !== 'GREEN')) {
     SUSPENDED[key] = Date.now() + CFG.suspendMs;
     dbStateSet('suspended', JSON.stringify(Object.entries(SUSPENDED)));
     log('SUSPENSO', { key, consecutiveLosses: recent.length });
   }
 }
 
-/* ══════════════════════ TIER E GATE ══════════════════════ */
-
-function idleMs() { return S.lastSignalAt ? Date.now() - S.lastSignalAt : Infinity; }
-function tierAtual() {
-  const i = idleMs();
-  if (i >= CFG.relaxMs) return 1;
-  return 0;
-}
+/* ============================ POLÍTICA CONSERVADORA ============================ */
+/* ============================ GATE ============================ */
 
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
 function podeGerar() {
   if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return false; }
-  if (!apiHealthy()) { R.ultimoMotivo = 'API instável — sinal bloqueado'; return false; }
+  if (R.erroAPI) { R.ultimoMotivo = 'API com erro; aguardando sincronização válida'; return false; }
   if (pendentes().length >= CFG.maxPending) { R.ultimoMotivo = 'max pending'; return false; }
   const now = Date.now();
   if (S.lastSignalAt && now - S.lastSignalAt < CFG.minGapMs) {
@@ -812,6 +839,7 @@ function podeGerar() {
   }
   const last = S.hist[S.hist.length - 1];
   if (!last) { R.ultimoMotivo = 'sem hist'; return false; }
+  if (now - last.t > CFG.maxDataAgeMs) { R.ultimoMotivo = 'dados API desatualizados'; return false; }
   if (now - last.t < CFG.minSettledAgeMs) {
     R.ultimoMotivo = `rodada recente ${Math.ceil((CFG.minSettledAgeMs - (now - last.t)) / 1000)}s`;
     return false;
@@ -820,51 +848,43 @@ function podeGerar() {
   return true;
 }
 
-function stratSamples(key, stats) {
-  const p = stats.per[key];
-  const bn = p ? p.n : 0;
-  let liveN = 0;
-  for (const x of S.signals) if (x.key === key && FECHADOS.has(x.status)) liveN++;
-  return bn + liveN;
-}
 function liveHitRate(key) {
   let n = 0, w = 0;
   for (const x of S.signals) {
-    if (x.key !== key || !FECHADOS.has(x.status)) continue;
-    n++; if (x.status !== 'LOSS') w++;
+    if (x.key !== key || !RESULTADOS_APURADOS.has(x.status)) continue;
+    n++; if (x.status === 'GREEN') w++;
   }
   return n >= 5 ? w / n : null;
 }
 
-/* ══════════════════════ GERAR SINAL ══════════════════════ */
-/* FIX v20.1: hora registada ANTES do envio para o Telegram. */
+/* ============================ GERAR SINAL ============================ */
 
 async function tentarSinal() {
   if (!podeGerar()) return;
 
-  const tier = tierAtual();
+  const tier = 0;
   R.tier = tier;
-  const T = CFG.tiers[tier];
+  const T = CFG.tiers[0];
 
   const rows = S.hist.slice(-30).reverse();
   const stats = getStats();
   const seq = rows.filter((r) => isCol(r.resultado));
   const regime = detectRegime(seq);
 
-  let cands = runStrategies(rows, false);
+  let cands = runStrategies(rows);
   if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
 
-  cands = cands.filter((c) => STRAT_WHITELIST.has(c.key));
   cands = cands.filter((c) => regimeFit(c, regime));
 
   cands = cands.filter((c) => {
     if (isSuspended(c.key)) return false;
-    if (stratSamples(c.key, stats) < T.minStratN) return false;
+    const hist = stats.per[c.key];
+    if (!hist || hist.validationN < T.minStratN || hist.validationW / hist.validationN < CFG.minBacktestRate) return false;
     const lr = liveHitRate(c.key);
     if (lr !== null && lr < T.liveMin) return false;
     return true;
   });
-  if (!cands.length) { R.ultimoMotivo = `tier${tier}: filtros`; return; }
+  if (!cands.length) { R.ultimoMotivo = `filtros: score ${T.scoreMin}%, amostra ${T.minStratN}`; return; }
 
   const byColor = {};
   for (const c of cands) {
@@ -875,6 +895,7 @@ async function tentarSinal() {
   let melhor = null;
   for (const cor of Object.keys(byColor)) {
     const list = byColor[cor];
+    if (list.length < CFG.minAgreement) continue; // pelo menos 2 estratégias concordantes
     const scored = list.map((c) => ({ ...c, conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } }) }));
     scored.sort((a, b) => b.conf - a.conf);
     const top = scored[0];
@@ -885,15 +906,11 @@ async function tentarSinal() {
   if (melhor.conf < T.scoreMin) { R.ultimoMotivo = `score ${melhor.conf} < ${T.scoreMin} (tier${tier})`; return; }
 
   const reservedId = S.nextId;
-
-  // ✅ FIX v20.1: hora definida ANTES do envio
-  const agora = Date.now();
-
   const sinalPreliminar = {
     id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome, emoji: melhor.emoji,
     conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE', tier,
-    t: agora, criadoEm: agora, agree: melhor.agree,
-    gale1MsgId: null, galeLevel: 0
+    t: 0, criadoEm: 0, agree: melhor.agree,
+    gale1MsgId: null, gale2MsgId: null, galeLevel: 0
   };
 
   const analisando = await tgSendRaw(fmtAnalisando());
@@ -904,7 +921,9 @@ async function tentarSinal() {
       R.ultimoMotivo = 'telegram falhou';
       return;
     }
-
+    const agora = Date.now();
+    sinalPreliminar.t = agora;
+    sinalPreliminar.criadoEm = agora;
     S.nextId++;
     S.signals.push(sinalPreliminar);
     if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
@@ -916,27 +935,13 @@ async function tentarSinal() {
     await dbStateSet('nextId', String(S.nextId));
     await dbStateSet('lastSignalAt', String(agora));
 
-    log('SINAL', {
-      id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf,
-      key: sinalPreliminar.key, tipo: sinalPreliminar.tipo, tier,
-      hora: hora(agora)
-    });
+    log('SINAL', { id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf, key: sinalPreliminar.key, tier });
   } finally {
     if (analisando.ok) await tgDelete(analisando.messageId);
   }
 }
 
-async function notificarGale(s, nivel) {
-  if (!apiHealthy()) return;
-  if (s.gale1MsgId) { await tgDelete(s.gale1MsgId); s.gale1MsgId = null; }
-  const r = await tgSendRaw(fmtGale(s, nivel));
-  if (r.ok) {
-    if (nivel === 1) s.gale1MsgId = r.messageId;
-    s.galeLevel = nivel;
-  }
-}
-
-/* ══════════════════════ FECHAR ══════════════════════ */
+/* ============================ FECHAR ============================ */
 
 async function fecharSinal(s, status, gale) {
   s.status = status;
@@ -944,14 +949,27 @@ async function fecharSinal(s, status, gale) {
   s.fechadoEm = Date.now();
 
   if (s.gale1MsgId) { await tgDelete(s.gale1MsgId); s.gale1MsgId = null; }
+  if (s.gale2MsgId) { await tgDelete(s.gale2MsgId); s.gale2MsgId = null; }
 
+  if (status === 'VOID') {
+    ALLTIME.void++; DAILY.void++;
+    await dbStateSet('daily_v20', JSON.stringify(DAILY));
+    await dbSignalUpdate(s);
+    await tgSendRaw(fmtResult(s));
+    await tgSendRaw(fmtHistorico());
+    return; // sem rodada observável: não é GREEN nem RED
+  }
   const bucket = status === 'GREEN' ? 'green' : status === 'G1' ? 'g1' : status === 'G2' ? 'g2'
     : status === 'EMPATE' ? 'empate' : status === 'EG1' ? 'eg1' : status === 'EG2' ? 'eg2' : 'loss';
   ALLTIME[bucket]++; ALLTIME.total++;
   DAILY[bucket]++; DAILY.total++;
-  if (status === 'LOSS') S.curStreak = 0;
-  else { S.curStreak++; if (S.curStreak > DAILY.bestStreak) DAILY.bestStreak = S.curStreak; }
-  await dbStateSet('curStreak', String(S.curStreak));
+  if (status === 'LOSS') {
+    S.curStreak = 0;
+  } else {
+    S.curStreak++;
+    if (S.curStreak > DAILY.bestStreak) DAILY.bestStreak = S.curStreak;
+  }
+  await dbStateSet('curStreak_v20', String(S.curStreak));
   await dbStateSet('daily_v20', JSON.stringify(DAILY));
 
   await dbSignalUpdate(s);
@@ -960,37 +978,32 @@ async function fecharSinal(s, status, gale) {
   maybeSuspend(s.key);
 }
 
-/* ══════════════════════ APURAÇÃO ══════════════════════ */
-
+/* ============================ APURAÇÃO — UMA RODADA, SEM GALE ============================ */
 async function apurar() {
   const now = Date.now();
   for (const s of S.signals) {
     if (FECHADOS.has(s.status)) continue;
     const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
-    let decided = false;
-    for (let k = 0; k <= CFG.maxGale && k < after.length; k++) {
-      const r = after[k];
-      const prevT = k === 0 ? s.t : after[k - 1].t;
-      if (r.t - prevT > CFG.gapMs) { await fecharSinal(s, 'LOSS', k); decided = true; break; }
-      if (r.resultado === s.cor || r.resultado === E) {
-        const status = r.resultado === E ? (k === 0 ? 'EMPATE' : 'EG1') : (k === 0 ? 'GREEN' : 'G1');
-        await fecharSinal(s, status, k); decided = true; break;
-      }
-      if (k < CFG.maxGale && s.galeLevel < k + 1) await notificarGale(s, k + 1);
+    if (after.length) {
+      const first = after[0];
+      // Se a rodada seguinte não chegou dentro da janela, sinal expira em RED.
+      if (first.t - s.t > CFG.gapMs) { await fecharSinal(s, 'VOID', 0); continue; }
+      await fecharSinal(s, first.resultado === s.cor ? 'GREEN' : 'LOSS', 0);
+    } else if (now - s.t >= CFG.apuraMaxMs) {
+      await fecharSinal(s, 'VOID', 0);
     }
-    if (decided) continue;
-    if (!after.length && now - s.t > CFG.gapMs) await fecharSinal(s, 'LOSS', 0);
-    else if (after.length >= CFG.maxGale + 1) await fecharSinal(s, 'LOSS', CFG.maxGale);
-    else if (now - s.t >= CFG.apuraMaxMs) await fecharSinal(s, 'LOSS', s.galeLevel || 0);
   }
 }
 
-/* ══════════════════════ SYNC ══════════════════════ */
+/* ============================ SYNC ADAPTATIVO ============================ */
+/* FIX do bug "passa uma rodada e não atualiza": o tick roda a CADA 1 SEGUNDO.
+   Quando há sinal pendente ou a mesa está quente, a API é consultada a cada 1s
+   (anteriormente: só a cada 3s). */
 
 function currentSyncMs() {
   if (pendentes().length > 0) return CFG.syncFastMs;
   const last = S.hist[S.hist.length - 1];
-  if (last && Date.now() - last.t < 45000) return CFG.syncFastMs;
+  if (last && Date.now() - last.t < 45000) return CFG.syncFastMs; // mesa quente
   return CFG.syncMs;
 }
 
@@ -1001,8 +1014,10 @@ async function sync() {
     const byId = new Map(S.hist.map((r) => [r.id, r]));
     for (const r of rounds) {
       const previous = byId.get(r.id);
-      if (!previous) { novos++; byId.set(r.id, r); await dbRoundUpsert(r); }
-      else if (previous.t !== r.t || previous.resultado !== r.resultado || previous.pj !== r.pj || previous.pb !== r.pb) {
+      if (!previous) {
+        novos++; byId.set(r.id, r);
+        await dbRoundUpsert(r);
+      } else if (previous.t !== r.t || previous.resultado !== r.resultado || previous.pj !== r.pj || previous.pb !== r.pb) {
         Object.assign(previous, r); atualizados++;
         await dbRoundUpsert(r);
       }
@@ -1016,14 +1031,13 @@ async function sync() {
 
     if (newest && Date.now() - newest.t > CFG.staleAlertMs) {
       const mins = Math.floor((Date.now() - newest.t) / 60000);
-      await tgAlert('API', `◈ API sem rodadas há ${mins} min\n◈ Última: ${R.ultimaRodadaNova}\n◈ Fonte: ${R.fonteAPI + 1}/${API_SOURCES.length}`);
+      await tgAlert('API', `API BACBO sem rodadas novas há <b>${mins} min</b>.\nÚltima: ${R.ultimaRodadaNova}\nFonte: ${R.fonteAPI + 1}/${API_SOURCES.length}`);
     }
     if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length, fonte: R.fonteAPI });
   } catch (e) {
     R.erroAPI = e.message;
-    R.lastErrorAt = Date.now();
     log('SYNC ERRO', e.message);
-    await tgAlert('API', `◈ Erro API BACBO\n◈ ${e.message}`);
+    await tgAlert('API', `Erro ao consultar API BACBO:\n<code>${e.message}</code>`);
   }
 }
 
@@ -1038,7 +1052,7 @@ async function tick() {
       await sync();
       lastSyncAt = Date.now();
     }
-    await apurar();
+    await apurar();    // apura a cada 1s — só a primeira rodada conta
     await tentarSinal();
   } catch (e) { log('TICK ERRO', e.message); }
   finally { busy = false; }
@@ -1055,7 +1069,7 @@ function wakeCheck() {
   }
 }
 
-/* ══════════════════════ EXPRESS ══════════════════════ */
+/* ============================ EXPRESS ============================ */
 
 const app = express();
 app.disable('x-powered-by');
@@ -1075,13 +1089,13 @@ function requireAdmin(req, res, next) {
 app.get('/health', (req, res) => {
   const newest = S.hist[S.hist.length - 1];
   res.json({
-    ok: apiHealthy() && Boolean(R.ultimaSync) && R.lockOk,
-    versao: '20.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    ok: !R.erroAPI && Boolean(R.ultimaSync) && R.lockOk,
+    versao: '20.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
-    apiHealthy: apiHealthy(), lastErrorAt: R.lastErrorAt,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     diario: { ...DAILY, taxa: dailyTaxa() }, geral: ALLTIME,
     ultimaSync: R.ultimaSync, ultimaRodada: newest ? R.ultimaRodadaNova : null,
+    apiStale: newest ? Date.now() - newest.t > CFG.maxDataAgeMs : true,
     erroAPI: R.erroAPI, erroDB: R.erroDB,
     uptime: Math.round(process.uptime())
   });
@@ -1095,36 +1109,34 @@ app.get('/sinais', requireAdmin, (req, res) => {
 });
 app.get('/stats', requireAdmin, (req, res) => {
   const wins = dailyWins();
-  const reais = DAILY.green + DAILY.g1 + DAILY.g2;
-  const decididos = reais + DAILY.loss;
-  const gw = ALLTIME.green + ALLTIME.g1 + ALLTIME.g2 + ALLTIME.empate + ALLTIME.eg1 + ALLTIME.eg2;
+  const gw = ALLTIME.green;
   res.json({
     diario: {
       ...DAILY, wins, taxa: DAILY.total > 0 ? wins / DAILY.total : null,
-      taxaReal: decididos > 0 ? reais / decididos : null, sequenciaAtual: S.curStreak
+      taxaReal: DAILY.total > 0 ? DAILY.green / DAILY.total : null, sequenciaAtual: S.curStreak
     },
     geral: { ...ALLTIME, wins: gw, taxa: ALLTIME.total > 0 ? gw / ALLTIME.total : null }
   });
 });
 app.get('/calibracao', requireAdmin, (req, res) => {
-  const buckets = { '80-85': { n: 0, w: 0 }, '86-92': { n: 0, w: 0 }, '93-95': { n: 0, w: 0 } };
+  const buckets = { '0-49': { n: 0, w: 0 }, '50-59': { n: 0, w: 0 }, '60-69': { n: 0, w: 0 }, '70-79': { n: 0, w: 0 }, '80-100': { n: 0, w: 0 } };
   for (const s of S.signals) {
-    if (!FECHADOS.has(s.status)) continue;
-    const b = s.conf >= 93 ? '93-95' : s.conf >= 86 ? '86-92' : '80-85';
+    if (!RESULTADOS_APURADOS.has(s.status)) continue;
+    const b = s.conf >= 80 ? '80-100' : s.conf >= 70 ? '70-79' : s.conf >= 60 ? '60-69' : s.conf >= 50 ? '50-59' : '0-49';
     buckets[b].n++;
-    if (s.status !== 'LOSS') buckets[b].w++;
+    if (s.status === 'GREEN') buckets[b].w++;
   }
   res.json(buckets);
 });
 
-/* ══════════════════════ START ══════════════════════ */
+/* ============================ START ============================ */
 
 async function start() {
   for (const [name, value] of Object.entries({ BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL })) {
     if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
   }
   if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
-  log('BOOT', { versao: '20.1', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  log('BOOT', { versao: '20.0', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
@@ -1135,26 +1147,10 @@ async function start() {
   await sync();
   getStats(true);
 
-  // Boot cleanup: sinais antigos em gale 2 (v19) fecham como loss
-  for (const s of S.signals) {
-    if (s.status !== 'PENDENTE') continue;
-    if ((s.galeLevel || 0) >= 2) {
-      s.status = 'LOSS'; s.gale = 2; s.fechadoEm = Date.now();
-      await dbSignalUpdate(s);
-      log('BOOT-CLEAN', `sinal #${s.id} em G2 v19 fechado como LOSS`);
-      continue;
-    }
-    const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
-    let consecutivasFalhas = 0, prevT = s.t;
-    for (const r of after) {
-      if (r.t - prevT > CFG.gapMs || r.resultado === s.cor || r.resultado === E) break;
-      consecutivasFalhas++; prevT = r.t;
-      if (consecutivasFalhas >= CFG.maxGale) break;
-    }
-    s.galeLevel = Math.min(consecutivasFalhas, CFG.maxGale);
-  }
+  // Sinais PENDENTES são apurados em apurar() apenas contra a primeira rodada posterior.
 
   server = app.listen(PORT, () => log('HTTP', `porta ${PORT}`));
+  // tick a CADA 1 SEGUNDO — sync interno é adaptativo (1s quente / 3s normal)
   tickTimer = setInterval(() => tick().catch(() => {}), 1000);
   keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
   setTimeout(() => tick().catch(() => {}), 1500);
