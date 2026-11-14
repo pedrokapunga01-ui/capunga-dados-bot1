@@ -1,17 +1,18 @@
 {
-  "name": "bac-sinais-bot",
+  "name": "bacbo-telegram-signals",
   "version": "1.0.0",
-  "description": "Servidor do bot de sinais BAC (Bac Bo) para Telegram, pronto para deploy no Render",
+  "private": true,
+  "description": "Serviço de sinais informativos BAC BO com feed ao vivo, Telegram e PostgreSQL.",
   "main": "server.js",
-  "engines": {
-    "node": ">=18"
-  },
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=20 <23"
+  },
   "dependencies": {
-    "express": "^4.19.2",
+    "express": "^4.21.2",
     "node-telegram-bot-api": "^0.66.0",
-    "pg": "^8.12.0"
+    "pg": "^8.13.1"
   }
 }
