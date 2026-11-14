@@ -5,7 +5,6 @@
 // Render supplies PORT automatically. Feed URL and polling interval are intentionally fixed.
 
 const express = require('express');
-const TelegramBot = require('node-telegram-bot-api');
 const { Pool } = require('pg');
 
 const app = express();
@@ -41,7 +40,19 @@ const pool = new Pool({
 });
 pool.on('error', (error) => console.error('[db] Erro numa ligação inativa:', error.message));
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
+const bot = {
+  async sendMessage(chatId, text, options = {}) {
+    const response = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: options.disable_web_page_preview ?? true }),
+      signal: AbortSignal.timeout(10000)
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(`Telegram API: ${payload.description || `HTTP ${response.status}`}`);
+    return payload.result;
+  }
+};
 let httpServer;
 let shuttingDown = false;
 
@@ -170,6 +181,7 @@ async function initializeDatabase() {
       value TEXT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     CREATE TABLE IF NOT EXISTS signals (
       id BIGSERIAL PRIMARY KEY,
       entry TEXT NOT NULL CHECK (entry IN ('P','B')),
@@ -595,7 +607,6 @@ async function shutdown(signal) {
   feed.stop();
   if (engine.timer) clearTimeout(engine.timer);
   if (httpServer) await new Promise((resolve) => httpServer.close(resolve));
-  await bot.close().catch(() => {});
   await pool.end().catch(() => {});
   process.exit(0);
 }
