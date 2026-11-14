@@ -1,19 +1,17 @@
 {
-  "name": "capunga-bacbo-server",
-  "version": "19.0.0",
-  "private": true,
-  "description": "Capunga Bac Bo signals server",
+  "name": "bac-sinais-bot",
+  "version": "1.0.0",
+  "description": "Servidor do bot de sinais BAC (Bac Bo) para Telegram, pronto para deploy no Render",
   "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=20"
-  },
   "dependencies": {
-    "axios": "^1.7.9",
-    "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "pg": "^8.13.1"
+    "express": "^4.19.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "pg": "^8.12.0"
   }
 }
