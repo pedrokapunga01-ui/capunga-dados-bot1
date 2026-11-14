@@ -40,17 +40,38 @@ const pool = new Pool({
 });
 pool.on('error', (error) => console.error('[db] Erro numa ligação inativa:', error.message));
 
+let telegramQueue = Promise.resolve();
 const bot = {
-  async sendMessage(chatId, text, options = {}) {
-    const response = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: options.disable_web_page_preview ?? true }),
-      signal: AbortSignal.timeout(10000)
-    });
-    const payload = await response.json();
-    if (!response.ok || !payload.ok) throw new Error(`Telegram API: ${payload.description || `HTTP ${response.status}`}`);
-    return payload.result;
+  sendMessage(chatId, text, options = {}) {
+    const send = async () => {
+      const response = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: options.disable_web_page_preview ?? true }),
+        signal: AbortSignal.timeout(10000)
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(`Telegram API: ${payload.description || `HTTP ${response.status}`}`);
+      return payload.result;
+    };
+    const result = telegramQueue.then(send, send);
+    telegramQueue = result.catch(() => {});
+    return result;
+  },
+  deleteMessage(chatId, messageId) {
+    const remove = async () => {
+      const response = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/deleteMessage`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+        signal: AbortSignal.timeout(10000)
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(`Telegram deleteMessage: ${payload.description || `HTTP ${response.status}`}`);
+      return payload.result;
+    };
+    const result = telegramQueue.then(remove, remove);
+    telegramQueue = result.catch(() => {});
+    return result;
   }
 };
 let httpServer;
@@ -197,6 +218,7 @@ async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS signals_result_idx ON signals (result);
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS detail TEXT NOT NULL DEFAULT '';
     ALTER TABLE signals ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
+    ALTER TABLE signals ADD COLUMN IF NOT EXISTS gale_message_id BIGINT;
   `);
   console.log('[db] PostgreSQL ligado e esquema verificado.');
 }
@@ -224,15 +246,80 @@ async function updateSignal(id, { attempts, result }) {
     WHERE id=$3`, [attempts ?? null, result ?? null, id]);
 }
 
+async function saveGaleMessageId(id, messageId) {
+  await pool.query('UPDATE signals SET gale_message_id=$1 WHERE id=$2', [messageId, id]);
+}
+
 async function statistics() {
   const { rows } = await pool.query(`SELECT COUNT(*)::int AS total,
-    COUNT(*) FILTER (WHERE result='green')::int AS green,
+    COUNT(*) FILTER (WHERE result IN ('green','g1','g2','empate','eg1','eg2'))::int AS green,
+    COUNT(*) FILTER (WHERE result='green')::int AS direct,
+    COUNT(*) FILTER (WHERE result IN ('g1','g2'))::int AS gale,
+    COUNT(*) FILTER (WHERE result IN ('empate','eg1','eg2'))::int AS tie,
     COUNT(*) FILTER (WHERE result='red')::int AS red,
     COUNT(*) FILTER (WHERE result='pendente')::int AS pending
     FROM signals`);
   const data = rows[0];
   const decided = data.green + data.red;
   return { ...data, assertividade: decided ? (data.green / decided * 100).toFixed(1) : null };
+}
+
+async function dailyHistory() {
+  const { rows } = await pool.query(`WITH today AS (
+      SELECT result, ROW_NUMBER() OVER (ORDER BY settled_at DESC, id DESC) AS rn
+      FROM signals
+      WHERE result <> 'pendente' AND settled_at IS NOT NULL
+        AND (settled_at AT TIME ZONE 'Africa/Luanda')::date = (NOW() AT TIME ZONE 'Africa/Luanda')::date
+    )
+    SELECT
+      (NOW() AT TIME ZONE 'Africa/Luanda')::date::text AS day,
+      COUNT(*)::int AS resolved,
+      COUNT(*) FILTER (WHERE result='green')::int AS direct,
+      COUNT(*) FILTER (WHERE result='g1')::int AS g1,
+      COUNT(*) FILTER (WHERE result='g2')::int AS g2,
+      COUNT(*) FILTER (WHERE result IN ('green','g1','g2'))::int AS greens,
+      COUNT(*) FILTER (WHERE result='empate')::int AS tieDirect,
+      COUNT(*) FILTER (WHERE result='eg1')::int AS eg1,
+      COUNT(*) FILTER (WHERE result='eg2')::int AS eg2,
+      COUNT(*) FILTER (WHERE result IN ('empate','eg1','eg2'))::int AS ties,
+      COUNT(*) FILTER (WHERE result='red')::int AS losses,
+      COALESCE((SELECT COUNT(*)::int FROM today t
+        WHERE t.rn < COALESCE((SELECT MIN(rn) FROM today WHERE result NOT IN ('green','g1','g2')), 2147483647)),0) AS greenStreak,
+      (SELECT COUNT(*)::int FROM signals s WHERE s.result='pendente' AND s.attempts > 0
+        AND (s.created_at AT TIME ZONE 'Africa/Luanda')::date = (NOW() AT TIME ZONE 'Africa/Luanda')::date) AS inGale
+    FROM today`);
+  return rows[0];
+}
+
+function dailyLine(daily) {
+  return `📊 HISTÓRICO DO DIA — ${daily.day} 🇺🇸\n🎯 Resolvidos: ${daily.resolved}\n🟢 Green sem gale: ${daily.direct}  •  G1: ${daily.g1}  •  G2: ${daily.g2}\n🟡 Empate: ${daily.tiedirect}  •  EG1: ${daily.eg1}  •  EG2: ${daily.eg2}\n🔴 Loss: ${daily.losses}  •  🔥 Greens seguidos: ${daily.greenstreak}`;
+}
+
+async function sendOutcome(status, signal, includeHistory = true) {
+  let text = resultMessage(status, signal);
+  if (includeHistory) {
+    try {
+      const daily = await dailyHistory();
+      text += `\n\n${dailyLine(daily)}`;
+    } catch (error) {
+      console.error('[db] Não foi possível montar o placar diário:', error.message);
+      text += '\n\n📊 Placar diário temporariamente indisponível.';
+    }
+  }
+  await bot.sendMessage(process.env.CHAT_ID, text);
+}
+
+function resultMessage(status, signal) {
+  const labels = {
+    green: '🟢 GREEN XIRA — DE PRIMEIRA! 🎉🥳',
+    g1: '🟢 GREEN XIRA — GALE 1! 🎊💚',
+    g2: '🟢 GREEN XIRA — GALE 2! 🎉🛡️',
+    empate: '🟡 EMPATE! A PROTEÇÃO SEGUROU A ENTRADA 🛡️🤝',
+    eg1: '🟡 EMPATE NO GALE 1 — PROTEÇÃO ATIVA 🛡️🤝',
+    eg2: '🟡 EMPATE NO GALE 2 — PROTEÇÃO ATIVA 🛡️🤝',
+    red: '🔴 TÁ MALÊ — LOSS NESTA ENTRADA 😕💔'
+  };
+  return `${labels[status] || '📣 RESULTADO DA ENTRADA'}\n🎲 Sinal #${signal.id}`;
 }
 
 const opposite = (side) => side === 'P' ? 'B' : side === 'B' ? 'P' : null;
@@ -413,9 +500,9 @@ class SignalEngine {
   }
 
   async restorePending() {
-    const { rows } = await pool.query(`SELECT id,entry,strategy,detail,gales,attempts,created_at
+    const { rows } = await pool.query(`SELECT id,entry,strategy,detail,gales,attempts,created_at,gale_message_id
       FROM signals WHERE result='pendente' ORDER BY created_at ASC LIMIT 100`);
-    this.activeSignals = rows.map((row) => ({ ...row, id: String(row.id), createdAt: new Date(row.created_at), attempts: row.attempts }));
+    this.activeSignals = rows.map((row) => ({ ...row, id: String(row.id), createdAt: new Date(row.created_at), attempts: row.attempts, galeMessageId: row.gale_message_id }));
     if (rows.length) console.log(`[sinais] ${rows.length} sinal(is) pendente(s) restaurado(s) após reinício.`);
   }
 
@@ -434,15 +521,15 @@ class SignalEngine {
       this.activeSignals.push(signal);
       const attempts = this.gales + 1;
       const message = [
-        '🎯 SINAL INFORMATIVO — BAC BO', '',
-        `🎲 Entrada: ${NAMES[signal.entry]}`,
-        `📊 Regra: ${signal.strategy}`,
-        `📈 Leitura: ${signal.detail}`,
-        `🛡️ Proteção configurada: até ${signal.gales} gale(s), ${attempts} tentativa(s) no total.`,
-        `⏱ Próxima análise automática em até ${this.intervalMin} minutos.`,
+        '🎲🔥 SINAL BAC BO 🔥🎲',
         '',
-        'Aviso: os resultados são aleatórios; este sinal não garante ganhos. Não aposte dinheiro que não pode perder.',
-        `Sinal #${signal.id}`
+        '✅ ENTRADA CONFIRMADA ✅',
+        `🎯 Jogar: ${signal.entry === 'B' ? '🔴 BANCA' : '🔵 JOGADOR'}`,
+        '🛡️ Proteção: 🟡 EMPATE',
+        `🔄 Até ${signal.gales} gale(s) • ${attempts} tentativa(s)`,
+        `🧠 Estratégia: ${signal.strategy}`,
+        '',
+        `🔖 Sinal #${signal.id}`
       ].join('\n');
       await bot.sendMessage(process.env.CHAT_ID, message, { disable_web_page_preview: true });
       console.log(`[sinais] Enviado #${signal.id}: ${signal.entry}/${signal.strategy}.`);
@@ -492,34 +579,58 @@ class SignalEngine {
   }
 
   async handleRound(round) {
-    if (round.side === 'T') return;
     for (const signal of [...this.activeSignals]) {
       if (round.at <= signal.createdAt) continue;
-      if (round.side === signal.entry) {
-        await updateSignal(signal.id, { attempts: signal.attempts, result: 'green' });
+      if (round.side === 'T') {
+        const status = signal.attempts === 0 ? 'empate' : signal.attempts === 1 ? 'eg1' : 'eg2';
+        await updateSignal(signal.id, { attempts: signal.attempts, result: status });
         this.activeSignals = this.activeSignals.filter((item) => item.id !== signal.id);
-        const stats = await statistics();
-        await bot.sendMessage(process.env.CHAT_ID,
-          `✅ GREEN — ${NAMES[signal.entry]} venceu.\n\nAssertividade histórica dos sinais registados: ${stats.assertividade ?? '—'}% (${stats.green}G/${stats.red}R).`)
+        await sendOutcome(status, signal, false)
+          .catch((error) => console.error('[telegram] Falha ao enviar resultado de empate:', error.message));
+        await this.clearGaleNotice(signal);
+        console.log(`[sinais] #${signal.id}: ${status.toUpperCase()} (proteção no empate).`);
+        continue;
+      }
+      if (round.side === signal.entry) {
+        const status = signal.attempts === 0 ? 'green' : signal.attempts === 1 ? 'g1' : 'g2';
+        await updateSignal(signal.id, { attempts: signal.attempts, result: status });
+        this.activeSignals = this.activeSignals.filter((item) => item.id !== signal.id);
+        await sendOutcome(status, signal)
           .catch((error) => console.error('[telegram] Falha ao enviar confirmação GREEN:', error.message));
-        console.log(`[sinais] #${signal.id}: GREEN.`);
+        await this.clearGaleNotice(signal);
+        console.log(`[sinais] #${signal.id}: ${status.toUpperCase()}.`);
         continue;
       }
       signal.attempts += 1;
       if (signal.attempts <= signal.gales) {
         await updateSignal(signal.id, { attempts: signal.attempts });
-        await bot.sendMessage(process.env.CHAT_ID,
-          `🔁 Resultado contrário. Gale ${signal.attempts}/${signal.gales}; entrada mantida em ${NAMES[signal.entry]}. Sinal #${signal.id}.`)
-          .catch((error) => console.error('[telegram] Falha ao enviar aviso de gale:', error.message));
+        const galeText = `🔄⚠️ GALE ${signal.attempts} — VAMOS À PRÓXIMA!\n🎯 Manter: ${signal.entry === 'B' ? '🔴 BANCA' : '🔵 JOGADOR'}\n🛡️ Empate continua protegido\n🔖 Sinal #${signal.id}`;
+        try {
+          const sent = await bot.sendMessage(process.env.CHAT_ID, galeText);
+          await this.clearGaleNotice(signal);
+          signal.galeMessageId = sent.message_id;
+          await saveGaleMessageId(signal.id, sent.message_id);
+        } catch (error) { console.error('[telegram] Falha ao enviar/atualizar aviso de gale:', error.message); }
         continue;
       }
       await updateSignal(signal.id, { attempts: signal.attempts, result: 'red' });
       this.activeSignals = this.activeSignals.filter((item) => item.id !== signal.id);
-      const stats = await statistics();
-      await bot.sendMessage(process.env.CHAT_ID,
-        `❌ RED — proteção encerrada no sinal #${signal.id}.\n\nAssertividade histórica dos sinais registados: ${stats.assertividade ?? '—'}% (${stats.green}G/${stats.red}R).`)
+      await sendOutcome('red', signal)
         .catch((error) => console.error('[telegram] Falha ao enviar confirmação RED:', error.message));
+      await this.clearGaleNotice(signal);
       console.log(`[sinais] #${signal.id}: RED.`);
+    }
+  }
+
+  async clearGaleNotice(signal) {
+    if (!signal.galeMessageId) return;
+    try {
+      await bot.deleteMessage(process.env.CHAT_ID, signal.galeMessageId);
+      signal.galeMessageId = null;
+      await saveGaleMessageId(signal.id, null);
+      console.log(`[telegram] Aviso de gale removido para o sinal #${signal.id}.`);
+    } catch (error) {
+      console.error(`[telegram] Não foi possível remover aviso de gale #${signal.id}:`, error.message);
     }
   }
 }
