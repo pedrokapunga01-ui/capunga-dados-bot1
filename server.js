@@ -1,13 +1,7 @@
 // ============================================================
 // BOT DE SINAIS BAC BO — TELEGRAM
 // Arquivo único: server.js
-// Deploy: Render Web Service
-//
-// Variáveis obrigatórias:
-// BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
-//
-// Variáveis opcionais:
-// DATABASE_URL, FEED_URL, PORT
+// Monitoramento: 2 segundos
 // ============================================================
 
 const express = require('express');
@@ -17,8 +11,11 @@ const { Pool } = require('pg');
 const app = express();
 app.use(express.json());
 
+const ADMIN_TOKEN =
+  process.env.ADMIN_TOKEN || 'BAC_ADMIN_7K92mQ4xV8pL3nR6tY1sW5zE';
+
 const DEFAULT_FEED_URL = 'https://ioscout.io/api/live.php?game=bac-bo';
-const FEED_INTERVAL_MS = 30000;
+const FEED_INTERVAL_MS = 2000;
 
 const NAMES = {
   P: 'PLAYER 🔵',
@@ -324,7 +321,7 @@ function analyzeResults(results) {
 }
 
 // ------------------------------------------------------------
-// Feed da API
+// Feed da API — atualização a cada 2 segundos
 // ------------------------------------------------------------
 
 function normalizeSector(sector) {
@@ -343,6 +340,7 @@ class LiveFeed {
     this.listeners = [];
     this.timer = null;
     this.loaded = false;
+    this.isFetching = false;
   }
 
   onRound(callback) {
@@ -356,6 +354,10 @@ class LiveFeed {
   }
 
   async fetchResults() {
+    if (this.isFetching) return;
+
+    this.isFetching = true;
+
     try {
       const response = await fetch(this.url, {
         headers: {
@@ -430,6 +432,8 @@ class LiveFeed {
       console.error(
         `[feed] Erro ao buscar resultados (${this.errors}): ${error.message}`
       );
+    } finally {
+      this.isFetching = false;
     }
   }
 
@@ -440,10 +444,8 @@ class LiveFeed {
       this.fetchResults();
     }, FEED_INTERVAL_MS);
 
-    if (this.timer.unref) this.timer.unref();
-
     console.log(
-      `[feed] Monitorando resultados a cada ${FEED_INTERVAL_MS / 1000} segundos.`
+      `[feed] Monitorando a mesa a cada ${FEED_INTERVAL_MS / 1000} segundos.`
     );
   }
 
@@ -646,8 +648,6 @@ class SignalEngine {
       this.scheduleNextSignal();
     }, this.intervalMin * 60 * 1000);
 
-    if (this.timer.unref) this.timer.unref();
-
     console.log(
       `[sinais] Próximo sinal agendado em ${this.intervalMin} minuto(s).`
     );
@@ -670,13 +670,13 @@ function requireAdmin(request, response, next) {
     request.get('x-admin-token') ||
     request.query.admin_token;
 
-  if (!process.env.ADMIN_TOKEN) {
+  if (!ADMIN_TOKEN) {
     return response.status(500).json({
-      error: 'ADMIN_TOKEN não está configurado no servidor.'
+      error: 'ADMIN_TOKEN não configurado.'
     });
   }
 
-  if (token !== process.env.ADMIN_TOKEN) {
+  if (token !== ADMIN_TOKEN) {
     return response.status(401).json({
       error: 'Token de administrador inválido.'
     });
@@ -694,14 +694,16 @@ app.get('/', (request, response) => {
     name: 'Bot de Sinais BAC',
     status: engine.running ? 'rodando' : 'parado',
     intervalo: `${engine.intervalMin} min`,
-    feed: feed.lastUpdate ? 'ao vivo' : 'carregando'
+    feed: feed.lastUpdate ? 'ao vivo' : 'carregando',
+    atualizacao: '2 segundos'
   });
 });
 
 app.get('/health', (request, response) => {
   response.json({
     ok: true,
-    feed: Boolean(feed.lastUpdate)
+    feed: Boolean(feed.lastUpdate),
+    ultimaAtualizacao: feed.lastUpdate
   });
 });
 
@@ -843,6 +845,10 @@ const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
       console.log(
         `[server] Bot de sinais BAC rodando na porta ${PORT}.`
+      );
+
+      console.log(
+        '[server] Monitoramento da mesa configurado para 2 segundos.'
       );
     });
 
