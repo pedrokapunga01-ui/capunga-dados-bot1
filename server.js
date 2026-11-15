@@ -1,12 +1,23 @@
 'use strict';
 
-// BAC BO Telegram Signals — Render Web Service (v2: 24/7 auto-recuperável)
+// BAC BO Telegram Signals — v3 (orientado a eventos de ronda, com diagnóstico de latência)
+//
 // Variáveis obrigatórias no Render:
 //   BOT_TOKEN, CHAT_ID, ADMIN_TOKEN (>=24 caracteres), DATABASE_URL
 // Opcionais:
-//   HISTORY_TZ (Africa/Luanda, America/New_York, America/Sao_Paulo, Europe/Lisbon, UTC)
-//   FEED_INTERVAL_MS (1000–10000, padrão 2000)
-//   SELF_URL (URL pública; no Render usa-se RENDER_EXTERNAL_URL automaticamente)
+//   HISTORY_TZ              Africa/Luanda | America/New_York | America/Sao_Paulo | Europe/Lisbon | UTC
+//   FEED_URL                URL alternativo do feed (padrão: ioscout.io)
+//   FEED_INTERVAL_MS        500–10000 (padrão 1000)
+//   MAX_TRIGGER_AGE_MS      idade máxima da ronda para ainda enviar sinal (padrão 8000)
+//   SIGNAL_LATENCY_SLACK_MS tolerância acima da latência normal do feed (padrão 6000)
+//   SELF_URL                URL público (no Render usa-se RENDER_EXTERNAL_URL)
+//
+// Princípios:
+//  1. O sinal só sai LOGO A SEGUIR a uma ronda nova (nunca a meio de uma ronda).
+//  2. Se a ronda chegou tarde demais para dar tempo de apostar, o sinal é adiado
+//     para a ronda seguinte (melhor sem sinal do que sinal fora de tempo).
+//  3. Resultados e avisos de gale saem imediatamente, sem filas bloqueantes.
+//  4. Tudo é medido: /admin/diagnostics mostra latência do feed e do Telegram.
 
 const express = require('express');
 const crypto = require('crypto');
@@ -17,20 +28,33 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb' }));
 
 const PORT = Number(process.env.PORT || 3000);
-const FEED_URL = 'https://ioscout.io/api/live.php?game=bac-bo';
+
+const FEED_URL =
+  String(process.env.FEED_URL || '').trim() ||
+  'https://ioscout.io/api/live.php?game=bac-bo';
+
 const FEED_INTERVAL_MS = Math.min(
   10000,
-  Math.max(1000, Number(process.env.FEED_INTERVAL_MS) || 2000)
+  Math.max(500, Number(process.env.FEED_INTERVAL_MS) || 1000)
 );
-const FEED_MAX_RETRY_MS = 15000;
-const REQUEST_TIMEOUT_MS = 10000;
+const FEED_TIMEOUT_MS = 4000;
+const FEED_MAX_RETRY_MS = 10000;
+const TELEGRAM_TIMEOUT_MS = 6000;
+
+const MAX_TRIGGER_AGE_MS = Math.max(
+  1000,
+  Number(process.env.MAX_TRIGGER_AGE_MS) || 8000
+);
+const SIGNAL_LATENCY_SLACK_MS = Math.max(
+  1000,
+  Number(process.env.SIGNAL_LATENCY_SLACK_MS) || 6000
+);
+
 const MAX_FEED_ROUND_AGE_MS = 5 * 60 * 1000;
 const FRESH_SEEN_WINDOW_MS = 3 * 60 * 1000;
-
-const SIGNAL_MAX_PENDING_MS = 10 * 60 * 1000; // sinal preso é cancelado
-const FEED_DEAD_RESTART_MS = 10 * 60 * 1000; // sem feed → reinício automático
-const SUPERVISOR_MS = 2000;
-const OVERDUE_GRACE_MS = 45 * 1000;
+const SIGNAL_MAX_PENDING_MS = 10 * 60 * 1000;
+const FEED_DEAD_RESTART_MS = 10 * 60 * 1000;
+const SUPERVISOR_MS = 3000;
 const KEEPALIVE_MS = 4 * 60 * 1000;
 
 const DEFAULT_SIGNAL_INTERVAL_MIN = 3;
@@ -72,6 +96,12 @@ function validateEnvironment() {
   } catch {
     throw new Error('DATABASE_URL inválida.');
   }
+
+  try {
+    new URL(FEED_URL);
+  } catch {
+    throw new Error('FEED_URL inválida.');
+  }
 }
 
 validateEnvironment();
@@ -100,14 +130,33 @@ pool.on('error', (error) => {
   console.error('[db] Erro numa ligação inativa:', error.message);
 });
 
-// ---------------------------------------------------------------------------
-// Telegram — fila ordenada com retentativas (429 / 5xx / rede)
-// ---------------------------------------------------------------------------
+// Repete uma operação de base de dados algumas vezes antes de desistir.
+async function retryDb(task, label, attempts = 3) {
+  let lastError;
 
-let telegramQueue = Promise.resolve();
+  for (let i = 1; i <= attempts; i += 1) {
+    try {
+      return await task();
+    } catch (error) {
+      lastError = error;
+
+      console.error(
+        `[db] ${label} falhou (tentativa ${i}/${attempts}): ${error.message}`
+      );
+
+      if (i < attempts) await sleep(200 * i);
+    }
+  }
+
+  throw lastError;
+}
+
+// ---------------------------------------------------------------------------
+// Telegram — chamadas diretas (sem fila), com retentativas curtas
+// ---------------------------------------------------------------------------
 
 async function telegramCall(method, payload, label) {
-  const maxAttempts = 4;
+  const maxAttempts = 3;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -117,7 +166,7 @@ async function telegramCall(method, payload, label) {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+          signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS)
         }
       );
 
@@ -137,15 +186,14 @@ async function telegramCall(method, payload, label) {
       const retryAfter = Number(data?.parameters?.retry_after);
 
       if (Number.isFinite(retryAfter) && retryAfter > 0) {
-        error.retryAfterMs = Math.min(10000, retryAfter * 1000);
+        error.retryAfterMs = Math.min(5000, retryAfter * 1000);
       }
 
       throw error;
     } catch (error) {
       if (error.permanent || attempt === maxAttempts) throw error;
 
-      const wait =
-        error.retryAfterMs ?? Math.min(8000, 500 * 2 ** (attempt - 1));
+      const wait = error.retryAfterMs ?? 300 * 2 ** (attempt - 1);
 
       console.warn(
         `[telegram] ${label} falhou (tentativa ${attempt}/${maxAttempts}): ${error.message}; nova tentativa em ${wait} ms.`
@@ -158,34 +206,20 @@ async function telegramCall(method, payload, label) {
   throw new Error(`${label}: falha desconhecida.`);
 }
 
-function enqueueTelegram(task) {
-  const result = telegramQueue.then(task, task);
-  telegramQueue = result.catch(() => {});
-  return result;
-}
-
 const bot = {
-  sendMessage(chatId, text, options = {}) {
-    return enqueueTelegram(() =>
-      telegramCall(
-        'sendMessage',
-        {
-          chat_id: chatId,
-          text,
-          disable_web_page_preview: options.disable_web_page_preview ?? true
-        },
-        'Telegram sendMessage'
-      )
+  sendMessage(chatId, text) {
+    return telegramCall(
+      'sendMessage',
+      { chat_id: chatId, text, disable_web_page_preview: true },
+      'Telegram sendMessage'
     );
   },
 
   deleteMessage(chatId, messageId) {
-    return enqueueTelegram(() =>
-      telegramCall(
-        'deleteMessage',
-        { chat_id: chatId, message_id: messageId },
-        'Telegram deleteMessage'
-      )
+    return telegramCall(
+      'deleteMessage',
+      { chat_id: chatId, message_id: messageId },
+      'Telegram deleteMessage'
     );
   }
 };
@@ -239,23 +273,40 @@ function optionalNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+const median = (values) => {
+  if (!values.length) return null;
+
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+
+  return sorted.length % 2
+    ? sorted[mid]
+    : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+};
+
 // ---------------------------------------------------------------------------
-// Feed ao vivo
+// Feed ao vivo — ciclo contínuo, mede a latência de cada ronda
 // ---------------------------------------------------------------------------
+
+const LATENCY_VALID_MIN_MS = -3000;
+const LATENCY_VALID_MAX_MS = 180000;
 
 class LiveFeed {
   constructor() {
-    this.rounds = [];
-    this.lastUpdate = null; // última resposta válida do feed
-    this.lastRoundAt = null; // hora (do feed) da última ronda
-    this.lastNewRoundSeenAt = null; // relógio do servidor: última ronda nova
+    this.rounds = []; // mais recente primeiro
+    this.lastUpdate = null; // última resposta válida
+    this.lastRoundAt = null; // hora (do feed) da ronda mais recente
+    this.lastNewRoundSeenAt = null; // relógio do servidor
     this.errors = 0;
     this.loaded = false;
-    this.fetching = false;
-    this.timer = null;
+    this.stopped = false;
+    this.looping = false;
+    this.loopTickAt = Date.now();
+    this.lastPollMs = null;
+    this.delay = FEED_INTERVAL_MS;
     this.listeners = new Set();
     this.roundQueue = Promise.resolve();
-    this.nextDelay = FEED_INTERVAL_MS;
+    this.latencies = []; // ms entre o fim da ronda e a nossa deteção
   }
 
   onRound(listener) {
@@ -270,8 +321,6 @@ class LiveFeed {
     return this.rounds[0] || null;
   }
 
-  // Frescura robusta: vale a hora do feed OU ter visto uma ronda nova há pouco
-  // (protege contra fusos horários diferentes no campo settled_at).
   isRoundFresh() {
     if (this.lastRoundAt) {
       const age = Date.now() - this.lastRoundAt.getTime();
@@ -284,45 +333,116 @@ class LiveFeed {
     );
   }
 
-  async fetchResults() {
-    if (this.fetching || shuttingDown) return;
+  recordLatency(round) {
+    const latency = round.detectedAt - round.at.getTime();
 
-    this.fetching = true;
+    round.latencyMs = latency;
 
-    try {
-      const response = await fetch(FEED_URL, {
-        headers: {
-          'User-Agent': 'BACBO-Telegram-Signals/2.0',
-          Accept: 'application/json'
-        },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        cache: 'no-store'
-      });
+    if (latency >= LATENCY_VALID_MIN_MS && latency <= LATENCY_VALID_MAX_MS) {
+      this.latencies.push(latency);
+      if (this.latencies.length > 50) this.latencies.shift();
+    }
+  }
 
-      if (!response.ok) {
-        throw new Error(`Feed respondeu HTTP ${response.status}`);
-      }
+  // Latência "normal" do feed (percentil 20 das últimas medições).
+  latencyBaseline() {
+    const samples = this.latencies.slice(-30);
 
-      const contentType = response.headers.get('content-type') || '';
+    if (samples.length < 5) return null;
 
-      if (!contentType.includes('json')) {
-        throw new Error(
-          `Tipo de conteúdo inesperado: ${contentType || 'desconhecido'}`
-        );
-      }
+    const sorted = [...samples].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length * 0.2)];
+  }
 
-      const payload = await response.json();
+  // A ronda chegou dentro do atraso habitual? (se não, já é tarde para apostar)
+  isRoundTimely(round) {
+    const baseline = this.latencyBaseline();
+    const latency = round.latencyMs;
 
-      if (!payload || !Array.isArray(payload.rounds)) {
-        throw new Error('Resposta sem array rounds.');
-      }
+    if (baseline === null || latency === undefined) return true;
+    if (latency < LATENCY_VALID_MIN_MS || latency > LATENCY_VALID_MAX_MS) {
+      return true;
+    }
 
-      const rounds = payload.rounds
-        .filter((item) => item && typeof item === 'object')
-        .map((item) => ({
+    return latency <= baseline + SIGNAL_LATENCY_SLACK_MS;
+  }
+
+  cadenceMs() {
+    const sample = this.rounds.slice(0, 21);
+    const diffs = [];
+
+    for (let i = 0; i < sample.length - 1; i += 1) {
+      const diff = sample[i].at.getTime() - sample[i + 1].at.getTime();
+      if (diff > 5000 && diff < 120000) diffs.push(diff);
+    }
+
+    return median(diffs);
+  }
+
+  stats() {
+    const samples = this.latencies;
+
+    return {
+      url: FEED_URL,
+      pollIntervalMs: FEED_INTERVAL_MS,
+      lastPollMs: this.lastPollMs,
+      samples: samples.length,
+      lastLatencyMs: samples.length ? samples[samples.length - 1] : null,
+      minLatencyMs: samples.length ? Math.min(...samples) : null,
+      medianLatencyMs: median(samples),
+      maxLatencyMs: samples.length ? Math.max(...samples) : null,
+      baselineMs: this.latencyBaseline(),
+      roundCadenceMs: this.cadenceMs(),
+      errors: this.errors
+    };
+  }
+
+  async poll() {
+    const startedAt = Date.now();
+    const separator = FEED_URL.includes('?') ? '&' : '?';
+
+    const response = await fetch(`${FEED_URL}${separator}_=${startedAt}`, {
+      headers: {
+        'User-Agent': 'BACBO-Telegram-Signals/3.0',
+        Accept: 'application/json',
+        'Cache-Control': 'no-cache, no-store',
+        Pragma: 'no-cache'
+      },
+      signal: AbortSignal.timeout(FEED_TIMEOUT_MS),
+      cache: 'no-store'
+    });
+
+    const receivedAt = Date.now();
+
+    if (!response.ok) {
+      throw new Error(`Feed respondeu HTTP ${response.status}`);
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+
+    if (!contentType.includes('json')) {
+      throw new Error(
+        `Tipo de conteúdo inesperado: ${contentType || 'desconhecido'}`
+      );
+    }
+
+    const payload = await response.json();
+
+    if (!payload || !Array.isArray(payload.rounds)) {
+      throw new Error('Resposta sem array rounds.');
+    }
+
+    const parsed = payload.rounds
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => {
+        const side = normalizeSector(item.sector);
+        const at = parseFeedTime(item.settled_at);
+
+        return {
+          key: `${item.settled_at}|${side}`,
           settledAt: item.settled_at,
-          at: parseFeedTime(item.settled_at),
-          side: normalizeSector(item.sector),
+          at,
+          side,
           multiplier: item.multiplier,
           playerScore: optionalNumber(
             item.playerScore ??
@@ -336,82 +456,103 @@ class LiveFeed {
               item.banker?.score ??
               item.banker_total
           )
-        }))
-        .filter((item) => item.side && item.at)
-        .sort((a, b) => b.at - a.at);
+        };
+      })
+      .filter((item) => item.side && item.at)
+      .sort((a, b) => b.at - a.at);
 
-      if (!rounds.length) {
-        throw new Error('Feed sem rodadas reconhecíveis.');
-      }
+    if (!parsed.length) {
+      throw new Error('Feed sem rodadas reconhecíveis.');
+    }
 
-      const existing = new Set(this.rounds.map((item) => item.settledAt));
-      const fresh = [];
+    const known = new Set(this.rounds.map((item) => item.key));
+    const isInitial = !this.loaded;
+    const fresh = [];
 
-      for (const round of rounds) {
-        if (!existing.has(round.settledAt)) {
-          fresh.push(round);
-          existing.add(round.settledAt);
-        }
-      }
+    for (const round of parsed) {
+      if (known.has(round.key)) continue;
 
-      this.rounds = [...fresh, ...this.rounds]
-        .sort((a, b) => b.at - a.at)
-        .slice(0, 500);
+      known.add(round.key);
 
-      this.lastUpdate = new Date();
-      this.lastRoundAt = this.rounds[0].at;
-      this.errors = 0;
-      this.nextDelay = FEED_INTERVAL_MS;
+      round.detectedAt = receivedAt;
+      round.initial = isInitial;
 
-      if (!this.loaded) {
-        this.loaded = true;
+      if (!isInitial) this.recordLatency(round);
+
+      fresh.push(round);
+    }
+
+    this.rounds = [...fresh, ...this.rounds]
+      .sort((a, b) => b.at - a.at)
+      .slice(0, 500);
+
+    this.lastPollMs = receivedAt - startedAt;
+    this.lastUpdate = new Date(receivedAt);
+    this.lastRoundAt = this.rounds[0].at;
+
+    if (isInitial) {
+      this.loaded = true;
+
+      console.log(
+        `[feed] Ligado: ${this.rounds.length} rondas válidas; última ronda ${this.rounds[0].settledAt}.`
+      );
+    } else if (fresh.length) {
+      this.lastNewRoundSeenAt = new Date(receivedAt);
+    }
+
+    for (const round of fresh.slice().sort((a, b) => a.at - b.at)) {
+      if (!round.initial) {
+        const score =
+          hasScore(round) ? ` ${round.playerScore}×${round.bankerScore}` : '';
+
         console.log(
-          `[feed] Ligado: ${this.rounds.length} rondas válidas; última ronda ${this.rounds[0].settledAt}.`
+          `[feed] Ronda nova ${round.side}${score} • latência ${(round.latencyMs / 1000).toFixed(1)} s • poll ${this.lastPollMs} ms`
         );
-      } else if (fresh.length) {
-        this.lastNewRoundSeenAt = new Date();
       }
 
-      for (const round of fresh.slice().sort((a, b) => a.at - b.at)) {
-        this.enqueueRound(round);
-      }
-    } catch (error) {
-      this.errors += 1;
-
-      this.nextDelay = Math.min(
-        FEED_MAX_RETRY_MS,
-        Math.max(FEED_INTERVAL_MS, this.nextDelay * 2)
-      );
-
-      console.error(
-        `[feed] Falha ${this.errors}: ${error.message}; nova tentativa em ${this.nextDelay} ms.`
-      );
-    } finally {
-      this.fetching = false;
-      this.schedule();
+      this.enqueueRound(round);
     }
   }
 
-  schedule() {
-    if (shuttingDown) return;
+  // Ciclo contínuo, taxa fixa; nunca morre por erro.
+  async run() {
+    if (this.looping) return;
 
-    if (this.timer) clearTimeout(this.timer);
+    this.looping = true;
 
-    this.timer = setTimeout(() => {
-      this.timer = null;
+    while (!this.stopped) {
+      const started = Date.now();
+      this.loopTickAt = started;
 
-      this.fetchResults().catch((error) =>
-        console.error('[feed] Erro inesperado no polling:', error.message)
-      );
-    }, this.nextDelay);
+      try {
+        await this.poll();
+
+        this.errors = 0;
+        this.delay = FEED_INTERVAL_MS;
+      } catch (error) {
+        this.errors += 1;
+
+        this.delay = Math.min(
+          FEED_MAX_RETRY_MS,
+          Math.max(FEED_INTERVAL_MS, this.delay * 2)
+        );
+
+        console.error(
+          `[feed] Falha ${this.errors}: ${error.message}; nova tentativa em ${this.delay} ms.`
+        );
+      }
+
+      await sleep(Math.max(100, this.delay - (Date.now() - started)));
+    }
+
+    this.looping = false;
   }
 
-  // Chamado pelo supervisor: se o ciclo de polling morreu, reativa-o.
   ensureRunning() {
-    if (shuttingDown || this.fetching || this.timer) return;
+    if (this.stopped || this.looping) return;
 
-    console.warn('[feed] Polling parado; a reativar.');
-    void this.fetchResults();
+    console.warn('[feed] Ciclo parado; a reativar.');
+    void this.run();
   }
 
   enqueueRound(round) {
@@ -429,16 +570,13 @@ class LiveFeed {
 
             return;
           } catch (error) {
-            const delay = Math.min(
-              15000,
-              500 * 2 ** Math.min(attempt - 1, 5)
-            );
-
             console.error(
               `[feed] Processamento da ronda falhou (tentativa ${attempt}/${maxAttempts}): ${error.message}`
             );
 
-            if (attempt < maxAttempts) await sleep(delay);
+            if (attempt < maxAttempts) {
+              await sleep(Math.min(5000, 300 * 2 ** (attempt - 1)));
+            }
           }
         }
 
@@ -452,12 +590,11 @@ class LiveFeed {
   }
 
   start() {
-    if (!this.fetching && !shuttingDown) void this.fetchResults();
+    void this.run();
   }
 
   stop() {
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
+    this.stopped = true;
   }
 }
 
@@ -636,15 +773,7 @@ async function dailyHistory() {
           )
         ),
         0
-      ) AS greenstreak,
-      (
-        SELECT COUNT(*)::int
-        FROM signals s
-        WHERE
-          s.result = 'pendente'
-          AND s.attempts > 0
-          AND (s.created_at AT TIME ZONE $1)::date = (NOW() AT TIME ZONE $1)::date
-      ) AS ingale
+      ) AS greenstreak
     FROM today
     `,
     [HISTORY_TZ]
@@ -682,15 +811,20 @@ async function sendOutcome(status, signal, includeHistory = true) {
 
   if (includeHistory) {
     try {
-      const daily = await dailyHistory();
+      // O placar não pode atrasar o resultado: máximo 1,5 s.
+      const daily = await Promise.race([
+        dailyHistory(),
+        sleep(1500).then(() => {
+          throw new Error('tempo esgotado');
+        })
+      ]);
+
       text += `\n\n${dailyLine(daily)}`;
     } catch (error) {
       console.error(
-        '[db] Não foi possível montar o placar diário:',
+        '[db] Placar diário indisponível nesta mensagem:',
         error.message
       );
-
-      text += '\n\n📊 Placar diário temporariamente indisponível.';
     }
   }
 
@@ -700,7 +834,7 @@ async function sendOutcome(status, signal, includeHistory = true) {
     await markOutcomeNotified(signal.id);
   } catch (error) {
     console.error(
-      `[db] Resultado #${signal.id} enviado, mas não foi possível marcar como notificado:`,
+      `[db] Resultado #${signal.id} enviado, mas não foi marcado como notificado:`,
       error.message
     );
   }
@@ -713,8 +847,11 @@ async function sendOutcome(status, signal, includeHistory = true) {
 const opposite = (side) => (side === 'P' ? 'B' : 'P');
 const isSide = (side) => side === 'P' || side === 'B';
 
-const hasScore = (round) =>
-  Number.isFinite(round.playerScore) && Number.isFinite(round.bankerScore);
+function hasScore(round) {
+  return (
+    Number.isFinite(round.playerScore) && Number.isFinite(round.bankerScore)
+  );
+}
 
 const scoreFor = (round) =>
   round.side === 'P' ? round.playerScore : round.bankerScore;
@@ -1158,10 +1295,11 @@ function analyzeResults(rows) {
 }
 
 // ---------------------------------------------------------------------------
-// Motor de sinais
+// Motor de sinais — orientado a eventos de ronda
 // ---------------------------------------------------------------------------
 
 const sideLabel = (side) => (side === 'B' ? '🔴 BANCA' : '🔵 JOGADOR');
+const noHistory = (status) => ['empate', 'eg1', 'eg2'].includes(status);
 
 class SignalEngine {
   constructor() {
@@ -1171,14 +1309,14 @@ class SignalEngine {
     this.activeSignals = [];
     this.sending = false;
     this.lastSignalAt = 0;
-    this.blockedUntil = 0;
+    this.skipped = { stale: 0, latency: 0, notDue: 0 };
     this.supervisorTimer = null;
     this.supervising = false;
     this.recoveringOutcomes = false;
     this.outcomeRecoveryTimer = null;
     this.notifying = new Set();
 
-    // Devolve a promessa: as rondas são processadas UMA A UMA, em ordem.
+    // As rondas chegam UMA A UMA, em ordem (a fila está no feed).
     feed.onRound((round) => this.handleRound(round));
   }
 
@@ -1231,7 +1369,6 @@ class SignalEngine {
     this.recoveringOutcomes = true;
 
     try {
-      // Resultados com mais de 30 min já não interessam: fecha em silêncio.
       await pool.query(
         `UPDATE signals
          SET result_notification_pending = false
@@ -1261,13 +1398,8 @@ class SignalEngine {
         this.notifying.add(id);
 
         try {
-          await sendOutcome(
-            row.result,
-            signal,
-            !['empate', 'eg1', 'eg2'].includes(row.result)
-          );
-
-          await this.clearGaleNotice(signal);
+          await sendOutcome(row.result, signal, !noHistory(row.result));
+          void this.clearGaleNotice(signal);
 
           console.log(`[sinais] Notificação do resultado #${id} recuperada.`);
         } catch (error) {
@@ -1284,50 +1416,79 @@ class SignalEngine {
     }
   }
 
-  // trigger: 'round' (logo após uma ronda nova) ou 'timer' (reserva)
-  async trySendSignal(trigger) {
-    if (!this.running || !feed.loaded || shuttingDown) return null;
-    if (this.sending) return null;
-    if (this.activeSignals.length >= MAX_ACTIVE_SIGNALS) return null;
-    if (Date.now() < this.blockedUntil) return null;
+  // Chamado para cada ronda nova, pela ordem em que aconteceram.
+  async handleRound(round) {
+    for (const signal of [...this.activeSignals]) {
+      await this.settle(signal, round);
+    }
 
-    const elapsed = Date.now() - this.lastSignalAt;
+    if (!round.initial) {
+      await this.maybeSendSignal(round);
+    }
+  }
+
+  async maybeSendSignal(round) {
+    if (!this.running || shuttingDown || this.sending) return;
+    if (this.activeSignals.length >= MAX_ACTIVE_SIGNALS) return;
+
     const intervalMs = this.intervalMin * 60 * 1000;
-    const needed = trigger === 'round' ? intervalMs : intervalMs + OVERDUE_GRACE_MS;
 
-    if (elapsed < needed) return null;
+    if (Date.now() - this.lastSignalAt < intervalMs) {
+      this.skipped.notDue += 1;
+      return;
+    }
 
-    if (!feed.isRoundFresh()) {
-      console.warn('[sinais] Sinal adiado: feed sem rondas recentes.');
-      return null;
+    // Só vale a ronda mais recente e recém-detetada: é isso que dá tempo de apostar.
+    const latest = feed.latest();
+
+    if (!latest || latest.key !== round.key) {
+      this.skipped.stale += 1;
+      console.warn('[sinais] Sinal adiado: já existe ronda mais recente.');
+      return;
+    }
+
+    const sinceDetected = Date.now() - round.detectedAt;
+
+    if (sinceDetected > MAX_TRIGGER_AGE_MS) {
+      this.skipped.stale += 1;
+
+      console.warn(
+        `[sinais] Sinal adiado: ronda detetada há ${sinceDetected} ms (limite ${MAX_TRIGGER_AGE_MS} ms).`
+      );
+
+      return;
+    }
+
+    if (!feed.isRoundTimely(round)) {
+      this.skipped.latency += 1;
+
+      console.warn(
+        `[sinais] Sinal adiado: ronda chegou com latência anormal (${round.latencyMs} ms).`
+      );
+
+      return;
     }
 
     this.sending = true;
 
     try {
-      return await this.sendSignal();
+      await this.sendSignal(round);
     } catch (error) {
-      this.blockedUntil = Date.now() + 10000;
-
       console.error('[sinais] Erro ao enviar sinal:', error.message);
-      return null;
     } finally {
       this.sending = false;
     }
   }
 
-  async sendSignal() {
-    const latest = feed.latest();
-
-    if (!latest) return null;
-
-    const analysis = analyzeResults(feed.getRounds(50));
-    const baselineAt = latest.at;
+  async sendSignal(round) {
+    // A análise usa o histórico até esta ronda, nem mais nem menos.
+    const history = feed.rounds.filter((item) => item.at <= round.at).slice(0, 50);
+    const analysis = analyzeResults(history);
 
     const saved = await insertSignal({
       ...analysis,
       gales: this.gales,
-      baselineAt
+      baselineAt: round.at
     });
 
     const signal = {
@@ -1338,7 +1499,7 @@ class SignalEngine {
       gales: this.gales,
       attempts: 0,
       createdAt: new Date(saved.created_at),
-      baselineAt,
+      baselineAt: round.at,
       galeMessageId: null,
       lastRoundKey: null
     };
@@ -1357,9 +1518,15 @@ class SignalEngine {
       `🔖 Sinal #${signal.id}`
     ].join('\n');
 
+    const t0 = Date.now();
+
     try {
       await bot.sendMessage(process.env.CHAT_ID, message);
     } catch (error) {
+      this.activeSignals = this.activeSignals.filter(
+        (item) => item.id !== signal.id
+      );
+
       try {
         await updateSignal(signal.id, { result: 'cancelado' });
       } catch (databaseError) {
@@ -1369,18 +1536,139 @@ class SignalEngine {
         );
       }
 
-      this.activeSignals = this.activeSignals.filter(
-        (item) => item.id !== signal.id
-      );
-
       throw error;
     }
 
     this.lastSignalAt = Date.now();
 
-    console.log(`[sinais] Enviado #${signal.id}: ${signal.entry}/${signal.strategy}.`);
+    console.log(
+      `[sinais] Enviado #${signal.id} ${signal.entry}/${signal.strategy} • Telegram ${Date.now() - t0} ms • desde a ronda ${Date.now() - round.detectedAt} ms`
+    );
+  }
 
-    return signal;
+  async settle(signal, round) {
+    // Só contam rondas posteriores à ronda-base do sinal.
+    if (round.at.getTime() <= signal.baselineAt.getTime()) return;
+    if (signal.lastRoundKey === round.key) return;
+
+    signal.lastRoundKey = round.key;
+
+    if (round.side === 'T') {
+      const status =
+        signal.attempts === 0 ? 'empate' : signal.attempts === 1 ? 'eg1' : 'eg2';
+
+      await this.finishSignal(signal, status, round);
+      return;
+    }
+
+    if (round.side === signal.entry) {
+      const status =
+        signal.attempts === 0 ? 'green' : signal.attempts === 1 ? 'g1' : 'g2';
+
+      await this.finishSignal(signal, status, round);
+      return;
+    }
+
+    const nextAttempt = signal.attempts + 1;
+
+    if (nextAttempt > signal.gales) {
+      await this.finishSignal(signal, 'red', round, nextAttempt);
+      return;
+    }
+
+    // Gale: o aviso sai já; a gravação na base de dados corre em paralelo.
+    signal.attempts = nextAttempt;
+
+    const galeText = [
+      `🔄⚠️ GALE ${nextAttempt} — VAMOS À PRÓXIMA!`,
+      `🎯 Manter: ${sideLabel(signal.entry)}`,
+      '🛡️ Empate continua protegido',
+      `🔖 Sinal #${signal.id}`
+    ].join('\n');
+
+    const sendTask = (async () => {
+      const t0 = Date.now();
+      const sent = await bot.sendMessage(process.env.CHAT_ID, galeText);
+
+      signal.galeMessageId = sent.message_id;
+
+      console.log(
+        `[sinais] Gale ${nextAttempt} #${signal.id} • Telegram ${Date.now() - t0} ms • desde a ronda ${Date.now() - round.detectedAt} ms`
+      );
+
+      await saveGaleMessageId(signal.id, sent.message_id).catch((error) =>
+        console.error(
+          `[db] Falha ao guardar ID do aviso de gale #${signal.id}:`,
+          error.message
+        )
+      );
+    })();
+
+    const dbTask = retryDb(
+      () => updateSignal(signal.id, { attempts: nextAttempt }),
+      `gale #${signal.id}`
+    );
+
+    const [sendResult, dbResult] = await Promise.allSettled([sendTask, dbTask]);
+
+    if (sendResult.status === 'rejected') {
+      console.error(
+        '[telegram] Falha ao enviar aviso de gale:',
+        sendResult.reason?.message
+      );
+    }
+
+    if (dbResult.status === 'rejected') {
+      console.error(
+        `[db] Gale #${signal.id} não gravado:`,
+        dbResult.reason?.message
+      );
+    }
+  }
+
+  async finishSignal(signal, status, round, attempts = signal.attempts) {
+    signal.attempts = attempts;
+
+    // Fora da lista ativa de imediato: nada o volta a processar.
+    this.activeSignals = this.activeSignals.filter(
+      (item) => item.id !== signal.id
+    );
+
+    this.notifying.add(signal.id);
+
+    try {
+      try {
+        await retryDb(
+          () => updateSignal(signal.id, { attempts, result: status }),
+          `resultado #${signal.id}`
+        );
+      } catch (error) {
+        console.error(
+          `[db] Resultado #${signal.id} não gravado; a notificar na mesma:`,
+          error.message
+        );
+      }
+
+      const t0 = Date.now();
+
+      try {
+        await sendOutcome(status, signal, !noHistory(status));
+
+        console.log(
+          `[sinais] #${signal.id}: ${status.toUpperCase()} • Telegram ${Date.now() - t0} ms • desde a ronda ${Date.now() - round.detectedAt} ms`
+        );
+      } catch (error) {
+        console.error(
+          `[telegram] Falha ao enviar resultado #${signal.id} (será recuperado):`,
+          error.message
+        );
+      }
+    } finally {
+      this.notifying.delete(signal.id);
+    }
+
+    // Apagar o aviso de gale nunca atrasa nada.
+    void this.clearGaleNotice(signal);
   }
 
   async start() {
@@ -1390,8 +1678,6 @@ class SignalEngine {
 
     await setSetting('running', 'true');
     this.running = true;
-
-    void this.trySendSignal('round');
 
     return { started: true, waitingForFeed: !feed.loaded };
   }
@@ -1406,7 +1692,7 @@ class SignalEngine {
     };
   }
 
-  // Supervisor: autorrecuperação (feed, sinais presos, envio de reserva).
+  // Supervisor: só limpeza e autorrecuperação (nunca envia sinais).
   startSupervisor() {
     if (this.supervisorTimer) return;
 
@@ -1433,31 +1719,33 @@ class SignalEngine {
         return;
       }
 
-      await this.cancelStale();
-      await this.trySendSignal('timer');
+      if (feed.looping && Date.now() - feed.loopTickAt > 60000) {
+        console.error('[supervisor] Ciclo do feed bloqueado; a reiniciar.');
+        void shutdown('feed-loop-stuck', 1);
+        return;
+      }
+
+      for (const signal of [...this.activeSignals]) {
+        if (Date.now() - signal.createdAt.getTime() > SIGNAL_MAX_PENDING_MS) {
+          await this.cancelSignal(signal, true);
+        }
+      }
     } finally {
       this.supervising = false;
     }
   }
 
-  async cancelStale() {
-    for (const signal of [...this.activeSignals]) {
-      if (Date.now() - signal.createdAt.getTime() <= SIGNAL_MAX_PENDING_MS) {
-        continue;
-      }
-
-      await this.cancelSignal(signal, true);
-    }
-  }
-
   async cancelSignal(signal, notify) {
-    await updateSignal(signal.id, { result: 'cancelado' });
-
     this.activeSignals = this.activeSignals.filter(
       (item) => item.id !== signal.id
     );
 
-    console.warn(`[sinais] Sinal #${signal.id} cancelado (sem resultado a tempo).`);
+    await retryDb(
+      () => updateSignal(signal.id, { result: 'cancelado' }),
+      `cancelar #${signal.id}`
+    );
+
+    console.warn(`[sinais] Sinal #${signal.id} cancelado.`);
 
     if (notify) {
       try {
@@ -1470,137 +1758,29 @@ class SignalEngine {
       }
     }
 
-    await this.clearGaleNotice(signal);
-  }
-
-  async finishSignal(signal, status, attempts = signal.attempts) {
-    await updateSignal(signal.id, { attempts, result: status });
-
-    signal.attempts = attempts;
-
-    this.activeSignals = this.activeSignals.filter(
-      (item) => item.id !== signal.id
-    );
-
-    this.notifying.add(signal.id);
-
-    try {
-      await sendOutcome(
-        status,
-        signal,
-        !['empate', 'eg1', 'eg2'].includes(status)
-      );
-    } catch (error) {
-      console.error(
-        `[telegram] Falha ao enviar resultado #${signal.id} (será recuperado):`,
-        error.message
-      );
-    } finally {
-      this.notifying.delete(signal.id);
-    }
-
-    await this.clearGaleNotice(signal);
-  }
-
-  async handleRound(round) {
-    for (const signal of [...this.activeSignals]) {
-      await this.settle(signal, round);
-    }
-
-    // Só a ronda mais recente dispara novo sinal (evita rajadas de reprocesso).
-    const latest = feed.latest();
-
-    if (latest && latest.settledAt === round.settledAt) {
-      await this.trySendSignal('round');
-    }
-  }
-
-  async settle(signal, round) {
-    // Só conta rondas posteriores à ronda-base do sinal.
-    if (round.at.getTime() <= signal.baselineAt.getTime()) return;
-    if (signal.lastRoundKey === round.settledAt) return;
-
-    if (round.side === 'T') {
-      const status =
-        signal.attempts === 0 ? 'empate' : signal.attempts === 1 ? 'eg1' : 'eg2';
-
-      await this.finishSignal(signal, status);
-      console.log(`[sinais] #${signal.id}: ${status.toUpperCase()} (proteção no empate).`);
-      return;
-    }
-
-    if (round.side === signal.entry) {
-      const status =
-        signal.attempts === 0 ? 'green' : signal.attempts === 1 ? 'g1' : 'g2';
-
-      await this.finishSignal(signal, status);
-      console.log(`[sinais] #${signal.id}: ${status.toUpperCase()}.`);
-      return;
-    }
-
-    const nextAttempt = signal.attempts + 1;
-
-    if (nextAttempt > signal.gales) {
-      await this.finishSignal(signal, 'red', nextAttempt);
-      console.log(`[sinais] #${signal.id}: RED.`);
-      return;
-    }
-
-    await updateSignal(signal.id, { attempts: nextAttempt });
-
-    signal.attempts = nextAttempt;
-    signal.lastRoundKey = round.settledAt;
-
-    const galeText = [
-      `🔄⚠️ GALE ${nextAttempt} — VAMOS À PRÓXIMA!`,
-      `🎯 Manter: ${sideLabel(signal.entry)}`,
-      '🛡️ Empate continua protegido',
-      `🔖 Sinal #${signal.id}`
-    ].join('\n');
-
-    try {
-      const sent = await bot.sendMessage(process.env.CHAT_ID, galeText);
-
-      signal.galeMessageId = sent.message_id;
-
-      try {
-        await saveGaleMessageId(signal.id, sent.message_id);
-      } catch (error) {
-        console.error(
-          `[db] Falha ao guardar ID do aviso de gale #${signal.id}:`,
-          error.message
-        );
-      }
-    } catch (error) {
-      console.error('[telegram] Falha ao enviar aviso de gale:', error.message);
-    }
+    void this.clearGaleNotice(signal);
   }
 
   async clearGaleNotice(signal) {
     if (!signal.galeMessageId) return;
 
+    const messageId = signal.galeMessageId;
+
+    signal.galeMessageId = null;
+
     try {
-      await bot.deleteMessage(process.env.CHAT_ID, signal.galeMessageId);
-
-      signal.galeMessageId = null;
-
-      await saveGaleMessageId(signal.id, null);
-
-      console.log(`[telegram] Aviso de gale removido para o sinal #${signal.id}.`);
+      await bot.deleteMessage(process.env.CHAT_ID, messageId);
     } catch (error) {
       console.error(
-        `[telegram] Não foi possível remover aviso de gale #${signal.id}:`,
+        `[telegram] Aviso de gale #${signal.id} não removido:`,
         error.message
       );
+    }
 
-      // Mensagem já apagada / inexistente: não insistir.
-      signal.galeMessageId = null;
-
-      try {
-        await saveGaleMessageId(signal.id, null);
-      } catch {
-        // ignorado
-      }
+    try {
+      await saveGaleMessageId(signal.id, null);
+    } catch {
+      // ignorado
     }
   }
 }
@@ -1611,7 +1791,6 @@ const engine = new SignalEngine();
 // HTTP
 // ---------------------------------------------------------------------------
 
-// Endpoint leve para keep-alive (UptimeRobot / cron-job.org / auto-ping).
 app.get('/ping', (_req, res) => {
   res.status(200).type('text/plain').send('ok');
 });
@@ -1654,6 +1833,7 @@ app.get(
       intervalMin: engine.intervalMin,
       gales: engine.gales,
       activeSignals: engine.activeSignals,
+      skipped: engine.skipped,
       statistics: stats,
       historyTimezone: HISTORY_TZ,
       feed: {
@@ -1663,8 +1843,56 @@ app.get(
         lastNewRoundSeenAt: feed.lastNewRoundSeenAt,
         roundFresh: feed.isRoundFresh(),
         errors: feed.errors,
-        recentRounds: feed.rounds.slice(0, 10)
+        recentRounds: feed.rounds.slice(0, 10).map((round) => ({
+          settledAt: round.settledAt,
+          side: round.side,
+          playerScore: round.playerScore,
+          bankerScore: round.bankerScore,
+          latencyMs: round.latencyMs ?? null
+        }))
       }
+    });
+  })
+);
+
+// Mostra ONDE está o atraso: no feed ou no Telegram.
+app.get(
+  '/admin/diagnostics',
+  requireAdmin,
+  asyncRoute(async (_req, res) => {
+    const telegram = [];
+
+    for (let i = 0; i < 3; i += 1) {
+      const t0 = Date.now();
+
+      try {
+        await telegramCall('getMe', {}, 'Telegram getMe');
+        telegram.push(Date.now() - t0);
+      } catch (error) {
+        telegram.push(`erro: ${error.message}`);
+      }
+    }
+
+    const t1 = Date.now();
+    let dbMs = null;
+
+    try {
+      await pool.query('SELECT 1');
+      dbMs = Date.now() - t1;
+    } catch (error) {
+      dbMs = `erro: ${error.message}`;
+    }
+
+    const feedStats = feed.stats();
+
+    res.json({
+      feed: feedStats,
+      telegramRoundtripMs: telegram,
+      databaseRoundtripMs: dbMs,
+      skippedSignals: engine.skipped,
+      reading:
+        'latência do feed = tempo entre o fim da ronda (settled_at) e a nossa deteção. ' +
+        'Se medianLatencyMs for alta, o atraso vem da fonte do feed, não do bot.'
     });
   })
 );
@@ -1681,7 +1909,6 @@ app.post(
   asyncRoute(async (_req, res) => res.json(await engine.stop()))
 );
 
-// Liberta o motor se algum sinal ficar preso.
 app.post(
   '/admin/cancel-pending',
   requireAdmin,
@@ -1812,13 +2039,13 @@ async function startServer() {
 
   httpServer.keepAliveTimeout = 65000;
 
-  feed.start();
-  engine.startSupervisor();
-  startKeepAlive();
-
   // Arranque automático SEMPRE (24/7).
   engine.running = true;
   await setSetting('running', 'true');
+
+  feed.start();
+  engine.startSupervisor();
+  startKeepAlive();
 
   void engine
     .recoverUnsentOutcomes()
@@ -1834,7 +2061,9 @@ async function startServer() {
       );
   }, 30000);
 
-  console.log('[server] Motor ativo 24/7; supervisor e keep-alive em execução.');
+  console.log(
+    '[server] Motor ativo 24/7: sinais só após rondas novas; supervisor e keep-alive em execução.'
+  );
 }
 
 async function shutdown(reason, exitCode = 0) {
@@ -1849,7 +2078,6 @@ async function shutdown(reason, exitCode = 0) {
   if (engine.supervisorTimer) clearInterval(engine.supervisorTimer);
   if (engine.outcomeRecoveryTimer) clearInterval(engine.outcomeRecoveryTimer);
 
-  // Rede de segurança: nunca ficar pendurado.
   setTimeout(() => process.exit(exitCode), 8000).unref();
 
   if (httpServer) {
