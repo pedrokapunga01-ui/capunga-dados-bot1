@@ -3,7 +3,7 @@
 // BAC BO Telegram Signals — Render Web Service
 // Variáveis obrigatórias no Render:
 // BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL
-// O Render fornece PORT automaticamente.
+// Opcional: HISTORY_TZ (Africa/Luanda, America/New_York, America/Sao_Paulo, Europe/Lisbon, UTC)
 
 const express = require('express');
 const crypto = require('crypto');
@@ -19,10 +19,12 @@ const FEED_INTERVAL_MS = 5000;
 const FEED_MAX_RETRY_MS = 30000;
 const REQUEST_TIMEOUT_MS = 10000;
 const MAX_FEED_ROUND_AGE_MS = 5 * 60 * 1000;
+
 const DEFAULT_SIGNAL_INTERVAL_MIN = 3;
 const DEFAULT_GALES = 2;
 const MAX_ACTIVE_SIGNALS = 1;
-const NAMES = { P: 'PLAYER 🔵', B: 'BANCO 🔴' };
+
+const REQUIRED_ENV = ['BOT_TOKEN', 'CHAT_ID', 'ADMIN_TOKEN', 'DATABASE_URL'];
 
 const ALLOWED_TIMEZONES = new Set([
   'Africa/Luanda',
@@ -32,15 +34,15 @@ const ALLOWED_TIMEZONES = new Set([
   'UTC'
 ]);
 
-const REQUIRED_ENV = ['BOT_TOKEN', 'CHAT_ID', 'ADMIN_TOKEN', 'DATABASE_URL'];
-
 function validateEnvironment() {
   const missing = REQUIRED_ENV.filter(
     (name) => !String(process.env[name] || '').trim()
   );
 
   if (missing.length) {
-    throw new Error(`Variáveis obrigatórias ausentes: ${missing.join(', ')}`);
+    throw new Error(
+      `Variáveis obrigatórias ausentes: ${missing.join(', ')}`
+    );
   }
 
   if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
@@ -48,7 +50,9 @@ function validateEnvironment() {
   }
 
   if (String(process.env.ADMIN_TOKEN).length < 24) {
-    throw new Error('ADMIN_TOKEN deve ter pelo menos 24 caracteres aleatórios.');
+    throw new Error(
+      'ADMIN_TOKEN deve ter pelo menos 24 caracteres aleatórios.'
+    );
   }
 
   try {
@@ -91,7 +95,9 @@ const bot = {
         `https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`,
         {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json'
+          },
           body: JSON.stringify({
             chat_id: chatId,
             text,
@@ -106,7 +112,9 @@ const bot = {
 
       if (!response.ok || !payload.ok) {
         throw new Error(
-          `Telegram API: ${payload.description || `HTTP ${response.status}`}`
+          `Telegram API: ${
+            payload.description || `HTTP ${response.status}`
+          }`
         );
       }
 
@@ -124,7 +132,9 @@ const bot = {
         `https://api.telegram.org/bot${process.env.BOT_TOKEN}/deleteMessage`,
         {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json'
+          },
           body: JSON.stringify({
             chat_id: chatId,
             message_id: messageId
@@ -171,7 +181,9 @@ function requireAdmin(req, res, next) {
     suppliedBuffer.length !== expectedBuffer.length ||
     !crypto.timingSafeEqual(suppliedBuffer, expectedBuffer)
   ) {
-    return res.status(401).json({ error: 'Token administrativo inválido.' });
+    return res.status(401).json({
+      error: 'Token administrativo inválido.'
+    });
   }
 
   next();
@@ -192,13 +204,17 @@ function parseFeedTime(value) {
     : String(value).replace(' ', 'T');
 
   const hasTimezone = /(?:[zZ]|[+-]\d{2}:\d{2})$/.test(normalized);
-  const date = new Date(hasTimezone ? normalized : `${normalized}Z`);
+  const date = new Date(
+    hasTimezone ? normalized : `${normalized}Z`
+  );
 
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function optionalNumber(value) {
-  if (value === null || value === undefined || value === '') return null;
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
 
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
@@ -253,14 +269,19 @@ class LiveFeed {
       });
 
       if (!response.ok) {
-        throw new Error(`Feed respondeu HTTP ${response.status}`);
+        throw new Error(
+          `Feed respondeu HTTP ${response.status}`
+        );
       }
 
-      const contentType = response.headers.get('content-type') || '';
+      const contentType =
+        response.headers.get('content-type') || '';
 
       if (!contentType.includes('json')) {
         throw new Error(
-          `Tipo de conteúdo inesperado: ${contentType || 'desconhecido'}`
+          `Tipo de conteúdo inesperado: ${
+            contentType || 'desconhecido'
+          }`
         );
       }
 
@@ -297,7 +318,10 @@ class LiveFeed {
         throw new Error('Feed sem rodadas reconhecíveis.');
       }
 
-      const existing = new Set(this.rounds.map((item) => item.settledAt));
+      const existing = new Set(
+        this.rounds.map((item) => item.settledAt)
+      );
+
       const fresh = [];
 
       for (const round of rounds) {
@@ -315,6 +339,7 @@ class LiveFeed {
 
       if (!this.loaded) {
         this.loaded = true;
+
         console.log(
           `[feed] Ligado: ${this.rounds.length} rondas válidas; última ronda ${rounds[0].settledAt}.`
         );
@@ -325,6 +350,7 @@ class LiveFeed {
       }
     } catch (error) {
       this.errors += 1;
+
       this.nextDelay = Math.min(
         FEED_MAX_RETRY_MS,
         Math.max(FEED_INTERVAL_MS, this.nextDelay * 2)
@@ -339,7 +365,10 @@ class LiveFeed {
       if (!shuttingDown) {
         this.timer = setTimeout(() => {
           this.fetchResults().catch((error) =>
-            console.error('[feed] Erro inesperado no polling:', error.message)
+            console.error(
+              '[feed] Erro inesperado no polling:',
+              error.message
+            )
           );
         }, this.nextDelay);
 
@@ -372,12 +401,17 @@ class LiveFeed {
               `[feed] Processamento da ronda falhou (tentativa ${attempt}); nova tentativa em ${delay} ms: ${error.message}`
             );
 
-            await new Promise((resolve) => setTimeout(resolve, delay));
+            await new Promise((resolve) =>
+              setTimeout(resolve, delay)
+            );
           }
         }
       })
       .catch((error) => {
-        console.error('[feed] Falha ao processar ronda:', error.message);
+        console.error(
+          '[feed] Falha ao processar ronda:',
+          error.message
+        );
       });
   }
 
@@ -410,25 +444,30 @@ async function initializeDatabase() {
       detail TEXT NOT NULL DEFAULT '',
       gales INTEGER NOT NULL DEFAULT 2 CHECK (gales BETWEEN 0 AND 3),
       attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-      result TEXT NOT NULL DEFAULT 'pendente'
-        CHECK (
-          result IN (
-            'pendente',
-            'green',
-            'g1',
-            'g2',
-            'empate',
-            'eg1',
-            'eg2',
-            'red',
-            'cancelado'
-          )
-        ),
+      result TEXT NOT NULL DEFAULT 'pendente',
       result_notification_pending BOOLEAN NOT NULL DEFAULT false,
       gale_message_id BIGINT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       settled_at TIMESTAMPTZ
     );
+
+    ALTER TABLE signals
+      ADD COLUMN IF NOT EXISTS detail TEXT NOT NULL DEFAULT '';
+
+    ALTER TABLE signals
+      ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
+
+    ALTER TABLE signals
+      ADD COLUMN IF NOT EXISTS gale_message_id BIGINT;
+
+    ALTER TABLE signals
+      ADD COLUMN IF NOT EXISTS result_notification_pending BOOLEAN NOT NULL DEFAULT false;
+
+    ALTER TABLE signals
+      ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
+
+    ALTER TABLE signals
+      ADD COLUMN IF NOT EXISTS gales INTEGER NOT NULL DEFAULT 2;
 
     CREATE INDEX IF NOT EXISTS signals_created_at_idx
       ON signals (created_at DESC);
@@ -462,7 +501,9 @@ async function setSetting(key, value) {
     `INSERT INTO settings (key, value)
      VALUES ($1, $2)
      ON CONFLICT (key)
-     DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+     DO UPDATE SET
+       value = EXCLUDED.value,
+       updated_at = NOW()`,
     [key, String(value)]
   );
 }
@@ -472,26 +513,43 @@ async function insertSignal(signal) {
     `INSERT INTO signals (entry, strategy, detail, gales)
      VALUES ($1, $2, $3, $4)
      RETURNING id, created_at`,
-    [signal.entry, signal.strategy, signal.detail, signal.gales]
+    [
+      signal.entry,
+      signal.strategy,
+      signal.detail,
+      signal.gales
+    ]
   );
 
   return result.rows[0];
 }
 
-async function updateSignal(id, { attempts = null, result = null } = {}) {
+async function updateSignal(
+  id,
+  { attempts = null, result = null } = {}
+) {
   await pool.query(
     `UPDATE signals
-     SET attempts = COALESCE($1, attempts),
-         result = COALESCE($2, result),
-         settled_at = CASE
-           WHEN $2 IS NULL THEN settled_at
-           ELSE NOW()
-         END,
-         result_notification_pending = CASE
-           WHEN $2 IN ('green', 'g1', 'g2', 'empate', 'eg1', 'eg2', 'red')
-           THEN true
-           ELSE result_notification_pending
-         END
+     SET
+       attempts = COALESCE($1, attempts),
+       result = COALESCE($2, result),
+       settled_at = CASE
+         WHEN $2 IS NULL THEN settled_at
+         ELSE NOW()
+       END,
+       result_notification_pending = CASE
+         WHEN $2 IN (
+           'green',
+           'g1',
+           'g2',
+           'empate',
+           'eg1',
+           'eg2',
+           'red'
+         )
+         THEN true
+         ELSE result_notification_pending
+       END
      WHERE id = $3`,
     [attempts, result, id]
   );
@@ -499,14 +557,18 @@ async function updateSignal(id, { attempts = null, result = null } = {}) {
 
 async function markOutcomeNotified(id) {
   await pool.query(
-    'UPDATE signals SET result_notification_pending = false WHERE id = $1',
+    `UPDATE signals
+     SET result_notification_pending = false
+     WHERE id = $1`,
     [id]
   );
 }
 
 async function saveGaleMessageId(id, messageId) {
   await pool.query(
-    'UPDATE signals SET gale_message_id = $1 WHERE id = $2',
+    `UPDATE signals
+     SET gale_message_id = $1
+     WHERE id = $2`,
     [messageId, id]
   );
 }
@@ -515,15 +577,23 @@ async function statistics() {
   const { rows } = await pool.query(`
     SELECT
       COUNT(*)::int AS total,
-      COUNT(*) FILTER (WHERE result IN ('green', 'g1', 'g2'))::int AS green,
+      COUNT(*) FILTER (
+        WHERE result IN ('green', 'g1', 'g2')
+      )::int AS green,
       COUNT(*) FILTER (WHERE result = 'green')::int AS direct,
-      COUNT(*) FILTER (WHERE result IN ('g1', 'g2'))::int AS gale,
+      COUNT(*) FILTER (
+        WHERE result IN ('g1', 'g2')
+      )::int AS gale,
       COUNT(*) FILTER (
         WHERE result IN ('empate', 'eg1', 'eg2')
       )::int AS tie,
       COUNT(*) FILTER (WHERE result = 'red')::int AS red,
-      COUNT(*) FILTER (WHERE result = 'pendente')::int AS pending,
-      COUNT(*) FILTER (WHERE result = 'cancelado')::int AS cancelled
+      COUNT(*) FILTER (
+        WHERE result = 'pendente'
+      )::int AS pending,
+      COUNT(*) FILTER (
+        WHERE result = 'cancelado'
+      )::int AS cancelled
     FROM signals
   `);
 
@@ -549,7 +619,15 @@ async function dailyHistory() {
         ) AS rn
       FROM signals
       WHERE
-        result IN ('green', 'g1', 'g2', 'empate', 'eg1', 'eg2', 'red')
+        result IN (
+          'green',
+          'g1',
+          'g2',
+          'empate',
+          'eg1',
+          'eg2',
+          'red'
+        )
         AND settled_at IS NOT NULL
         AND (settled_at AT TIME ZONE $1)::date =
             (NOW() AT TIME ZONE $1)::date
@@ -563,7 +641,9 @@ async function dailyHistory() {
       COUNT(*) FILTER (
         WHERE result IN ('green', 'g1', 'g2')
       )::int AS greens,
-      COUNT(*) FILTER (WHERE result = 'empate')::int AS tiedirect,
+      COUNT(*) FILTER (
+        WHERE result = 'empate'
+      )::int AS tiedirect,
       COUNT(*) FILTER (WHERE result = 'eg1')::int AS eg1,
       COUNT(*) FILTER (WHERE result = 'eg2')::int AS eg2,
       COUNT(*) FILTER (
@@ -617,7 +697,8 @@ function resultMessage(status, signal) {
     green: '🟢 GREEN XIRA — DE PRIMEIRA! 🎉🥳',
     g1: '🟢 GREEN XIRA — GALE 1! 🎊💚',
     g2: '🟢 GREEN XIRA — GALE 2! 🎉🛡️',
-    empate: '🟡 EMPATE! PROTEÇÃO ATIVADA — ENTRADA ENCERRADA 🛡️🤝',
+    empate:
+      '🟡 EMPATE! PROTEÇÃO ATIVADA — ENTRADA ENCERRADA 🛡️🤝',
     eg1: '🟡 EMPATE NO GALE 1 — ENTRADA ENCERRADA 🛡️🤝',
     eg2: '🟡 EMPATE NO GALE 2 — ENTRADA ENCERRADA 🛡️🤝',
     red: '🔴 TÁ MALÊ — LOSS NESTA ENTRADA 😕💔'
@@ -628,7 +709,11 @@ function resultMessage(status, signal) {
   }`;
 }
 
-async function sendOutcome(status, signal, includeHistory = true) {
+async function sendOutcome(
+  status,
+  signal,
+  includeHistory = true
+) {
   let text = resultMessage(status, signal);
 
   if (includeHistory) {
@@ -641,7 +726,8 @@ async function sendOutcome(status, signal, includeHistory = true) {
         error.message
       );
 
-      text += '\n\n📊 Placar diário temporariamente indisponível.';
+      text +=
+        '\n\n📊 Placar diário temporariamente indisponível.';
     }
   }
 
@@ -659,8 +745,10 @@ async function sendOutcome(status, signal, includeHistory = true) {
 
 const opposite = (side) => (side === 'P' ? 'B' : 'P');
 const isSide = (side) => side === 'P' || side === 'B';
+
 const hasScore = (round) =>
-  Number.isFinite(round.playerScore) && Number.isFinite(round.bankerScore);
+  Number.isFinite(round.playerScore) &&
+  Number.isFinite(round.bankerScore);
 
 const scoreFor = (round) =>
   round.side === 'P' ? round.playerScore : round.bankerScore;
@@ -710,13 +798,19 @@ function detectRegime(sequence) {
   const sample = sequence.slice(0, 15);
 
   if (sample.length < 6) {
-    return { trend: 0.5, chop: 0.5, label: 'neutro' };
+    return {
+      trend: 0.5,
+      chop: 0.5,
+      label: 'neutro'
+    };
   }
 
   let changes = 0;
 
   for (let i = 1; i < sample.length; i += 1) {
-    if (sample[i].side !== sample[i - 1].side) changes += 1;
+    if (sample[i].side !== sample[i - 1].side) {
+      changes += 1;
+    }
   }
 
   const chop = changes / (sample.length - 1);
@@ -740,9 +834,21 @@ function runStrategies(rows) {
 
   const out = [];
 
-  const add = (side, key, name, strength, type = 'seq') => {
+  const add = (
+    side,
+    key,
+    name,
+    strength,
+    type = 'seq'
+  ) => {
     if (isSide(side)) {
-      out.push({ side, key, name, strength, type });
+      out.push({
+        side,
+        key,
+        name,
+        strength,
+        type
+      });
     }
   };
 
@@ -750,6 +856,7 @@ function runStrategies(rows) {
 
   if (n >= 3 && n <= 7) {
     const strengths = [0, 0, 0, 72, 78, 84, 86, 86];
+
     add(
       seq[0].side,
       `SEQ_REP_${n}`,
@@ -761,6 +868,7 @@ function runStrategies(rows) {
 
   if (n >= 4 && n <= 8) {
     const strengths = [0, 0, 0, 0, 74, 80, 84, 85, 85];
+
     add(
       opposite(seq[0].side),
       `SEQ_QUEBRA_${n}`,
@@ -783,7 +891,9 @@ function runStrategies(rows) {
   }
 
   if (seq.length >= 4) {
-    const [a, b, c, d] = seq.slice(0, 4).map((item) => item.side);
+    const [a, b, c, d] = seq
+      .slice(0, 4)
+      .map((item) => item.side);
 
     if (a === b && c === d && a !== c) {
       add(c, 'SEQ_2x2', 'Bloco 2+2', 76, 'seq');
@@ -795,7 +905,9 @@ function runStrategies(rows) {
   }
 
   if (seq.length >= 3) {
-    const [a, b, c] = seq.slice(0, 3).map((item) => item.side);
+    const [a, b, c] = seq
+      .slice(0, 3)
+      .map((item) => item.side);
 
     if (a !== b && b === c) {
       add(c, 'SEQ_MOMENTUM_2', 'Momentum 2', 77, 'seq');
@@ -806,7 +918,9 @@ function runStrategies(rows) {
     n === 4 &&
     seq
       .slice(0, 4)
-      .every((round) => hasScore(round) && margin(round) <= 2)
+      .every(
+        (round) => hasScore(round) && margin(round) <= 2
+      )
   ) {
     add(
       opposite(seq[0].side),
@@ -818,7 +932,9 @@ function runStrategies(rows) {
   }
 
   if (seq.length >= 5) {
-    const [a, b, c, d, e] = seq.slice(0, 5).map((item) => item.side);
+    const [a, b, c, d, e] = seq
+      .slice(0, 5)
+      .map((item) => item.side);
 
     if (a === b && b === c && c !== d && d === e) {
       add(a, 'SEQ_EXTEND', 'Streak extend', 80, 'seq');
@@ -830,7 +946,9 @@ function runStrategies(rows) {
     n <= 6 &&
     seq
       .slice(0, n)
-      .every((round) => hasScore(round) && margin(round) >= 3)
+      .every(
+        (round) => hasScore(round) && margin(round) >= 3
+      )
   ) {
     add(
       seq[0].side,
@@ -855,7 +973,9 @@ function runStrategies(rows) {
     alt >= 3 &&
     seq
       .slice(0, alt)
-      .every((round) => hasScore(round) && margin(round) >= 3)
+      .every(
+        (round) => hasScore(round) && margin(round) >= 3
+      )
   ) {
     add(
       opposite(seq[0].side),
@@ -869,7 +989,10 @@ function runStrategies(rows) {
   const last20 = seq.slice(0, 20);
 
   if (last20.length >= 15) {
-    const bankers = last20.filter((round) => round.side === 'B').length;
+    const bankers = last20.filter(
+      (round) => round.side === 'B'
+    ).length;
+
     const players = last20.length - bankers;
 
     if (bankers >= 12) {
@@ -881,10 +1004,7 @@ function runStrategies(rows) {
     }
   }
 
-  if (
-    seq.length >= 3 &&
-    seq.slice(0, 3).every(hasScore)
-  ) {
+  if (seq.length >= 3 && seq.slice(0, 3).every(hasScore)) {
     const [a, b, c] = seq.slice(0, 3);
     const sa = scoreFor(a);
     const sb = scoreFor(b);
@@ -1011,12 +1131,16 @@ function runStrategies(rows) {
 
   if (scoredRows.length >= 6) {
     const playerMean =
-      scoredRows.reduce((sum, round) => sum + round.playerScore, 0) /
-      scoredRows.length;
+      scoredRows.reduce(
+        (sum, round) => sum + round.playerScore,
+        0
+      ) / scoredRows.length;
 
     const bankerMean =
-      scoredRows.reduce((sum, round) => sum + round.bankerScore, 0) /
-      scoredRows.length;
+      scoredRows.reduce(
+        (sum, round) => sum + round.bankerScore,
+        0
+      ) / scoredRows.length;
 
     const difference = playerMean - bankerMean;
 
@@ -1094,14 +1218,30 @@ function runStrategies(rows) {
   }
 
   if (rows[0]?.side === 'T' && seq.length) {
-    add(seq[0].side, 'NUM_POS_EMPATE', 'Pós-empate', 74, 'num');
+    add(
+      seq[0].side,
+      'NUM_POS_EMPATE',
+      'Pós-empate',
+      74,
+      'num'
+    );
   }
 
-  if (rows.slice(0, 3).filter((round) => round.side === 'T').length >= 2) {
+  if (
+    rows
+      .slice(0, 3)
+      .filter((round) => round.side === 'T').length >= 2
+  ) {
     const prior = rows.find((round) => isSide(round.side));
 
     if (prior) {
-      add(prior.side, 'TIE_CASCADE', 'Cascata de empates', 76, 'num');
+      add(
+        prior.side,
+        'TIE_CASCADE',
+        'Cascata de empates',
+        76,
+        'num'
+      );
     }
   }
 
@@ -1135,7 +1275,10 @@ function runStrategies(rows) {
 
   if (seq.length >= 10) {
     const sample = seq.slice(0, 10);
-    const p = sample.filter((round) => round.side === 'P').length;
+    const p = sample.filter(
+      (round) => round.side === 'P'
+    ).length;
+
     const b = sample.length - p;
 
     if (p !== b) {
@@ -1156,7 +1299,9 @@ function analyzeResults(rows) {
   const seq = rows.filter((round) => isSide(round.side));
 
   if (seq.length < 5) {
-    throw new Error('Histórico válido insuficiente para analisar.');
+    throw new Error(
+      'Histórico válido insuficiente para analisar.'
+    );
   }
 
   const regime = detectRegime(seq);
@@ -1172,7 +1317,9 @@ function analyzeResults(rows) {
       return regime.chop >= 0.4;
     }
 
-    if (/REP|STRONG_STREAK|BANKER_BIAS/.test(candidate.key)) {
+    if (
+      /REP|STRONG_STREAK|BANKER_BIAS/.test(candidate.key)
+    ) {
       return regime.trend >= 0.4;
     }
 
@@ -1181,7 +1328,10 @@ function analyzeResults(rows) {
 
   if (!candidates.length) {
     const sample = seq.slice(0, 10);
-    const p = sample.filter((round) => round.side === 'P').length;
+    const p = sample.filter(
+      (round) => round.side === 'P'
+    ).length;
+
     const b = sample.length - p;
 
     candidates = [
@@ -1217,14 +1367,22 @@ function analyzeResults(rows) {
       const families = new Set(votes.map(familyOf));
 
       const score =
-        votes.reduce((sum, vote) => sum + vote.strength, 0) +
-        Math.max(0, families.size - 1) * 4;
+        votes.reduce(
+          (sum, vote) => sum + vote.strength,
+          0
+        ) + Math.max(0, families.size - 1) * 4;
 
-      return { side, votes, score, families };
+      return {
+        side,
+        votes,
+        score,
+        families
+      };
     })
     .sort((a, b) => b.score - a.score);
 
   const winner = ranked[0];
+
   const best = winner.votes
     .slice()
     .sort((a, b) => b.strength - a.strength)[0];
@@ -1357,6 +1515,7 @@ class SignalEngine {
       console.warn(
         '[sinais] Sinal adiado: última ronda do feed está desatualizada.'
       );
+
       return null;
     }
 
@@ -1371,7 +1530,10 @@ class SignalEngine {
     let signal = null;
 
     try {
-      const analysis = analyzeResults(feed.getRounds(50));
+      const analysis = analyzeResults(
+        feed.getRounds(50)
+      );
+
       const saved = await insertSignal({
         ...analysis,
         gales: this.gales
@@ -1404,9 +1566,13 @@ class SignalEngine {
         `🔖 Sinal #${signal.id}`
       ].join('\n');
 
-      await bot.sendMessage(process.env.CHAT_ID, message, {
-        disable_web_page_preview: true
-      });
+      await bot.sendMessage(
+        process.env.CHAT_ID,
+        message,
+        {
+          disable_web_page_preview: true
+        }
+      );
 
       console.log(
         `[sinais] Enviado #${signal.id}: ${signal.entry}/${signal.strategy}.`
@@ -1416,7 +1582,9 @@ class SignalEngine {
     } catch (error) {
       if (signal) {
         try {
-          await updateSignal(signal.id, { result: 'cancelado' });
+          await updateSignal(signal.id, {
+            result: 'cancelado'
+          });
         } catch (databaseError) {
           console.error(
             `[db] Falha ao cancelar sinal #${signal.id}:`,
@@ -1437,7 +1605,10 @@ class SignalEngine {
 
   async start() {
     if (this.running) {
-      return { started: false, reason: 'O motor já está ativo.' };
+      return {
+        started: false,
+        reason: 'O motor já está ativo.'
+      };
     }
 
     await setSetting('running', 'true');
@@ -1476,7 +1647,9 @@ class SignalEngine {
   }
 
   scheduleNext() {
-    if (!this.running || this.timer || shuttingDown) return;
+    if (!this.running || this.timer || shuttingDown) {
+      return;
+    }
 
     this.timer = setTimeout(async () => {
       this.timer = null;
@@ -1523,7 +1696,9 @@ class SignalEngine {
 
   async handleRound(round) {
     for (const signal of [...this.activeSignals]) {
-      if (round.at.getTime() <= signal.createdAt.getTime()) continue;
+      if (round.at.getTime() <= signal.createdAt.getTime()) {
+        continue;
+      }
 
       if (round.side === 'T') {
         const status =
@@ -1562,13 +1737,18 @@ class SignalEngine {
       const nextAttempt = signal.attempts + 1;
 
       if (nextAttempt <= signal.gales) {
-        await updateSignal(signal.id, { attempts: nextAttempt });
+        await updateSignal(signal.id, {
+          attempts: nextAttempt
+        });
+
         signal.attempts = nextAttempt;
 
         const galeText = [
-          '🔄⚠️ GALE ' + nextAttempt + ' — VAMOS À PRÓXIMA!',
+          `🔄⚠️ GALE ${nextAttempt} — VAMOS À PRÓXIMA!`,
           `🎯 Manter: ${
-            signal.entry === 'B' ? '🔴 BANCA' : '🔵 JOGADOR'
+            signal.entry === 'B'
+              ? '🔴 BANCA'
+              : '🔵 JOGADOR'
           }`,
           '🛡️ Empate continua protegido',
           `🔖 Sinal #${signal.id}`
@@ -1583,7 +1763,10 @@ class SignalEngine {
           signal.galeMessageId = sent.message_id;
 
           try {
-            await saveGaleMessageId(signal.id, sent.message_id);
+            await saveGaleMessageId(
+              signal.id,
+              sent.message_id
+            );
           } catch (error) {
             console.error(
               `[db] Falha ao guardar ID do aviso de gale #${signal.id}:`,
@@ -1654,6 +1837,7 @@ app.get('/health', (_req, res) => {
     Date.now() - feed.lastUpdate.getTime() < 60000;
 
   const roundFresh = feed.isRoundFresh();
+
   const healthy = Boolean(
     responseFresh && roundFresh && !shuttingDown
   );
@@ -1697,13 +1881,17 @@ app.get(
 app.post(
   '/admin/start',
   requireAdmin,
-  asyncRoute(async (_req, res) => res.json(await engine.start()))
+  asyncRoute(async (_req, res) =>
+    res.json(await engine.start())
+  )
 );
 
 app.post(
   '/admin/stop',
   requireAdmin,
-  asyncRoute(async (_req, res) => res.json(await engine.stop()))
+  asyncRoute(async (_req, res) =>
+    res.json(await engine.stop())
+  )
 );
 
 app.post(
@@ -1730,7 +1918,10 @@ app.post(
     engine.timer = null;
     engine.scheduleNext();
 
-    res.json({ ok: true, intervalMin: value });
+    res.json({
+      ok: true,
+      intervalMin: value
+    });
   })
 );
 
@@ -1753,7 +1944,10 @@ app.post(
     engine.gales = value;
     await setSetting('gales', value);
 
-    res.json({ ok: true, gales: value });
+    res.json({
+      ok: true,
+      gales: value
+    });
   })
 );
 
@@ -1786,17 +1980,24 @@ app.use((err, _req, res, _next) => {
 
   if (res.headersSent) return;
 
-  res.status(500).json({ error: 'Erro interno do servidor.' });
+  res.status(500).json({
+    error: 'Erro interno do servidor.'
+  });
 });
 
 async function startServer() {
   await initializeDatabase();
 
   const interval = Number(
-    await getSetting('interval_min', DEFAULT_SIGNAL_INTERVAL_MIN)
+    await getSetting(
+      'interval_min',
+      DEFAULT_SIGNAL_INTERVAL_MIN
+    )
   );
 
-  const gales = Number(await getSetting('gales', DEFAULT_GALES));
+  const gales = Number(
+    await getSetting('gales', DEFAULT_GALES)
+  );
 
   if (Number.isInteger(interval) && interval >= 1) {
     engine.intervalMin = Math.min(3, interval);
@@ -1806,7 +2007,11 @@ async function startServer() {
     }
   }
 
-  if (Number.isInteger(gales) && gales >= 0 && gales <= 3) {
+  if (
+    Number.isInteger(gales) &&
+    gales >= 0 &&
+    gales <= 3
+  ) {
     engine.gales = gales;
   }
 
@@ -1889,6 +2094,7 @@ async function shutdown(signal, exitCode = 0) {
   feed.stop();
 
   if (engine.timer) clearTimeout(engine.timer);
+
   if (engine.outcomeRecoveryTimer) {
     clearInterval(engine.outcomeRecoveryTimer);
   }
