@@ -151,9 +151,10 @@ async function dbInit() {
     CREATE TABLE IF NOT EXISTS capunga_signals (
       id INTEGER PRIMARY KEY, cor TEXT NOT NULL, key TEXT NOT NULL, nome TEXT NOT NULL,
       tipo TEXT NOT NULL, conf INT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDENTE',
-      gale INT, agree INT, tier INT DEFAULT 0,
+      gale INT, agree INT, tier INT DEFAULT 0, base_round_id TEXT,
       created_at TIMESTAMPTZ NOT NULL, closed_at TIMESTAMPTZ
     );
+    ALTER TABLE capunga_signals ADD COLUMN IF NOT EXISTS base_round_id TEXT;
     CREATE INDEX IF NOT EXISTS idx_cap_sig_status ON capunga_signals(status);
     CREATE INDEX IF NOT EXISTS idx_cap_sig_created ON capunga_signals(created_at DESC);
   `);
@@ -223,9 +224,9 @@ async function dbStateSet(k, v) {
 async function dbSignalInsert(s) {
   try {
     await pool.query(
-      `INSERT INTO capunga_signals (id,cor,key,nome,tipo,conf,status,gale,agree,tier,created_at,closed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING`,
-      [s.id, s.cor, s.key, s.nome, s.tipo, s.conf, s.status, s.gale ?? null, s.agree ?? 1, s.tier ?? 0,
+      `INSERT INTO capunga_signals (id,cor,key,nome,tipo,conf,status,gale,agree,tier,base_round_id,created_at,closed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO NOTHING`,
+      [s.id, s.cor, s.key, s.nome, s.tipo, s.conf, s.status, s.gale ?? null, s.agree ?? 1, s.tier ?? 0, s.baseRoundId ?? null,
        new Date(s.criadoEm), s.fechadoEm ? new Date(s.fechadoEm) : null]
     );
   } catch (e) { R.erroDB = e.message; }
@@ -352,7 +353,7 @@ async function dbLoadState() {
   } catch (_) {}
 
   const rounds = await pool.query(
-    `SELECT id,resultado,t,pj,pb FROM capunga_rounds ORDER BY t DESC LIMIT ${CFG.maxHist}`
+    `SELECT id,resultado,t,pj,pb FROM capunga_rounds ORDER BY t DESC, id DESC LIMIT ${CFG.maxHist}`
   );
   S.hist = rounds.rows.map((r) => ({
     id: r.id, resultado: r.resultado, t: Number(r.t),
@@ -369,6 +370,7 @@ async function dbLoadState() {
     conf: row.conf, status: row.status, gale: row.gale, agree: row.agree, tier: row.tier || 0,
     criadoEm: new Date(row.created_at).getTime(),
     fechadoEm: row.closed_at ? new Date(row.closed_at).getTime() : null,
+    baseRoundId: row.base_round_id || null,
     gale1MsgId: null, gale2MsgId: null,
     galeLevel: row.status !== 'PENDENTE' ? 2 : 0
   }));
@@ -569,16 +571,31 @@ function normalizeRound(item) {
 }
 
 async function fetchFrom(url) {
-  const resp = await axios.get(url, {
-    timeout: 8000,
-    headers: { Accept: 'application/json', 'User-Agent': 'BACBO/4.0' }
-  });
+  const PAGE_SIZE = 50;
+  const MAX_PAGES = 20; // Recupera até 1.000 rondas em caso de atraso do serviço.
+  const base = new URL(url);
   const map = new Map();
-  for (const it of extractItems(resp.data)) {
-    const rd = normalizeRound(it);
-    if (rd) map.set(rd.id, rd);
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const pageUrl = new URL(base);
+    pageUrl.searchParams.set('page', String(page));
+    pageUrl.searchParams.set('size', String(PAGE_SIZE));
+    const resp = await axios.get(pageUrl.toString(), {
+      timeout: 8000,
+      headers: { Accept: 'application/json', 'User-Agent': 'BACBO/4.0' }
+    });
+    const items = extractItems(resp.data);
+    for (const it of items) {
+      const rd = normalizeRound(it);
+      if (!rd) continue;
+      const prev = map.get(rd.id);
+      // Mantém a versão mais completa se a API repetir um evento entre páginas.
+      if (!prev || ((!Number.isFinite(prev.pj) || !Number.isFinite(prev.pb)) && Number.isFinite(rd.pj) && Number.isFinite(rd.pb))) {
+        map.set(rd.id, rd);
+      }
+    }
+    if (items.length < PAGE_SIZE) break;
   }
-  return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
+  return [...map.values()].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
 }
 
 async function fetchRounds() {
@@ -918,6 +935,7 @@ async function tentarSinal() {
   const prelim = {
     id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome,
     conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE', tier,
+    baseRoundId: S.hist[S.hist.length - 1]?.id || null,
     criadoEm: 0, agree: melhor.agree,
     gale1MsgId: null, gale2MsgId: null, galeLevel: 0
   };
@@ -1016,9 +1034,10 @@ async function apurar() {
   const now = Date.now();
   for (const s of S.signals) {
     if (FECHADOS.has(s.status)) continue;
-    const after = S.hist
-      .filter((r) => r.t > s.criadoEm)
-      .sort((a, b) => a.t - b.t);
+    const anchorIndex = s.baseRoundId ? S.hist.findIndex((r) => r.id === s.baseRoundId) : -1;
+    const after = anchorIndex >= 0
+      ? S.hist.slice(anchorIndex + 1)
+      : S.hist.filter((r) => r.t > s.criadoEm).sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
     let decided = false;
 
     for (let k = 0; k <= CFG.maxGale && k < after.length; k++) {
@@ -1346,7 +1365,9 @@ async function start() {
   // Recuperação de pendentes: reconstrói galeLevel
   for (const s of S.signals) {
     if (s.status !== 'PENDENTE') continue;
-    const after = S.hist.filter((r) => r.t > s.criadoEm).sort((a, b) => a.t - b.t);
+    const anchorIndex = s.baseRoundId ? S.hist.findIndex((r) => r.id === s.baseRoundId) : -1;
+    const after = anchorIndex >= 0 ? S.hist.slice(anchorIndex + 1)
+      : S.hist.filter((r) => r.t > s.criadoEm).sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
     let consecutivasFalhas = 0, prevT = s.criadoEm;
     for (const r of after) {
       if (r.t - prevT > CFG.gapMs || r.resultado === s.cor || r.resultado === E) break;
