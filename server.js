@@ -1,10 +1,14 @@
 'use strict';
 
 /**
- * BAC BO Telegram Signals — v4
- * Lógica de processamento: CAPUNGA v19 (tick 1s, sync adaptativo, tiers, apuração com gap)
- * Estratégias e modelo de SMS: mantidos do bot original
- * Correção do histórico: streak em memória + reconstrução do DAILY a partir da BD no arranque
+ * BAC BO Telegram Signals — v5.1
+ *
+ * Objetivos:
+ * - Sinais automáticos 24h
+ * - Frequência máxima \~2.5-3 minutos entre sinais
+ * - maxPending = 1 rigorosamente respeitado
+ * - Sem race conditions
+ * - Estratégias equilibradas
  *
  * Dependências: express, axios, pg
  * Variáveis: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL
@@ -31,27 +35,28 @@ const CFG = {
   ativos: true,
   maxGale: 2,
   maxPending: 1,
-  minAmostra: 60,
-  syncMs: 3000,
-  syncFastMs: 1000,
-  minGapMs: 20000,
-  relaxMs: 3 * 60 * 1000,
-  forceSignalMs: 5 * 60 * 1000,
+  minAmostra: 50,
+  syncMs: 2500,
+  syncFastMs: 900,
+  minGapMs: 150000,              // 2.5 minutos
+  relaxMs: 2 * 60 * 1000,
+  forceSignalMs: 4 * 60 * 1000,
   minSettledAgeMs: 5000,
-  apuraMaxMs: 600000,
+  apuraMaxMs: 7 * 60 * 1000,
   maxHist: 4000,
-  gapMs: 7 * 60 * 1000,
-  maxSignalsMem: 500,
-  signalsOnBoot: 500,
-  suspendMs: 4 * 3600 * 1000,
+  gapMs: 6 * 60 * 1000,
+  maxSignalsMem: 600,
+  signalsOnBoot: 400,
+  suspendMs: 2.5 * 3600 * 1000,
   suspendLossStreak: 3,
+  strategyCooldownMs: 90 * 1000,
   staleAlertMs: 3 * 60 * 1000,
   alertThrottleMs: 10 * 60 * 1000,
-  keepAliveMs: 60000,
+  keepAliveMs: 55000,
   tiers: [
-    { scoreMin: 85, minStratN: 8, liveMin: 0.86 },
-    { scoreMin: 81, minStratN: 5, liveMin: 0.80 },
-    { scoreMin: 80, minStratN: 3, liveMin: 0 }
+    { scoreMin: 82, minStratN: 5, liveMin: 0.78 },
+    { scoreMin: 79, minStratN: 4, liveMin: 0.72 },
+    { scoreMin: 76, minStratN: 2, liveMin: 0.60 }
   ]
 };
 
@@ -63,7 +68,7 @@ const LOCK_KEY = 727272;
 
 const API_SOURCES = [
   process.env.API_BACBO ||
-    'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie',
+  'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie',
   process.env.API_BACBO_2 || ''
 ].filter(Boolean);
 
@@ -80,17 +85,19 @@ const S = {
   lastSignalAt: 0,
   curStreak: 0,
   stats: null,
-  statsAtLen: -1
+  statsAtLen: -1,
+  generating: false
 };
 
 const DAILY = { date: '', total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0, bestStreak: 0 };
 const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0 };
 const SUSPENDED = {};
+const STRATEGY_COOLDOWN = {};
 
 const R = {
   iniciadoEm: new Date().toISOString(),
   deployId: DEPLOY_ID,
-  versao: '4.0',
+  versao: '5.1',
   ultimaSync: null,
   ultimaRodadaNova: null,
   fonteAPI: 0,
@@ -109,7 +116,7 @@ let pool = null, server = null, tickTimer = null, keepTimer = null;
 let busy = false, stopping = false, lastTickMs = Date.now();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (tag, d) => console.log(`[${new Date().toISOString()}] [${tag}] ${typeof d === 'string' ? d : JSON.stringify(d)}`);
+const log = (tag, d) => console.log(`[\( {new Date().toISOString()}] [ \){tag}] ${typeof d === 'string' ? d : JSON.stringify(d)}`);
 
 const fmtHora = new Intl.DateTimeFormat('pt-PT', {
   timeZone: HISTORY_TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
@@ -159,7 +166,6 @@ async function dbInit() {
     CREATE INDEX IF NOT EXISTS idx_cap_sig_created ON capunga_signals(created_at DESC);
   `);
 
-  // Migração opcional da tabela `signals` do bot anterior
   try {
     const { rows: old } = await pool.query(`
       SELECT id, entry, strategy, attempts, result, created_at, settled_at
@@ -315,7 +321,7 @@ async function rebuildDailyFromDb() {
 
     await dbStateSet('daily_v4', JSON.stringify(DAILY));
     await dbStateSet('curStreak', String(S.curStreak));
-    log('DIÁRIO', `reconstruído do DB: ${DAILY.total} resolvidos hoje, streak ${S.curStreak}/${DAILY.bestStreak}`);
+    log('DIÁRIO', `reconstruído do DB: ${DAILY.total} resolvidos hoje, streak \( {S.curStreak}/ \){DAILY.bestStreak}`);
   } catch (e) {
     log('DIÁRIO ERRO', e.message);
   }
@@ -384,7 +390,7 @@ async function dbLoadState() {
     await dbStateSet('nextId', String(S.nextId));
   }
 
-  log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}, dia=${DAILY.date}`);
+  log('DB', `estado carregado: nextId=\( {S.nextId}, sinais= \){S.signals.length}, dia=${DAILY.date}`);
 }
 
 /* ============================ TELEGRAM ============================ */
@@ -437,10 +443,10 @@ async function tgAlert(tag, detalhe) {
     if (now - R.ultimoAlertaDB < CFG.alertThrottleMs) return;
     R.ultimoAlertaDB = now;
   }
-  await tgSend(`⚠️ ALERTA ${tag}\n${detalhe}\n⏱ ${hora()}`);
+  await tgSend(`⚠️ ALERTA \( {tag}\n \){detalhe}\n⏱ ${hora()}`);
 }
 
-/* ============================ SMS (formato do bot original) ============================ */
+/* ============================ SMS ============================ */
 
 function fmtSinal(s, tentativas) {
   return [
@@ -486,7 +492,7 @@ function fmtHistoricoBloco() {
 }
 
 function fmtResultado(s) {
-  let text = `${RESULT_LABEL[s.status] || '📣 RESULTADO DA ENTRADA'}\n🎲 Sinal #${s.id}`;
+  let text = `\( {RESULT_LABEL[s.status] || '📣 RESULTADO DA ENTRADA'}\n🎲 Sinal # \){s.id}`;
   if (!noHistory(s.status)) text += `\n\n${fmtHistoricoBloco()}`;
   return text;
 }
@@ -572,7 +578,7 @@ function normalizeRound(item) {
 
 async function fetchFrom(url) {
   const PAGE_SIZE = 50;
-  const MAX_PAGES = 20; // Recupera até 1.000 rondas em caso de atraso do serviço.
+  const MAX_PAGES = 20;
   const base = new URL(url);
   const map = new Map();
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -581,14 +587,13 @@ async function fetchFrom(url) {
     pageUrl.searchParams.set('size', String(PAGE_SIZE));
     const resp = await axios.get(pageUrl.toString(), {
       timeout: 8000,
-      headers: { Accept: 'application/json', 'User-Agent': 'BACBO/4.0' }
+      headers: { Accept: 'application/json', 'User-Agent': 'BACBO/5.1' }
     });
     const items = extractItems(resp.data);
     for (const it of items) {
       const rd = normalizeRound(it);
       if (!rd) continue;
       const prev = map.get(rd.id);
-      // Mantém a versão mais completa se a API repetir um evento entre páginas.
       if (!prev || ((!Number.isFinite(prev.pj) || !Number.isFinite(prev.pb)) && Number.isFinite(rd.pj) && Number.isFinite(rd.pb))) {
         map.set(rd.id, rd);
       }
@@ -617,7 +622,7 @@ async function fetchRounds() {
   throw new Error(R.erroAPI);
 }
 
-/* ============================ HELPERS DE ANÁLISE ============================ */
+/* ============================ HELPERS ============================ */
 
 const hasScore = (r) => r && Number.isFinite(r.pj) && Number.isFinite(r.pb);
 const margem = (r) => Math.abs((r.pj || 0) - (r.pb || 0));
@@ -660,48 +665,224 @@ function detectRegime(seq) {
 
 function regimeFit(cand, regime) {
   const k = cand.key;
-  if (/SEQ_(QUEBRA|SURF|PINGPONG|2x2|EXTEND|3_1|MOMENTUM|ALT|BREAK_WEAK)/.test(k)) return regime.chop >= 0.45;
-  if (/SEQ_(REP|STRONG_STREAK)|BANKER_BIAS/.test(k)) return regime.trend >= 0.45;
+  if (/SEQ_(QUEBRA|SURF|PINGPONG|2x2|EXTEND|3_1|MOMENTUM|ALT|BREAK_WEAK)/.test(k)) return regime.chop >= 0.40;
+  if (/SEQ_(REP|STRONG_STREAK)|BANKER_BIAS|VIÉS/.test(k)) return regime.trend >= 0.40;
   return true;
 }
 
-/* ============================ ESTRATÉGIAS (mantidas do original) ============================ */
+/* ============================ ESTRATÉGIAS ============================ */
 
 const STRATS = [
-  ({ seq }) => { const n = streak(seq); if (n < 3 || n > 7) return null; return { cor: seq[0].resultado, key: `SEQ_REP_${n}`, nome: `Sequência x${n}`, tipo: 'seq', strength: [0,0,0,72,78,84,86,86][n] || 86 }; },
-  ({ seq }) => { const n = streak(seq); if (n < 4 || n > 8) return null; return { cor: opp(seq[0].resultado), key: `SEQ_QUEBRA_${n}`, nome: `Quebra x${n}`, tipo: 'seq', strength: [0,0,0,0,74,80,84,85,85][n] || 85 }; },
-  ({ seq }) => { const L = alternation(seq); if (L < 4) return null; return { cor: opp(seq[0].resultado), key: `SEQ_SURF_${L}`, nome: `Surf ${L}`, tipo: 'seq', strength: L >= 6 ? 84 : L >= 5 ? 78 : 72 }; },
-  ({ seq }) => { if (seq.length < 4) return null; const [a,b,c,d] = seq.map(x => x.resultado); if (a === b && c === d && a !== c) return { cor: c, key: 'SEQ_2x2', nome: 'Bloco 2+2', tipo: 'seq', strength: 76 }; return null; },
-  ({ seq }) => { if (seq.length < 4) return null; const [a,b,c,d] = seq.map(x => x.resultado); if (a !== b && b === c && c === d) return { cor: a, key: 'SEQ_3_1', nome: '3→1 confirmado', tipo: 'seq', strength: 78 }; return null; },
-  ({ seq }) => { if (seq.length < 3) return null; const [a,b,c] = seq.map(x => x.resultado); if (a !== b && b === c) return { cor: c, key: 'SEQ_MOMENTUM_2', nome: 'Momentum 2', tipo: 'seq', strength: 77 }; return null; },
-  ({ seq }) => { const n = streak(seq); if (n !== 4) return null; const s = seq.slice(0,4); if (!s.every(r => hasScore(r) && margem(r) <= 2)) return null; return { cor: opp(seq[0].resultado), key: 'SEQ_BREAK_WEAK_4', nome: 'Quebra fraca x4', tipo: 'seq', strength: 79 }; },
-  ({ seq }) => { if (seq.length < 5) return null; const [a,b,c,d,e] = seq.map(x => x.resultado); if (a === b && b === c && c !== d && d === e) return { cor: a, key: 'SEQ_EXTEND', nome: 'Streak extend', tipo: 'seq', strength: 80 }; return null; },
-  ({ seq }) => { const n = streak(seq); if (n < 4 || n > 6) return null; const s = seq.slice(0,n); if (!s.every(r => hasScore(r) && margem(r) >= 3)) return null; return { cor: seq[0].resultado, key: 'SEQ_STRONG_STREAK', nome: `Dragon ${n}`, tipo: 'seq', strength: 82 }; },
-  ({ seq }) => { const L = alternation(seq); if (L < 4 || L > 10) return null; return { cor: opp(seq[0].resultado), key: 'SEQ_PINGPONG', nome: `Ping-pong ${L}`, tipo: 'seq', strength: 79 }; },
-  ({ seq }) => { const L = alternation(seq); if (L < 3) return null; const s = seq.slice(0,L); if (!s.every(r => hasScore(r) && margem(r) >= 3)) return null; return { cor: opp(seq[0].resultado), key: 'SEQ_ALT_STRONG', nome: `Alt. forte ${L}`, tipo: 'seq', strength: 78 }; },
-  ({ seq }) => { const s = seq.slice(0,20); if (s.length < 15) return null; const b = s.filter(r => r.resultado === B).length; const j = s.filter(r => r.resultado === J).length; if (b >= 12) return { cor: B, key: 'BANKER_BIAS_20', nome: 'Viés Banca', tipo: 'seq', strength: 80 }; if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', tipo: 'seq', strength: 80 }; return null; },
+  ({ seq }) => {
+    const n = streak(seq);
+    if (n < 3 || n > 7) return null;
+    return { cor: seq[0].resultado, key: `SEQ_REP_\( {n}`, nome: `Sequência x \){n}`, tipo: 'seq', strength: [0,0,0,74,80,85,87,87][n] || 87 };
+  },
+  ({ seq }) => {
+    const n = streak(seq);
+    if (n < 4 || n > 8) return null;
+    return { cor: opp(seq[0].resultado), key: `SEQ_QUEBRA_\( {n}`, nome: `Quebra x \){n}`, tipo: 'seq', strength: [0,0,0,0,76,82,85,86,86][n] || 86 };
+  },
+  ({ seq }) => {
+    const L = alternation(seq);
+    if (L < 4) return null;
+    return { cor: opp(seq[0].resultado), key: `SEQ_SURF_${L}`, nome: `Surf ${L}`, tipo: 'seq', strength: L >= 6 ? 84 : L >= 5 ? 79 : 74 };
+  },
+  ({ seq }) => {
+    if (seq.length < 4) return null;
+    const [a,b,c,d] = seq.map(x => x.resultado);
+    if (a === b && c === d && a !== c) return { cor: c, key: 'SEQ_2x2', nome: 'Bloco 2+2', tipo: 'seq', strength: 77 };
+    return null;
+  },
+  ({ seq }) => {
+    if (seq.length < 4) return null;
+    const [a,b,c,d] = seq.map(x => x.resultado);
+    if (a !== b && b === c && c === d) return { cor: a, key: 'SEQ_3_1', nome: '3→1 confirmado', tipo: 'seq', strength: 80 };
+    return null;
+  },
+  ({ seq }) => {
+    if (seq.length < 3) return null;
+    const [a,b,c] = seq.map(x => x.resultado);
+    if (a !== b && b === c) return { cor: c, key: 'SEQ_MOMENTUM_2', nome: 'Momentum 2', tipo: 'seq', strength: 78 };
+    return null;
+  },
+  ({ seq }) => {
+    const n = streak(seq);
+    if (n !== 4) return null;
+    const s = seq.slice(0,4);
+    if (!s.every(r => hasScore(r) && margem(r) <= 2)) return null;
+    return { cor: opp(seq[0].resultado), key: 'SEQ_BREAK_WEAK_4', nome: 'Quebra fraca x4', tipo: 'seq', strength: 81 };
+  },
+  ({ seq }) => {
+    if (seq.length < 5) return null;
+    const [a,b,c,d,e] = seq.map(x => x.resultado);
+    if (a === b && b === c && c !== d && d === e) return { cor: a, key: 'SEQ_EXTEND', nome: 'Streak extend', tipo: 'seq', strength: 82 };
+    return null;
+  },
+  ({ seq }) => {
+    const n = streak(seq);
+    if (n < 4 || n > 6) return null;
+    const s = seq.slice(0,n);
+    if (!s.every(r => hasScore(r) && margem(r) >= 3)) return null;
+    return { cor: seq[0].resultado, key: 'SEQ_STRONG_STREAK', nome: `Dragon ${n}`, tipo: 'seq', strength: 84 };
+  },
+  ({ seq }) => {
+    const L = alternation(seq);
+    if (L < 4 || L > 10) return null;
+    return { cor: opp(seq[0].resultado), key: 'SEQ_PINGPONG', nome: `Ping-pong ${L}`, tipo: 'seq', strength: 80 };
+  },
+  ({ seq }) => {
+    const L = alternation(seq);
+    if (L < 3) return null;
+    const s = seq.slice(0,L);
+    if (!s.every(r => hasScore(r) && margem(r) >= 3)) return null;
+    return { cor: opp(seq[0].resultado), key: 'SEQ_ALT_STRONG', nome: `Alt. forte ${L}`, tipo: 'seq', strength: 80 };
+  },
+  ({ seq }) => {
+    const s = seq.slice(0,20);
+    if (s.length < 15) return null;
+    const b = s.filter(r => r.resultado === B).length;
+    const j = s.filter(r => r.resultado === J).length;
+    if (b >= 12) return { cor: B, key: 'BANKER_BIAS_20', nome: 'Viés Banca', tipo: 'seq', strength: 81 };
+    if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', tipo: 'seq', strength: 81 };
+    return null;
+  },
 
-  ({ seq }) => { if (seq.length < 3 || !seq.slice(0,3).every(hasScore)) return null; const [a,b,c] = seq; if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null; const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c); if ((sb - sa === 1 && sc - sb === 1) || (sa - sb === 1 && sb - sc === 1)) return { cor: a.resultado, key: 'NUM_ESCADA', nome: `Escada ${sa}→${sb}→${sc}`, tipo: 'num', strength: 88 }; return null; },
-  ({ seq }) => { if (seq.length < 2 || !seq.slice(0,2).every(hasScore)) return null; const [a,b] = seq; if (a.resultado !== b.resultado) return null; if (scoreOf(a) === scoreOf(b)) return { cor: a.resultado, key: 'NUM_REPETE', nome: `Score repetido ${scoreOf(a)}`, tipo: 'num', strength: 84 }; return null; },
-  ({ seq }) => { if (seq.length < 3 || !seq.slice(0,3).every(hasScore)) return null; const [a,b,c] = seq; if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null; if (scoreOf(a) <= 3 && scoreOf(b) <= 3 && scoreOf(c) <= 3) return { cor: opp(a.resultado), key: 'NUM_THREE_LOW', nome: 'Virada de baixos x3', tipo: 'num', strength: 81 }; return null; },
-  ({ seq }) => { if (!seq.length || !hasScore(seq[0])) return null; if (scoreOf(seq[0]) === 0) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_0', nome: 'Gatilho 0', tipo: 'num', strength: 86 }; return null; },
-  ({ seq }) => { if (!seq.length || !hasScore(seq[0])) return null; if (scoreOf(seq[0]) === 1) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_1', nome: 'Gatilho 1', tipo: 'num', strength: 84 }; return null; },
-  ({ seq }) => { if (!seq.length || !hasScore(seq[0])) return null; if (scoreOf(seq[0]) === 9) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_9', nome: 'Gatilho 9', tipo: 'num', strength: 88 }; return null; },
-  ({ rows }) => { const r = rows[0]; if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null; return { cor: r.resultado, key: 'NUM_MARGEM5', nome: `Margem alta ${r.pj}×${r.pb}`, tipo: 'num', strength: 82 }; },
-  ({ seq }) => { if (seq.length < 3) return null; const t = seq.slice(0,3); if (!t.every(r => hasScore(r) && margem(r) >= 4 && r.resultado === t[0].resultado)) return null; return { cor: t[0].resultado, key: 'NUM_DIFF4x3', nome: 'Diff ≥4 ×3', tipo: 'num', strength: 85 }; },
-  ({ seq }) => { if (seq.length < 2) return null; const [a,b] = seq; if (!hasScore(a) || !hasScore(b) || a.resultado !== b.resultado) return null; if (scoreOf(a) > 4 || scoreOf(b) > 4) return null; return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Virada de baixos', tipo: 'num', strength: 80 }; },
-  ({ rows }) => { const s = rows.slice(0,8).filter(hasScore); if (s.length < 6) return null; const mj = s.reduce((a,r) => a + r.pj, 0) / s.length; const mb = s.reduce((a,r) => a + r.pb, 0) / s.length; const diff = mj - mb; if (Math.abs(diff) < 1.5) return null; return { cor: diff > 0 ? J : B, key: 'NUM_TENDENCIA', nome: `Tendência ${mj.toFixed(1)}×${mb.toFixed(1)}`, tipo: 'num', strength: Math.abs(diff) >= 2.2 ? 84 : 76 }; },
-  ({ seq }) => { if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null; const [a,b] = seq; const ra = scoreRange(scoreOf(a)), rb = scoreRange(scoreOf(b)); if (!ra || !rb) return null; if ((ra === 'MB' && rb === 'MA') || (ra === 'MA' && rb === 'MB')) return { cor: opp(a.resultado), key: 'NUM_SALTO_RANGE', nome: `Salto ${scoreOf(b)}→${scoreOf(a)}`, tipo: 'num', strength: 81 }; return null; },
-  ({ seq }) => { if (seq.length < 3 || !seq.slice(0,3).every(hasScore)) return null; const [a,b,c] = seq; if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null; const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c); if (sa < sb && sb < sc) return { cor: a.resultado, key: 'NUM_SCORE_TREND_3', nome: `Escala ascendente ${sa}→${sc}`, tipo: 'num', strength: 82 }; return null; },
-  ({ seq }) => { if (seq.length < 2 || !seq.slice(0,2).every(hasScore)) return null; const [a,b] = seq; if (a.resultado !== b.resultado) return null; if (margem(a) >= 5 && margem(b) >= 5) return { cor: a.resultado, key: 'NUM_DOUBLE_HIGH', nome: 'Dupla margem alta', tipo: 'num', strength: 84 }; return null; },
-  ({ seq }) => { if (seq.length < 4 || !seq.slice(0,4).every(hasScore)) return null; const [a,b,c,d] = seq; const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c), sd = scoreOf(d); if (sb - sa < 0 && sc - sb < 0 && sd - sc < 0) return { cor: opp(a.resultado), key: 'MOMENTUM_SHIFT', nome: 'Mudança de momentum', tipo: 'num', strength: 78 }; return null; },
+  ({ seq }) => {
+    if (seq.length < 3 || !seq.slice(0,3).every(hasScore)) return null;
+    const [a,b,c] = seq;
+    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
+    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c);
+    if ((sb - sa === 1 && sc - sb === 1) || (sa - sb === 1 && sb - sc === 1)) {
+      return { cor: a.resultado, key: 'NUM_ESCADA', nome: `Escada \( {sa}→ \){sb}→${sc}`, tipo: 'num', strength: 89 };
+    }
+    return null;
+  },
+  ({ seq }) => {
+    if (seq.length < 2 || !seq.slice(0,2).every(hasScore)) return null;
+    const [a,b] = seq;
+    if (a.resultado !== b.resultado) return null;
+    if (scoreOf(a) === scoreOf(b)) return { cor: a.resultado, key: 'NUM_REPETE', nome: `Score repetido ${scoreOf(a)}`, tipo: 'num', strength: 85 };
+    return null;
+  },
+  ({ seq }) => {
+    if (seq.length < 3 || !seq.slice(0,3).every(hasScore)) return null;
+    const [a,b,c] = seq;
+    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
+    if (scoreOf(a) <= 3 && scoreOf(b) <= 3 && scoreOf(c) <= 3) {
+      return { cor: opp(a.resultado), key: 'NUM_THREE_LOW', nome: 'Virada de baixos x3', tipo: 'num', strength: 82 };
+    }
+    return null;
+  },
+  ({ seq }) => {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 0) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_0', nome: 'Gatilho 0', tipo: 'num', strength: 88 };
+    return null;
+  },
+  ({ seq }) => {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 1) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_1', nome: 'Gatilho 1', tipo: 'num', strength: 86 };
+    return null;
+  },
+  ({ seq }) => {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 9) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_9', nome: 'Gatilho 9', tipo: 'num', strength: 89 };
+    return null;
+  },
+  ({ rows }) => {
+    const r = rows[0];
+    if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null;
+    return { cor: r.resultado, key: 'NUM_MARGEM5', nome: `Margem alta \( {r.pj}× \){r.pb}`, tipo: 'num', strength: 83 };
+  },
+  ({ seq }) => {
+    if (seq.length < 3) return null;
+    const t = seq.slice(0,3);
+    if (!t.every(r => hasScore(r) && margem(r) >= 4 && r.resultado === t[0].resultado)) return null;
+    return { cor: t[0].resultado, key: 'NUM_DIFF4x3', nome: 'Diff ≥4 ×3', tipo: 'num', strength: 86 };
+  },
+  ({ seq }) => {
+    if (seq.length < 2) return null;
+    const [a,b] = seq;
+    if (!hasScore(a) || !hasScore(b) || a.resultado !== b.resultado) return null;
+    if (scoreOf(a) > 4 || scoreOf(b) > 4) return null;
+    return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Virada de baixos', tipo: 'num', strength: 80 };
+  },
+  ({ rows }) => {
+    const s = rows.slice(0,8).filter(hasScore);
+    if (s.length < 6) return null;
+    const mj = s.reduce((a,r) => a + r.pj, 0) / s.length;
+    const mb = s.reduce((a,r) => a + r.pb, 0) / s.length;
+    const diff = mj - mb;
+    if (Math.abs(diff) < 1.5) return null;
+    return { cor: diff > 0 ? J : B, key: 'NUM_TENDENCIA', nome: `Tendência \( {mj.toFixed(1)}× \){mb.toFixed(1)}`, tipo: 'num', strength: Math.abs(diff) >= 2.2 ? 84 : 77 };
+  },
+  ({ seq }) => {
+    if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
+    const [a,b] = seq;
+    const ra = scoreRange(scoreOf(a)), rb = scoreRange(scoreOf(b));
+    if (!ra || !rb) return null;
+    if ((ra === 'MB' && rb === 'MA') || (ra === 'MA' && rb === 'MB')) {
+      return { cor: opp(a.resultado), key: 'NUM_SALTO_RANGE', nome: `Salto \( {scoreOf(b)}→ \){scoreOf(a)}`, tipo: 'num', strength: 82 };
+    }
+    return null;
+  },
+  ({ seq }) => {
+    if (seq.length < 3 || !seq.slice(0,3).every(hasScore)) return null;
+    const [a,b,c] = seq;
+    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
+    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c);
+    if (sa < sb && sb < sc) return { cor: a.resultado, key: 'NUM_SCORE_TREND_3', nome: `Escala ascendente \( {sa}→ \){sc}`, tipo: 'num', strength: 83 };
+    return null;
+  },
+  ({ seq }) => {
+    if (seq.length < 2 || !seq.slice(0,2).every(hasScore)) return null;
+    const [a,b] = seq;
+    if (a.resultado !== b.resultado) return null;
+    if (margem(a) >= 5 && margem(b) >= 5) return { cor: a.resultado, key: 'NUM_DOUBLE_HIGH', nome: 'Dupla margem alta', tipo: 'num', strength: 85 };
+    return null;
+  },
+  ({ seq }) => {
+    if (seq.length < 4 || !seq.slice(0,4).every(hasScore)) return null;
+    const [a,b,c,d] = seq;
+    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c), sd = scoreOf(d);
+    if (sb - sa < 0 && sc - sb < 0 && sd - sc < 0) {
+      return { cor: opp(a.resultado), key: 'MOMENTUM_SHIFT', nome: 'Mudança de momentum', tipo: 'num', strength: 79 };
+    }
+    return null;
+  },
 
-  ({ rows, seq }) => { if (!rows[0] || rows[0].resultado !== E || !seq.length) return null; return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', tipo: 'num', strength: 74 }; },
-  ({ rows }) => { const t = rows.slice(0,3).filter(r => r.resultado === E).length; if (t < 2) return null; const pre = rows.find(r => isCol(r.resultado)); if (!pre) return null; return { cor: pre.resultado, key: 'TIE_CASCADE', nome: 'Cascata de empates', tipo: 'num', strength: 76 }; },
-  ({ rows, seq }) => { if (!rows[0] || rows[0].resultado !== E) return null; if (!rows[1] || rows[1].resultado === E) return null; if (!seq.length) return null; return { cor: opp(seq[0].resultado), key: 'TIE_SINGLE', nome: 'Empate isolado', tipo: 'num', strength: 77 }; },
-  ({ rows }) => { if (rows.length < 3) return null; if (rows[0].resultado !== E || rows[1].resultado !== E) return null; if (!isCol(rows[2].resultado)) return null; return { cor: rows[2].resultado, key: 'TIE_DOUBLE_BACK', nome: 'Retorno pós-duplo empate', tipo: 'num', strength: 78 }; },
+  ({ rows, seq }) => {
+    if (!rows[0] || rows[0].resultado !== E || !seq.length) return null;
+    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', tipo: 'num', strength: 76 };
+  },
+  ({ rows }) => {
+    const t = rows.slice(0,3).filter(r => r.resultado === E).length;
+    if (t < 2) return null;
+    const pre = rows.find(r => isCol(r.resultado));
+    if (!pre) return null;
+    return { cor: pre.resultado, key: 'TIE_CASCADE', nome: 'Cascata de empates', tipo: 'num', strength: 78 };
+  },
+  ({ rows, seq }) => {
+    if (!rows[0] || rows[0].resultado !== E) return null;
+    if (!rows[1] || rows[1].resultado === E) return null;
+    if (!seq.length) return null;
+    return { cor: opp(seq[0].resultado), key: 'TIE_SINGLE', nome: 'Empate isolado', tipo: 'num', strength: 78 };
+  },
+  ({ rows }) => {
+    if (rows.length < 3) return null;
+    if (rows[0].resultado !== E || rows[1].resultado !== E) return null;
+    if (!isCol(rows[2].resultado)) return null;
+    return { cor: rows[2].resultado, key: 'TIE_DOUBLE_BACK', nome: 'Retorno pós-duplo empate', tipo: 'num', strength: 80 };
+  },
 
-  ({ seq }) => { if (seq.length < 10) return null; const s = seq.slice(0,10); const p = s.filter(r => r.resultado === J).length; const b = s.length - p; if (p === b) return null; return { cor: p > b ? J : B, key: 'FREQ_10', nome: 'Frequência nas últimas 10', tipo: 'freq', strength: 70 + Math.min(10, Math.abs(p - b)) }; }
+  ({ seq }) => {
+    if (seq.length < 10) return null;
+    const s = seq.slice(0,10);
+    const p = s.filter(r => r.resultado === J).length;
+    const b = s.length - p;
+    if (p === b) return null;
+    return { cor: p > b ? J : B, key: 'FREQ_10', nome: 'Frequência nas últimas 10', tipo: 'freq', strength: 72 + Math.min(8, Math.abs(p - b)) };
+  }
 ];
 
 function runStrategies(rows) {
@@ -741,7 +922,7 @@ function evalEntry(H, i, cor) {
 function backtest() {
   const H = S.hist, per = {};
   const ini = 10, fim = H.length - 1;
-  if (fim - ini < 30) return { per, baseRate: 0.90 };
+  if (fim - ini < 30) return { per, baseRate: 0.88 };
   let bw = 0, bn = 0;
   for (let i = ini; i < fim; i++) {
     const win = windowAt(H, i);
@@ -756,51 +937,53 @@ function backtest() {
       if (v) bw++;
     }
   }
-  return { per, baseRate: bn ? Math.min(0.95, Math.max(0.80, bw / bn)) : 0.90 };
+  return { per, baseRate: bn ? Math.min(0.94, Math.max(0.78, bw / bn)) : 0.88 };
 }
 
 function getStats(force = false) {
-  if (force || !S.stats || S.hist.length - S.statsAtLen >= 30) {
+  if (force || !S.stats || S.hist.length - S.statsAtLen >= 25) {
     S.stats = backtest();
     S.statsAtLen = S.hist.length;
   }
   return S.stats;
 }
 
-function bayesianRate(w, n, priorRate = 0.90, priorWeight = 10) {
+function bayesianRate(w, n, priorRate = 0.88, priorWeight = 10) {
   return (w + priorRate * priorWeight) / (n + priorWeight);
 }
 
 function confianca(cand, ctx) {
   const stats = ctx.stats;
   const p = stats.per[cand.key] || { n: 0, w: 0 };
-  const baseRate = stats.baseRate || 0.90;
-  const btRate = bayesianRate(p.w, p.n, baseRate, 6);
+  const baseRate = stats.baseRate || 0.88;
+  const btRate = bayesianRate(p.w, p.n, baseRate, 7);
   const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status));
   const liveW = live.filter((x) => x.status !== 'LOSS').length;
   const liveRate = live.length >= 3 ? bayesianRate(liveW, live.length, btRate, 4) : null;
-  const btSamples = p.n + 6;
+  const btSamples = p.n + 7;
   const liveSamples = live.length >= 3 ? live.length + 4 : 0;
   const observed = ((btRate * btSamples) + ((liveRate ?? btRate) * liveSamples)) / (btSamples + liveSamples);
 
   let conf = Math.round(observed * 100);
   const agree = ctx.agreement?.confirmations || 0;
   conf += agree >= 3 ? 2 : agree >= 2 ? 1 : 0;
-  conf += Math.round((cand.strength - 80) * 0.2);
+  conf += Math.round((cand.strength - 80) * 0.22);
+
   if (cand.tipo === 'seq' && ctx.regime) {
-    const rm = (cand.key.includes('QUEBRA') || cand.key.includes('SURF') || cand.key.includes('PINGPONG'))
+    const rm = (cand.key.includes('QUEBRA') || cand.key.includes('SURF') || cand.key.includes('PINGPONG') || cand.key.includes('ALT'))
       ? ctx.regime.chop : ctx.regime.trend;
     conf += Math.round((rm - 0.5) * 4);
   }
-  if (live.length >= 5 && liveW / live.length < 0.85) conf -= 4;
+
+  if (live.length >= 5 && liveW / live.length < 0.80) conf -= 4;
   const recentLoss = S.signals.find((x) =>
-    x.key === cand.key && x.status === 'LOSS' && Date.now() - (x.fechadoEm || 0) < 5 * 60 * 1000);
+    x.key === cand.key && x.status === 'LOSS' && Date.now() - (x.fechadoEm || 0) < 6 * 60 * 1000);
   if (recentLoss) conf -= 3;
 
-  return Math.max(80, Math.min(95, conf));
+  return Math.max(75, Math.min(95, conf));
 }
 
-/* ============================ SUSPENSÃO + TIERS + GATE ============================ */
+/* ============================ SUSPENSÃO + TIERS ============================ */
 
 function isSuspended(key) {
   const u = SUSPENDED[key];
@@ -808,6 +991,16 @@ function isSuspended(key) {
   if (Date.now() > u) {
     delete SUSPENDED[key];
     dbStateSet('suspended', JSON.stringify(Object.entries(SUSPENDED)));
+    return false;
+  }
+  return true;
+}
+
+function isInCooldown(key) {
+  const until = STRATEGY_COOLDOWN[key];
+  if (!until) return false;
+  if (Date.now() > until) {
+    delete STRATEGY_COOLDOWN[key];
     return false;
   }
   return true;
@@ -823,7 +1016,12 @@ function maybeSuspend(key) {
   }
 }
 
+function applyCooldown(key) {
+  STRATEGY_COOLDOWN[key] = Date.now() + CFG.strategyCooldownMs;
+}
+
 function idleMs() { return S.lastSignalAt ? Date.now() - S.lastSignalAt : Infinity; }
+
 function tierAtual() {
   const i = idleMs();
   if (i >= CFG.forceSignalMs) return 2;
@@ -831,23 +1029,36 @@ function tierAtual() {
   return 0;
 }
 
-function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
+function pendentes() {
+  return S.signals.filter((s) => !FECHADOS.has(s.status));
+}
 
 function podeGerar() {
   if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return false; }
-  if (pendentes().length >= CFG.maxPending) { R.ultimoMotivo = 'max pending'; return false; }
+  if (S.generating) { R.ultimoMotivo = 'já a gerar'; return false; }
+
+  const pend = pendentes();
+  if (pend.length >= CFG.maxPending) {
+    R.ultimoMotivo = `max pending (${pend.length})`;
+    return false;
+  }
+
   const now = Date.now();
   if (S.lastSignalAt && now - S.lastSignalAt < CFG.minGapMs) {
     R.ultimoMotivo = `gap ${Math.ceil((CFG.minGapMs - (now - S.lastSignalAt)) / 1000)}s`;
     return false;
   }
+
   const last = S.hist[S.hist.length - 1];
   if (!last) { R.ultimoMotivo = 'sem hist'; return false; }
   if (now - last.t < CFG.minSettledAgeMs) {
     R.ultimoMotivo = `rodada recente ${Math.ceil((CFG.minSettledAgeMs - (now - last.t)) / 1000)}s`;
     return false;
   }
-  if (S.hist.length < CFG.minAmostra) { R.ultimoMotivo = `amostra ${S.hist.length}`; return false; }
+  if (S.hist.length < CFG.minAmostra) {
+    R.ultimoMotivo = `amostra \( {S.hist.length}/ \){CFG.minAmostra}`;
+    return false;
+  }
   return true;
 }
 
@@ -873,95 +1084,118 @@ function liveHitRate(key) {
 async function tentarSinal() {
   if (!podeGerar()) return;
 
-  const tier = tierAtual();
-  R.tier = tier;
-  const T = CFG.tiers[tier];
+  S.generating = true;
+  try {
+    const tier = tierAtual();
+    R.tier = tier;
+    const T = CFG.tiers[tier];
 
-  const rows = S.hist.slice(-30).reverse();
-  const stats = getStats();
-  const seq = rows.filter((r) => isCol(r.resultado));
-  const regime = detectRegime(seq);
+    const rows = S.hist.slice(-30).reverse();
+    const stats = getStats();
+    const seq = rows.filter((r) => isCol(r.resultado));
+    const regime = detectRegime(seq);
 
-  let cands = runStrategies(rows);
-  if (!cands.length && rows.length >= 6) {
-    const s = rows.slice(0, 10);
-    const p = s.filter((r) => r.resultado === J).length;
-    const b = s.filter((r) => r.resultado === B).length;
-    if (p || b) {
-      cands = [{
-        cor: p >= b ? J : B, key: 'FREQ_FALLBACK', nome: 'Frequência de reserva',
-        tipo: 'freq', strength: 65
-      }];
+    let cands = runStrategies(rows);
+
+    if (!cands.length && tier === 2 && rows.length >= 6) {
+      const s = rows.slice(0, 10);
+      const p = s.filter((r) => r.resultado === J).length;
+      const b = s.filter((r) => r.resultado === B).length;
+      if (p || b) {
+        cands = [{
+          cor: p >= b ? J : B, key: 'FREQ_FALLBACK', nome: 'Frequência de reserva',
+          tipo: 'freq', strength: 68
+        }];
+      }
     }
+
+    if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
+
+    if (tier <= 1) cands = cands.filter((c) => regimeFit(c, regime));
+
+    cands = cands.filter((c) => {
+      if (isSuspended(c.key)) return false;
+      if (isInCooldown(c.key)) return false;
+      if (stratSamples(c.key, stats) < T.minStratN) return false;
+      const lr = liveHitRate(c.key);
+      if (lr !== null && lr < T.liveMin) return false;
+      return true;
+    });
+
+    if (!cands.length) { R.ultimoMotivo = `tier${tier}: filtros`; return; }
+
+    const byColor = {};
+    for (const c of cands) {
+      if (!byColor[c.cor]) byColor[c.cor] = [];
+      byColor[c.cor].push(c);
+    }
+
+    let melhor = null;
+    for (const cor of Object.keys(byColor)) {
+      const list = byColor[cor];
+      const scored = list.map((c) => ({
+        ...c,
+        conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } })
+      }));
+      scored.sort((a, b) => b.conf - a.conf);
+      const top = scored[0];
+      if (!melhor || top.conf > melhor.conf) melhor = { ...top, agree: scored.length };
+    }
+
+    if (!melhor) { R.ultimoMotivo = 'sem candidato'; return; }
+    if (tier <= 1 && melhor.conf < T.scoreMin) {
+      R.ultimoMotivo = `score \( {melhor.conf}< \){T.scoreMin}`;
+      return;
+    }
+
+    if (pendentes().length >= CFG.maxPending) {
+      R.ultimoMotivo = 'max pending (recheck)';
+      return;
+    }
+
+    const reservedId = S.nextId;
+    const prelim = {
+      id: reservedId,
+      cor: melhor.cor,
+      key: melhor.key,
+      nome: melhor.nome,
+      conf: melhor.conf,
+      tipo: melhor.tipo,
+      status: 'PENDENTE',
+      tier,
+      baseRoundId: S.hist[S.hist.length - 1]?.id || null,
+      criadoEm: 0,
+      agree: melhor.agree,
+      gale1MsgId: null,
+      gale2MsgId: null,
+      galeLevel: 0
+    };
+
+    const envio = await tgSend(fmtSinal(prelim, CFG.maxGale + 1));
+    if (!envio.ok) {
+      R.ultimoMotivo = 'telegram falhou';
+      return;
+    }
+
+    prelim.criadoEm = Date.now();
+    S.nextId++;
+    S.signals.push(prelim);
+    if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
+    S.lastSignalAt = prelim.criadoEm;
+    R.ultimoSinal = prelim;
+    R.ultimoMotivo = null;
+
+    void dbSignalInsert(prelim);
+    void dbStateSet('nextId', String(S.nextId));
+    void dbStateSet('lastSignalAt', String(S.lastSignalAt));
+
+    log('SINAL', {
+      id: prelim.id, cor: prelim.cor, conf: prelim.conf,
+      key: prelim.key, tier, agree: prelim.agree
+    });
+  } finally {
+    S.generating = false;
   }
-  if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
-
-  if (tier <= 1) cands = cands.filter((c) => regimeFit(c, regime));
-
-  cands = cands.filter((c) => {
-    if (isSuspended(c.key)) return false;
-    if (stratSamples(c.key, stats) < T.minStratN) return false;
-    const lr = liveHitRate(c.key);
-    if (lr !== null && lr < T.liveMin) return false;
-    return true;
-  });
-  if (!cands.length) { R.ultimoMotivo = `tier${tier}: filtros`; return; }
-
-  const byColor = {};
-  for (const c of cands) {
-    if (!byColor[c.cor]) byColor[c.cor] = [];
-    byColor[c.cor].push(c);
-  }
-
-  let melhor = null;
-  for (const cor of Object.keys(byColor)) {
-    const list = byColor[cor];
-    const scored = list.map((c) => ({
-      ...c,
-      conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } })
-    }));
-    scored.sort((a, b) => b.conf - a.conf);
-    const top = scored[0];
-    if (!melhor || top.conf > melhor.conf) melhor = { ...top, agree: scored.length };
-  }
-
-  if (!melhor) { R.ultimoMotivo = 'sem candidato'; return; }
-  if (tier <= 1 && melhor.conf < T.scoreMin) {
-    R.ultimoMotivo = `score ${melhor.conf}<${T.scoreMin}`;
-    return;
-  }
-
-  const reservedId = S.nextId;
-  const prelim = {
-    id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome,
-    conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE', tier,
-    baseRoundId: S.hist[S.hist.length - 1]?.id || null,
-    criadoEm: 0, agree: melhor.agree,
-    gale1MsgId: null, gale2MsgId: null, galeLevel: 0
-  };
-
-  const envio = await tgSend(fmtSinal(prelim, CFG.maxGale + 1));
-  if (!envio.ok) {
-    R.ultimoMotivo = 'telegram falhou';
-    return;
-  }
-
-  prelim.criadoEm = Date.now();
-  S.nextId++;
-  S.signals.push(prelim);
-  if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
-  S.lastSignalAt = prelim.criadoEm;
-  R.ultimoSinal = prelim;
-  R.ultimoMotivo = null;
-
-  void dbSignalInsert(prelim);
-  void dbStateSet('nextId', String(S.nextId));
-  void dbStateSet('lastSignalAt', String(S.lastSignalAt));
-
-  log('SINAL', {
-    id: prelim.id, cor: prelim.cor, conf: prelim.conf,
-    key: prelim.key, tier
-  });
 }
 
 async function notificarGale(s, nivel) {
@@ -1026,6 +1260,7 @@ async function fecharSinal(s, status, gale) {
   })();
 
   maybeSuspend(s.key);
+  if (status === 'LOSS') applyCooldown(s.key);
 }
 
 /* ============================ APURAÇÃO ============================ */
@@ -1034,10 +1269,12 @@ async function apurar() {
   const now = Date.now();
   for (const s of S.signals) {
     if (FECHADOS.has(s.status)) continue;
+
     const anchorIndex = s.baseRoundId ? S.hist.findIndex((r) => r.id === s.baseRoundId) : -1;
     const after = anchorIndex >= 0
       ? S.hist.slice(anchorIndex + 1)
       : S.hist.filter((r) => r.t > s.criadoEm).sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
+
     let decided = false;
 
     for (let k = 0; k <= CFG.maxGale && k < after.length; k++) {
@@ -1074,7 +1311,7 @@ async function apurar() {
   }
 }
 
-/* ============================ SYNC ADAPTATIVO ============================ */
+/* ============================ SYNC ============================ */
 
 function currentSyncMs() {
   if (pendentes().length > 0) return CFG.syncFastMs;
@@ -1109,7 +1346,7 @@ async function sync() {
 
     if (newest && Date.now() - newest.t > CFG.staleAlertMs) {
       const mins = Math.floor((Date.now() - newest.t) / 60000);
-      await tgAlert('API', `API sem rodadas novas há ${mins} min.\nÚltima: ${R.ultimaRodadaNova}\nFonte: ${R.fonteAPI + 1}/${API_SOURCES.length}`);
+      await tgAlert('API', `API sem rodadas novas há ${mins} min.\nÚltima: ${R.ultimaRodadaNova}\nFonte: \( {R.fonteAPI + 1}/ \){API_SOURCES.length}`);
     }
     if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length, fonte: R.fonteAPI });
   } catch (e) {
@@ -1149,7 +1386,7 @@ async function keepAlive() {
 }
 
 function wakeCheck() {
-  if (Date.now() - lastTickMs > 10000) {
+  if (Date.now() - lastTickMs > 12000) {
     log('WAKE', 'atraso detetado');
     tick().catch(() => {});
   }
@@ -1230,7 +1467,8 @@ app.get('/admin/status', requireAdmin, (_req, res) => {
     sinaisPendentes: pendentes().length,
     diario: { ...DAILY, taxa: DAILY.total > 0 ? (DAILY.green + DAILY.g1 + DAILY.g2) / DAILY.total : null, streak: S.curStreak },
     geral: ALLTIME,
-    suspensos: Object.keys(SUSPENDED)
+    suspensos: Object.keys(SUSPENDED),
+    cooldowns: Object.keys(STRATEGY_COOLDOWN)
   });
 });
 
@@ -1276,15 +1514,12 @@ app.get('/admin/diagnostics', requireAdmin, (_req, res) => {
       tier: R.tier,
       motivo: R.ultimoMotivo
     },
-    telegram: {
-      erro: R.erroTelegram,
-      alertaThrottleMs: CFG.alertThrottleMs
-    },
+    telegram: { erro: R.erroTelegram },
     db: { erro: R.erroDB, lockOk: R.lockOk },
     env: {
       HISTORY_TZ,
       maxGale: CFG.maxGale,
-      gapMs: CFG.gapMs,
+      minGapMs: CFG.minGapMs,
       relaxMs: CFG.relaxMs,
       forceSignalMs: CFG.forceSignalMs
     }
@@ -1328,9 +1563,9 @@ app.post('/admin/gales', requireAdmin, async (req, res) => {
 app.post('/admin/interval', requireAdmin, async (req, res) => {
   const minutes = Number(req.body?.minutes);
   if (!Number.isFinite(minutes) || minutes < 0 || minutes > 10) {
-    return res.status(400).json({ error: 'minutes deve estar entre 0 e 10 (0 = padrão v19 de 20s)' });
+    return res.status(400).json({ error: 'minutes deve estar entre 0 e 10 (0 = padrão 2.5 min)' });
   }
-  const gapMs = minutes === 0 ? 20000 : Math.round(minutes * 60000);
+  const gapMs = minutes === 0 ? 150000 : Math.round(minutes * 60000);
   CFG.minGapMs = gapMs;
   await dbStateSet('minGapMs', String(gapMs));
   res.json({ ok: true, minGapMs: gapMs, minutes: minutes === 0 ? 'default' : minutes });
@@ -1352,7 +1587,7 @@ async function start() {
   if (ADMIN_TOKEN.length < 24) throw new Error('ADMIN_TOKEN deve ter >= 24 caracteres');
   if (!API_SOURCES.length) throw new Error('Nenhuma API configurada');
 
-  log('BOOT', { versao: '4.0', deployId: DEPLOY_ID, fontes: API_SOURCES.length, tz: HISTORY_TZ });
+  log('BOOT', { versao: '5.1', deployId: DEPLOY_ID, fontes: API_SOURCES.length, tz: HISTORY_TZ });
 
   await dbInit();
   const locked = await acquireLock();
@@ -1362,7 +1597,6 @@ async function start() {
   await sync();
   getStats(true);
 
-  // Recuperação de pendentes: reconstrói galeLevel
   for (const s of S.signals) {
     if (s.status !== 'PENDENTE') continue;
     const anchorIndex = s.baseRoundId ? S.hist.findIndex((r) => r.id === s.baseRoundId) : -1;
