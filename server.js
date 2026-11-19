@@ -1,5 +1,5 @@
 /**
- * CAPUNGA PRIME — BAC BO v22.0
+ * CAPUNGA PRIME — BAC BO v22.1
  * Reconstrução do servidor a partir do CAPUNGA DADOS v20.1 enviado pelo utilizador.
  *
  * Principais mudanças:
@@ -36,7 +36,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 
 const CFG = {
-  version: '22.0',
+  version: '22.1',
   active: true,
   maxGales: 2,
   maxPending: 1,
@@ -65,7 +65,9 @@ const CFG = {
   api5xxBaseMs: 8000,
   alertThrottleMs: 10 * 60 * 1000,
   keepAliveMs: 60000,
-  lockKey: 72727222,
+  lockKey: Number(process.env.LOCK_KEY || 72727222),
+  lockWaitMs: Math.max(30000, Number(process.env.LOCK_WAIT_MS || 240000)),
+  lockRetryMs: 3000,
   backtestWindow: 20,
   priorWeight: 40,
   // Estimativa neutra para três tentativas em Bac Bo não é uma garantia.
@@ -112,7 +114,7 @@ const S = {
   recoveryLeft: 0, stats: null, statsAt: -1, suspended: new Map(),
   apiBackoffUntil: 0, apiFailures: 0, lastApiError: null,
   lastApiAlert: 0, lastDbAlert: 0, lastSync: null, sourceIndex: 0,
-  lockClient: null, pool: null, busy: false, stopping: false
+  lockClient: null, pool: null, httpServer: null, tickTimer: null, keepTimer: null, busy: false, stopping: false
 };
 const DAILY = {
   date: dateLuanda(), total: 0, green: 0, g1: 0, g2: 0,
@@ -177,13 +179,17 @@ const hasScore = r => Number.isFinite(r?.pj) && Number.isFinite(r?.pb);
 const margin = r => hasScore(r) ? Math.abs(r.pj - r.pb) : null;
 const scoreWinner = r => r.resultado === J ? r.pj : r.pb;
 
-async function initDb() {
+async function connectDb() {
   S.pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL) ? false : { rejectUnauthorized: false },
-    max: 8
+    max: 8,
+    connectionTimeoutMillis: 10000,
+    idleTimeoutMillis: 30000
   });
   await S.pool.query('SELECT 1');
+}
+async function initDb() {
   await S.pool.query(`
     CREATE TABLE IF NOT EXISTS capunga_rounds (
       id TEXT PRIMARY KEY, resultado TEXT NOT NULL, t BIGINT NOT NULL,
@@ -215,7 +221,7 @@ async function initDb() {
       date_key TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-  log('DB', 'schema v22 pronto');
+  log('DB', 'schema v22.1 pronto');
 }
 async function stateGet(k) {
   const r = await S.pool.query('SELECT v FROM capunga_state_v22 WHERE k=$1', [k]);
@@ -249,13 +255,32 @@ async function saveEvent(s, round, stage, eventType) {
       round?.resultado || 'SEM_RODADA',eventType]);
 }
 async function acquireLock() {
-  // Advisory lock pertence à sessão. Reservamos uma ligação dedicada até ao shutdown.
-  S.lockClient = await S.pool.connect();
-  const r = await S.lockClient.query('SELECT pg_try_advisory_lock($1) AS ok', [CFG.lockKey]);
-  if (!r.rows[0].ok) {
-    S.lockClient.release(); S.lockClient = null;
-    throw new Error('Outra instância v22 está ativa (advisory lock).');
+  // Render pode iniciar a nova instância antes de terminar a antiga.
+  // Esperar pelo lock impede dois motores de sinais em simultâneo.
+  const started = now();
+  let lastNotice = 0;
+  while (!S.stopping && now() - started < CFG.lockWaitMs) {
+    const client = await S.pool.connect();
+    try {
+      const r = await client.query('SELECT pg_try_advisory_lock($1::bigint) AS ok', [CFG.lockKey]);
+      if (r.rows[0]?.ok === true) {
+        S.lockClient = client;
+        log('LOCK', `exclusivo adquirido; espera ${Math.round((now()-started)/1000)}s`);
+        return;
+      }
+    } catch (e) {
+      client.release();
+      throw e;
+    }
+    client.release();
+    if (now() - lastNotice >= 15000) {
+      log('LOCK', 'Outra instância ainda está ativa; aguardando libertação segura do bloqueio.');
+      lastNotice = now();
+    }
+    await sleep(CFG.lockRetryMs);
   }
+  if (S.stopping) throw new Error('Arranque cancelado durante encerramento.');
+  throw new Error(`Não foi possível obter o advisory lock após ${Math.round(CFG.lockWaitMs/1000)}s. Verifique instâncias duplicadas no Render.`);
 }
 async function releaseLock() {
   if (!S.lockClient) return;
@@ -762,8 +787,16 @@ async function start() {
   for(const [name,value] of Object.entries({BOT_TOKEN,CHAT_ID,ADMIN_TOKEN,DATABASE_URL}))
     if(!value)throw new Error(`Variável obrigatória em falta: ${name}`);
   if(!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL))throw new Error('DATABASE_URL inválido');
-  await initDb();
+
+  // Abrir a porta primeiro permite ao Render confirmar o arranque do processo.
+  // /health só fica ok:true depois de DB, lock e sincronização.
+  S.httpServer = app.listen(PORT,()=>log('HTTP',`porta ${PORT}; inicialização protegida pelo lock`));
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  await connectDb();
   await acquireLock();
+  await initDb();
   await loadState();
   try {await syncRounds();} catch(e) {S.lastApiError=e.message;log('BOOT_API',e.message);}
   if(!S.hist.length||now()-S.hist.at(-1).t>CFG.maxStaleMs)S.recoveryLeft=CFG.recoveryRounds;
@@ -784,19 +817,29 @@ async function start() {
       s.lastRoundTime=last?.t||s.t;
     }
   }
-  const server=app.listen(PORT,()=>log('HTTP',`porta ${PORT}`));
-  const timer=setInterval(()=>tick().catch(e=>log('TICK',e.message)),1000);
-  const keep=setInterval(async()=>{
+  S.tickTimer=setInterval(()=>tick().catch(e=>log('TICK',e.message)),1000);
+  S.keepTimer=setInterval(async()=>{
     const url=process.env.SELF_URL||process.env.RENDER_EXTERNAL_URL;
-    if(url)try{await axios.get(url.replace(/\/$/,'')+'/health',{timeout:7000});}catch{}
+    if(url)try{await axios.get(url.replace(/\/$/, '')+'/health',{timeout:7000});}catch{}
   },CFG.keepAliveMs);
   await tick();
-  const shutdown=async()=>{
-    if(S.stopping)return;S.stopping=true;
-    clearInterval(timer);clearInterval(keep);
-    await new Promise(resolve=>server.close(resolve));
-    await releaseLock();await S.pool.end();process.exit(0);
-  };
-  process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
+  log('START','CAPUNGA PRIME v22.1 pronto; lock exclusivo confirmado.');
 }
-start().catch(e=>{console.error(e);process.exit(1);});
+async function shutdown() {
+  if(S.stopping)return;
+  S.stopping=true;
+  if(S.tickTimer)clearInterval(S.tickTimer);
+  if(S.keepTimer)clearInterval(S.keepTimer);
+  if(S.httpServer) await new Promise(resolve=>S.httpServer.close(resolve));
+  await releaseLock();
+  if(S.pool) await S.pool.end();
+  process.exit(0);
+}
+start().catch(async e=>{
+  console.error(e);
+  S.stopping=true;
+  if(S.httpServer) await new Promise(resolve=>S.httpServer.close(resolve)).catch(()=>{});
+  await releaseLock().catch(()=>{});
+  if(S.pool) await S.pool.end().catch(()=>{});
+  process.exit(1);
+});
