@@ -1,6 +1,6 @@
 /**
- * CAPUNGA PRIME — BAC BO v22.1
- * Reconstrução do servidor a partir do CAPUNGA DADOS v20.1 enviado pelo utilizador.
+ * CAPUNGA PRIME — BAC BO v22.2
+ * Versão v22.2: fecho imediato no empate, histórico discriminado e mensagens compactas.
  *
  * Principais mudanças:
  * - Empates são eventos neutros: registados e não consomem gale.
@@ -36,7 +36,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 
 const CFG = {
-  version: '22.1',
+  version: '22.2',
   active: true,
   maxGales: 2,
   maxPending: 1,
@@ -57,7 +57,9 @@ const CFG = {
   minConfidence: 50,
   maxConfidence: 92,
   minScore: 76,
-  minStrategyAgreement: 1,
+  minStrategyAgreement: 2,
+  minStrategyBacktestN: 40,
+  postLossCooldownMs: 6 * 60 * 1000,
   maxSignalsMemory: 1000,
   apiTimeoutMs: 10000,
   api429BaseMs: 15000,
@@ -70,9 +72,7 @@ const CFG = {
   lockRetryMs: 3000,
   backtestWindow: 20,
   priorWeight: 40,
-  // Estimativa neutra para três tentativas em Bac Bo não é uma garantia.
-  // Usamos prior conservador e forte shrinkage até existir amostra suficiente.
-  priorNonLoss: 0.80
+  // Mantido apenas para compatibilidade de configuração; o índice usa limite Wilson.
 };
 
 const J = 'Jogador';
@@ -113,18 +113,18 @@ const S = {
   hist: [], signals: [], nextId: 1, lastSignalAt: 0, currentStreak: 0,
   recoveryLeft: 0, stats: null, statsAt: -1, suspended: new Map(),
   apiBackoffUntil: 0, apiFailures: 0, lastApiError: null,
-  lastApiAlert: 0, lastDbAlert: 0, lastSync: null, sourceIndex: 0,
+  lastApiAlert: 0, lastDbAlert: 0, lastSync: null, sourceIndex: 0, lastLossAt: 0,
   lockClient: null, pool: null, httpServer: null, tickTimer: null, keepTimer: null, busy: false, stopping: false
 };
 const DAILY = {
   date: dateLuanda(), total: 0, green: 0, g1: 0, g2: 0,
-  ties: 0, loss: 0, expired: 0, bestStreak: 0
+  ties: 0, tieGS: 0, tieG1: 0, tieG2: 0, loss: 0, expired: 0, bestStreak: 0
 };
 const ALL = {
-  total: 0, green: 0, g1: 0, g2: 0, ties: 0, loss: 0, expired: 0
+  total: 0, green: 0, g1: 0, g2: 0, ties: 0, tieGS: 0, tieG1: 0, tieG2: 0, loss: 0, expired: 0
 };
 
-const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'LOSS', 'EXPIRADO']);
+const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE_GS', 'EMPATE_G1', 'EMPATE_G2', 'LOSS', 'EXPIRADO']);
 const pending = () => S.signals.filter(s => s.status === 'PENDENTE');
 const eventKey = (signalId, roundId) => `${signalId}:${roundId}`;
 
@@ -221,7 +221,7 @@ async function initDb() {
       date_key TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-  log('DB', 'schema v22.1 pronto');
+  log('DB', 'schema v22.2 pronto');
 }
 async function stateGet(k) {
   const r = await S.pool.query('SELECT v FROM capunga_state_v22 WHERE k=$1', [k]);
@@ -288,17 +288,18 @@ async function releaseLock() {
   finally { S.lockClient.release(); S.lockClient = null; }
 }
 async function loadState() {
-  const [nextId,lastAt,streak,daily] = await Promise.all([
-    stateGet('nextId'),stateGet('lastSignalAt'),stateGet('currentStreak'),stateGet('daily')
+  const [nextId,lastAt,streak,daily,lastLossAt] = await Promise.all([
+    stateGet('nextId'),stateGet('lastSignalAt'),stateGet('currentStreak'),stateGet('daily'),stateGet('lastLossAt')
   ]);
   if (nextId) S.nextId = Math.max(1, Number(nextId) || 1);
   if (lastAt) S.lastSignalAt = Number(lastAt) || 0;
   if (streak) S.currentStreak = Number(streak) || 0;
+  if (lastLossAt) S.lastLossAt = Number(lastLossAt) || 0;
   if (daily) {
     try { Object.assign(DAILY, JSON.parse(daily)); } catch {}
   }
   if (DAILY.date !== dateLuanda()) {
-    Object.assign(DAILY,{date:dateLuanda(),total:0,green:0,g1:0,g2:0,ties:0,loss:0,expired:0,bestStreak:0});
+    Object.assign(DAILY,{date:dateLuanda(),total:0,green:0,g1:0,g2:0,ties:0,tieGS:0,tieG1:0,tieG2:0,loss:0,expired:0,bestStreak:0});
   }
   const rounds = await S.pool.query(`SELECT id,resultado,t,pj,pb FROM capunga_rounds ORDER BY t DESC LIMIT ${CFG.maxHistory}`);
   S.hist = rounds.rows.map(r => ({id:r.id,resultado:r.resultado,t:Number(r.t),
@@ -319,10 +320,12 @@ async function loadState() {
     if (row.status === 'G1') ALL.g1 = row.n;
     if (row.status === 'G2') ALL.g2 = row.n;
     if (row.status === 'LOSS') ALL.loss = row.n;
+    if (row.status === 'EMPATE_GS') ALL.tieGS = row.n;
+    if (row.status === 'EMPATE_G1') ALL.tieG1 = row.n;
+    if (row.status === 'EMPATE_G2') ALL.tieG2 = row.n;
     if (row.status === 'EXPIRADO') ALL.expired = row.n;
   }
-  const events = await S.pool.query(`SELECT COUNT(*)::int n FROM capunga_signal_events_v22 WHERE event_type='TIE'`);
-  ALL.ties = events.rows[0]?.n || 0;
+  ALL.ties = ALL.tieGS + ALL.tieG1 + ALL.tieG2;
   log('DB',`carregado: ${S.hist.length} rodadas, ${S.signals.length} sinais`);
 }
 
@@ -342,30 +345,28 @@ async function alert(tag, message) {
   await telegram(`⚠️ <b>ALERTA ${tag}</b>\n${message}\n⏱ ${time()}`);
 }
 function signalMessage(s) {
-  const strength = s.conf >= 88 ? '💎' : s.conf >= 80 ? '🔥' : '⚡';
   return [
-    '━━━━━━━━━━━━━━━━━━',
-    `🎲 <b>CAPUNGA PRIME v22 — SINAL #${s.id}</b>`,
-    '━━━━━━━━━━━━━━━━━━',
-    `🎯 Entrada: <b>${colorName(s.cor)}</b>`,
-    `🛡 Gestão: empate não consome gale`,
-    `${strength} Força estatística: <b>${s.conf}%</b> ${progress(s.conf)}`,
-    `🧠 Estratégia: ${clean(s.nome)}`,
-    `🤝 Confirmações: ${s.agree || 1}`,
-    `📍 Etapa inicial: GS`,
-    `⏰ ${time(s.t)}`,
-    '<i>Estimativa estatística; não é garantia de resultado.</i>'
+    `🎲 <b>CAPUNGA PRIME | #${s.id}</b>`,
+    `🎯 <b>${colorName(s.cor)}</b>  •  Entrada GS`,
+    `📊 Índice de evidência: <b>${s.conf}/100</b>`,
+    `🧠 ${clean(s.nome)}`,
+    `🕒 ${time(s.t)} (Luanda)`,
+    '<i>Leitura estatística, sem garantia de resultado.</i>'
   ].join('\n');
 }
 function stageMessage(s, stage) {
-  return `🔄 <b>SINAL #${s.id} — ${stage}</b>\n🎯 Manter ${colorName(s.cor)}\n🟡 Empates são registados e não avançam gale.\n⏱ ${time()}`;
+  return `↪️ <b>#${s.id} | ${stage}</b>\nManter: <b>${colorName(s.cor)}</b>\n🕒 ${time()} (Luanda)`;
 }
 function resultMessage(s) {
-  const label = s.status === 'GREEN' ? 'GREEN NO GS' : s.status === 'G1' ? 'GREEN NO G1' :
-    s.status === 'G2' ? 'GREEN NO G2' : s.status === 'LOSS' ? 'LOSS' : 'EXPIRADO';
-  return `━━━━━━━━━━━━━━━━━━\n${s.status === 'LOSS' ? '❌' : s.status === 'EXPIRADO' ? '⏸' : '✅'} <b>${label} #${s.id}</b>\n`+
-    `Etapa final: ${s.finalStage || s.stage}\nResultado: ${s.finalResult || 'indisponível'}\n`+
-    `⏱ ${time(s.fechadoEm)}\n📊 ${DAILY.green+DAILY.g1+DAILY.g2} GREEN • ${DAILY.loss} LOSS • ${DAILY.ties} empates`;
+  const labels = {GREEN:'GREEN GS',G1:'GREEN G1',G2:'GREEN G2',
+    EMPATE_GS:'GREEN EMPATE GS',EMPATE_G1:'GREEN EMPATE G1',EMPATE_G2:'GREEN EMPATE G2',
+    LOSS:'LOSS',EXPIRADO:'EXPIRADO'};
+  const isLoss=s.status==='LOSS', isExpired=s.status==='EXPIRADO';
+  const greenCount=DAILY.green+DAILY.g1+DAILY.g2+DAILY.ties;
+  return `\n${isLoss?'❌':isExpired?'⏸':'✅'} <b>${labels[s.status]||s.status} #${s.id}</b>\n`+
+    `Etapa: ${s.finalStage||s.stage} • Resultado: ${s.finalResult||'indisponível'}\n`+
+    `📊 Hoje: ${greenCount} GREEN • ${DAILY.loss} LOSS • Empates: ${DAILY.ties}\n`+
+    `🕒 ${time(s.fechadoEm)} (Luanda)`;
 }
 async function persistDaily() {
   await S.pool.query(`INSERT INTO capunga_daily_v22(date_key,data) VALUES($1,$2::jsonb)
@@ -376,8 +377,8 @@ async function persistDaily() {
 async function dailyReset() {
   const key = dateLuanda();
   if (DAILY.date === key) return;
-  await telegram(`🕛 <b>FECHO DO DIA ${DAILY.date}</b>\nSinais: ${DAILY.total}\nGREEN: ${DAILY.green+DAILY.g1+DAILY.g2}\nEmpates: ${DAILY.ties}\nLOSS: ${DAILY.loss}\nEXPIRADOS: ${DAILY.expired}`);
-  Object.assign(DAILY,{date:key,total:0,green:0,g1:0,g2:0,ties:0,loss:0,expired:0,bestStreak:0});
+  await telegram(`🕛 <b>FECHO DO DIA ${DAILY.date}</b>\nSinais: ${DAILY.total}\nGREEN: ${DAILY.green+DAILY.g1+DAILY.g2+DAILY.ties}\nEmpates: ${DAILY.ties}\nLOSS: ${DAILY.loss}\nEXPIRADOS: ${DAILY.expired}`);
+  Object.assign(DAILY,{date:key,total:0,green:0,g1:0,g2:0,ties:0,tieGS:0,tieG1:0,tieG2:0,loss:0,expired:0,bestStreak:0});
   await persistDaily();
 }
 
@@ -451,7 +452,7 @@ function evaluateAt(history,index,cor) {
     const r=history[k];
     if(r.t-lastT>CFG.roundGapMs) return null;
     lastT=r.t;
-    if(r.resultado===TIE) {ties++;continue;}
+    if(r.resultado===TIE) return {nonLoss:true,green:false,tie:true,ties:ties+1,stage:losses};
     if(r.resultado===cor) return {nonLoss:true,green:true,ties,stage:losses};
     losses++;
     if(losses>CFG.maxGales) return {nonLoss:false,green:false,ties,stage:2};
@@ -469,10 +470,11 @@ function buildBacktest() {
     for(const c of candidates) {
       const outcome=evaluateAt(H,i,c.cor);
       if(!outcome) continue;
-      const p=stats[c.key]||(stats[c.key]={n:0,nonLoss:0,greens:0,losses:0});
+      const p=stats[c.key]||(stats[c.key]={n:0,nonLoss:0,greens:0,ties:0,gs:0,g1:0,g2:0,losses:0});
       p.n++; observations++;
       if(outcome.nonLoss)p.nonLoss++;
-      if(outcome.green)p.greens++;
+      if(outcome.green){p.greens++;if(outcome.stage===0)p.gs++;else if(outcome.stage===1)p.g1++;else p.g2++;}
+      else if(outcome.tie)p.ties++;
       else if(!outcome.nonLoss)p.losses++;
     }
   }
@@ -487,22 +489,29 @@ function getStats(force=false) {
 function liveResults(key) {
   return S.signals.filter(s=>s.key===key&&FECHADOS.has(s.status)&&s.status!=='EXPIRADO');
 }
+function wilsonLower(successes,n) {
+  if(!n) return 0;
+  const z=1.96, p=successes/n, z2=z*z;
+  const den=1+z2/n;
+  const center=p+z2/(2*n);
+  const spread=z*Math.sqrt((p*(1-p)+z2/(4*n))/n);
+  return Math.max(0,(center-spread)/den);
+}
 function estimateConfidence(candidate,stats) {
-  const p=stats.per[candidate.key]||{n:0,nonLoss:0};
+  const p=stats.per[candidate.key]||{n:0,nonLoss:0,gs:0,g1:0,g2:0,ties:0};
   const live=liveResults(candidate.key);
   const liveN=live.length;
   const liveWins=live.filter(s=>s.status!=='LOSS').length;
-  // O backtest recebe shrinkage forte. O histórico real só pesa após amostra mínima.
-  const prior=CFG.priorNonLoss;
-  const bt=(p.nonLoss+prior*CFG.priorWeight)/(p.n+CFG.priorWeight);
-  const useLive=liveN>=CFG.minLiveN;
-  const raw=useLive ?
-    (liveWins+bt*CFG.priorWeight)/(liveN+CFG.priorWeight) : bt;
-  // Penalização por amostra pequena; sem bónus por concordância para não inflacionar.
-  const samplePenalty=p.n<CFG.minBacktestN?Math.min(10,(CFG.minBacktestN-p.n)/10):0;
-  const confidence=Math.round(Math.max(CFG.minConfidence,
-    Math.min(CFG.maxConfidence,raw*100-samplePenalty)));
-  return {confidence,backtestN:p.n,liveN,backtestRate:bt};
+  const total=p.n+liveN;
+  const success=p.nonLoss+liveWins;
+  const lower=wilsonLower(success,total);
+  const early=(p.gs+p.g1+live.filter(s=>['GREEN','G1','EMPATE_GS','EMPATE_G1'].includes(s.status)).length);
+  const late=(p.g2+live.filter(s=>s.status==='G2').length);
+  const earlyRate=total?early/total:0;
+  const lateRate=total?late/total:0;
+  // Escala de evidência (0-100), não probabilidade de vitória.
+  const score=Math.round(Math.max(0,Math.min(100,lower*100 - lateRate*18)));
+  return {confidence:score,backtestN:p.n,liveN,backtestRate:p.n?p.nonLoss/p.n:0,earlyRate,lateRate};
 }
 function isSuspended(key) {
   const until=S.suspended.get(key)||0;
@@ -530,6 +539,7 @@ function eligibleSignal() {
   if(now()-last.t<CFG.minSettledAgeMs)return {reason:'rodada ainda recente'};
   if(S.hist.length<CFG.minHistory)return {reason:`histórico insuficiente (${S.hist.length}/${CFG.minHistory})`};
   if(S.lastSignalAt&&now()-S.lastSignalAt<CFG.signalCooldownMs)return {reason:'intervalo mínimo de 4 minutos'};
+  if(S.lastLossAt&&now()-S.lastLossAt<CFG.postLossCooldownMs)return {reason:'pausa de proteção após LOSS'};
   return {ok:true};
 }
 async function generateSignal() {
@@ -553,8 +563,10 @@ async function generateSignal() {
   const ranked=[];
   for(const [cor,list] of byColor) {
     const evaluated=list.map(c=>({...c,...estimateConfidence(c,stats)}))
-      .sort((a,b)=>b.confidence-a.confidence);
+      .filter(c=>c.backtestN>=CFG.minStrategyBacktestN)
+      .sort((a,b)=>(b.earlyRate-b.lateRate)-(a.earlyRate-a.lateRate) || b.confidence-a.confidence);
     const best=evaluated[0];
+    if(!best) continue;
     ranked.push({...best,cor,agree:list.length,agreementKeys:list.map(x=>x.key)});
   }
   ranked.sort((a,b)=>b.confidence-a.confidence);
@@ -582,9 +594,10 @@ async function closeSignal(s,status,round,stage) {
   s.status=status;s.fechadoEm=now();s.finalRoundId=round?.id||null;
   s.finalResult=round?.resultado||null;s.finalStage=stage;
   const bucket=status==='GREEN'?'green':status==='G1'?'g1':status==='G2'?'g2':
+    status==='EMPATE_GS'?'tieGS':status==='EMPATE_G1'?'tieG1':status==='EMPATE_G2'?'tieG2':
     status==='LOSS'?'loss':'expired';
   DAILY.total++;DAILY[bucket]++;ALL.total++;ALL[bucket]++;
-  if(status==='LOSS')S.currentStreak=0;
+  if(status==='LOSS'){S.currentStreak=0;S.lastLossAt=now();await stateSet('lastLossAt',S.lastLossAt);}
   else if(status!=='EXPIRADO') {
     S.currentStreak++;
     DAILY.bestStreak=Math.max(DAILY.bestStreak,S.currentStreak);
@@ -606,10 +619,11 @@ async function processRoundForSignal(s,r) {
   if(r.resultado===TIE) {
     s.ties++;
     await saveEvent(s,r,s.stage,'TIE');
-    DAILY.ties++;ALL.ties++;
-    await persistDaily();
-    // Empate é push: continua exatamente na mesma etapa e não consome gale.
-    await telegram(`🟡 <b>EMPATE NO ${s.stage} — SINAL #${s.id}</b>\nEtapa mantida: ${s.stage}\nEmpates acumulados: ${s.ties}\n⏱ ${time(r.t)}`);
+    const stage=s.stage;
+    const status=stage==='GS'?'EMPATE_GS':stage==='G1'?'EMPATE_G1':'EMPATE_G2';
+    const bucket=stage==='GS'?'tieGS':stage==='G1'?'tieG1':'tieG2';
+    DAILY.ties++;ALL.ties++;DAILY[bucket]++;ALL[bucket]++;
+    await closeSignal(s,status,r,stage);
     return;
   }
   if(r.resultado===s.cor) {
@@ -650,7 +664,7 @@ async function settleSignals() {
 /* ======================== API E SINCRONIZAÇÃO ======================== */
 async function fetchSource(url) {
   const resp=await axios.get(url,{timeout:CFG.apiTimeoutMs,
-    headers:{Accept:'application/json','User-Agent':'CapungaPrime/22.0'}});
+    headers:{Accept:'application/json','User-Agent':'CapungaPrime/22.2'}});
   const map=new Map();
   for(const item of extractItems(resp.data)) {
     const r=normalizeRound(item);if(r)map.set(r.id,r);
@@ -734,10 +748,13 @@ function admin(req,res,next) {
 }
 function statsSummary() {
   const decided=ALL.total-ALL.expired;
-  const nonLoss=ALL.green+ALL.g1+ALL.g2;
+  const directional=ALL.green+ALL.g1+ALL.g2;
+  const ties=ALL.tieGS+ALL.tieG1+ALL.tieG2;
   return {daily:{...DAILY},all:{...ALL},
-    taxaSemLoss:decided>0?(nonLoss+ALL.ties)/decided:null,
-    taxaGreen:decided>0?nonLoss/decided:null};
+    greensDirecionais:directional,greensComEmpate:directional+ties,
+    taxaGreenSemEmpate:decided>0?directional/decided:null,
+    taxaGreenComEmpate:decided>0?(directional+ties)/decided:null,
+    distribuicao:{GS:ALL.green,G1:ALL.g1,G2:ALL.g2,empateGS:ALL.tieGS,empateG1:ALL.tieG1,empateG2:ALL.tieG2,LOSS:ALL.loss,EXPIRADO:ALL.expired}};
 }
 app.get('/health',(req,res)=>{
   const last=S.hist.at(-1);
@@ -759,6 +776,13 @@ app.get('/status',admin,(req,res)=>res.json({
 app.get('/signals',admin,(req,res)=>{
   const n=Math.min(200,Math.max(1,Number(req.query.n)||30));
   res.json(S.signals.slice(-n).reverse());
+});
+app.get('/history',admin,async(req,res)=>{
+  const limit=Math.min(500,Math.max(1,Number(req.query.limit)||100));
+  const offset=Math.max(0,Number(req.query.offset)||0);
+  const r=await S.pool.query(`SELECT id,cor,strategy_name,confidence,status,stage,created_at,closed_at,final_round_id,final_result,final_stage FROM capunga_signals_v22 ORDER BY id DESC LIMIT $1 OFFSET $2`,[limit,offset]);
+  const count=await S.pool.query('SELECT COUNT(*)::int n FROM capunga_signals_v22');
+  res.json({total:count.rows[0].n,limit,offset,items:r.rows});
 });
 app.get('/events/:id',admin,async(req,res)=>{
   const id=Number(req.params.id);
@@ -823,7 +847,7 @@ async function start() {
     if(url)try{await axios.get(url.replace(/\/$/, '')+'/health',{timeout:7000});}catch{}
   },CFG.keepAliveMs);
   await tick();
-  log('START','CAPUNGA PRIME v22.1 pronto; lock exclusivo confirmado.');
+  log('START','CAPUNGA PRIME v22.2 pronto; lock exclusivo confirmado.');
 }
 async function shutdown() {
   if(S.stopping)return;
