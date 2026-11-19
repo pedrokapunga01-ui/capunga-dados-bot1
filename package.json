@@ -1,8 +1,7 @@
-
 {
   "name": "bacbo-telegram-signals",
   "version": "1.0.0",
-  "description": "CAPUNGA PRIME BAC BO Signal Service v22",
+  "description": "CAPUNGA PRIME BAC BO Signal Service v22.1",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
